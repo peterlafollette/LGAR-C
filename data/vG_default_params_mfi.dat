@@ -1,0 +1,13 @@
+"Texture	        a_f (cm)	beta_f	K_sa_f (cm h^-1)	gamma_f
+"sand"	            1.0	        3.0 	0.005	            0.4	
+"loamy_sand"	    1.0	        3.0 	0.005	            0.4	
+"sandy_loam"	    1.0	        3.0 	0.005	            0.4	
+"loam"	        	1.0	        3.0 	0.005	            0.4	
+"silt"	        	1.0	        3.0 	0.005	            0.4	
+"silt_loam"	        1.0	        3.0 	0.005	            0.4	
+"sandy_clay_loam"	1.0	        3.0 	0.005	            0.4	
+"clay_loam"	        1.0	        3.0 	0.005	            0.4	
+"silty_clay_loam"	1.0	        3.0 	0.005	            0.4	
+"sandy_clay"	    1.0	        3.0 	0.005	            0.4	
+"silty_clay"		1.0	        3.0 	0.005	            0.4	
+"clay"	        	1.0	        3.0 	0.005	            0.4	

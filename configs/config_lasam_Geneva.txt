@@ -1,6 +1,7 @@
 verbosity=none
 forcing_file=./forcing/forcing_data_resampled_uniform_Geneva.txt
-soil_params_file=./data/vG_default_params_HYDRUS.dat
+soil_params_file=./data/vG_default_params_HYDRUS_frac.dat
+soil_params_file_mfi=./data/vG_default_params_mfi.dat
 layer_thickness=36.0,111.0,107.0[cm]
 initial_psi=100.0[cm]
 timestep=300[sec]
@@ -16,3 +17,7 @@ root_zone_depth=127.0[cm]
 giuh_ordinates=0.0,0.0,0.0,0.0,0.0
 adaptive_timestep=true
 TO_enabled=true
+dual_perm=true
+frac_to_pref=0.1
+ratio_fracture_vol_to_total_vol=0.1
+mbal_tol=1.0

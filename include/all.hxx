@@ -64,7 +64,7 @@ struct wetting_front
 */
 
 
-// Define a data structure to hold properties and parameters for each soil type
+// Define a data structure to hold properties and parameters for each soil type. works for both soil matrix and fracture domain
 struct soil_properties_  /* note the trailing underscore on the name.  It is just part of the name */
 {
   char soil_name[MAX_SOIL_NAME_CHARS];  // string to hold the soil name
@@ -78,6 +78,18 @@ struct soil_properties_  /* note the trailing underscore on the name.  It is jus
   double h_min_cm;         // the minimum Geff calculated as per Morel-Seytoux and Khanji
   double Ksat_cm_per_h;    // saturated hydraulic conductivity cm/s
   double theta_wp;         // water content at wilting point [-]
+};
+
+// Define a data structure to hold parameters for each soil type, for parameters specific to the fracture / matrix interactions
+struct mass_transfer_soil_properties_  /* note the trailing underscore on the name.  It is just part of the name */
+{
+  // parameters describing the mass trasnfer between the fracture domain and soil matrix. 
+  // see "Evaluation of a first-order water transfer term for variably saturated dual-porosity flow models", Water Resour. Res., 29, 1225-1238, 1993.
+  char soil_name[MAX_SOIL_NAME_CHARS];  // string to hold the soil name
+  double a_f;
+  double beta_f;
+  double K_sa_f;
+  double gamma_f;
 };
 
 
@@ -131,12 +143,19 @@ struct lgar_bmi_parameters
 					    depth from the surface in meters */
   double *frozen_factor;                 // frozen factor added to the hydraulic conductivity due to coupling to soil freeze-thaw
   double  wilting_point_psi_cm;          // wilting point (the amount of water not available for plants or not accessible by plants)
-  double  field_capacity_psi_cm;          // field capacity represented as a capillary head. Note that both wilting point and field capacity are specified for the whole model domain with single values
+  double  field_capacity_psi_cm;         // field capacity represented as a capillary head. Note that both wilting point and field capacity are specified for the whole model domain with single values
+  double a = 0.0;                        // parameter for nonlinear GW reservoir
+  double b = 0.0;                        // parameter for nonlinear GW reservoir
+  double frac_to_GW = 0.0;               // parameter for nonlinear GW reservoir 
+  double frac_to_pref = 0.0;             // parameter controlling what fraction of precipitation and ponded head goes to the fracture (preferential flow) domain
+  double ratio_fracture_vol_to_total_vol = 0.0; //parameter controlling ratio of volume of fracture domain to volume of total system, and therefore also controlling this ratio for the soil matrix.
   double root_zone_depth_cm;             // maximum depth from which roots extract water
   bool   use_closed_form_G = false;      /* true if closed form of capillary drive calculation is desired, false if numeric integral
 					    for capillary drive calculation is desired */
+  bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution
   bool   TO_enabled = false;             // if set to true, model uses multilayer TO model for recharge 
+  bool   dual_perm = false;              // if set to true, model simulates preferential flow through a fracture domain as well as flow through the soil matrix
   bool   free_drainage_enabled = false;  // When running in LGAR mode (TO_enabled is false), then free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). 
   double mbal_tol;                       // if a substep's mass balance error is larger than this number, the model will abort. By default it is set to a large value (10 cm).
   double ponded_depth_cm;                // amount of water on the surface unavailable for surface runoff
@@ -152,44 +171,62 @@ struct lgar_bmi_parameters
   double *giuh_ordinates;       // geomorphological instantaneous unit hydrograph
   int    num_giuh_ordinates;    // number of giuh ordinates
 
-  int  calib_params_flag = 0;  // flag for calibratable parameters; if true, then calibratable params are updated otherwise not
-  bool is_invalid_soil_type  = true;  // checks if the provided soil type is valid for the model, if not then return Q_out = precip
+  int    calib_params_flag = 0;  // flag for calibratable parameters; if true, then calibratable params are updated otherwise not
+  bool   is_invalid_soil_type  = true;  // checks if the provided soil type is valid for the model, if not then return Q_out = precip
+
+  bool   runoff_in_prev_step = false; // true if there was there runoff in the previous time step. Used for conceptual quickflow model
 };
 
 // Define a data structure for local (timestep) and global mass balance parameters
 struct lgar_mass_balance_variables
 {
   // for local mass balance (compute mass balance at each timestep)
-  double volstart_timestep_cm;       // initial volume of water in the soil at each timestep
+  double volstart_timestep_cm;       // initial volume of water in the soil matrix at each timestep
+  double volstart_timestep_cm_frac;  // initial volume of water in the fracture domain at each timestep
   double volend_timestep_cm;         // volume of water at the end of timestep
+  double volend_timestep_cm_frac;    // volume of water at the end of timestep in fracture domain
   double volprecip_timestep_cm;      // volume of rainfall at each timestep
   double volin_timestep_cm;          // volume of infiltrated water at each timestep (water that will be added to the soil)
+  double volin_timestep_cm_frac;     // volume of infiltrated water at each timestep (water that will be added to the fracture domain)
   double volon_timestep_cm;          // volume of water on the surface (ponded water) at each timestep
-  double volrunoff_timestep_cm;      // volume of water surface runoff at each timestep
+  double volrunoff_timestep_cm;      // volume of water surface runoff at each timestep from soil matrix
+  double volrunoff_timestep_cm_frac; // volume of water surface runoff at each timestep from fracture domain
   double volAET_timestep_cm;         // volume of AET at each timestep
   double volPET_timestep_cm;         // volume of PET at each timestep
   double volrech_timestep_cm;        // volume of water leaving soil to the ground water (ground water recharge)
+  double volrech_timestep_cm_frac;   // volume of water leaving soil to the ground water (ground water recharge) from fracture domain
   double volrunoff_giuh_timestep_cm; // volume of giuh runoff at each timestep
   double volQ_timestep_cm;           // total outgoing water (giuh_runoff + volrech)
   double volQ_gw_timestep_cm;        /* volume of water from groundwater to stream
 					(i.e., stream water recharge from groundwater reservoir) */
+  double mass_transfer_timestep_cm;  // mass transfer between fracture domain and soil matrix
   
   // for global mass balance (compute cumulative mass balance)
-  double volstart_cm;         // initial volume of water in the soil (at timestep 0)
-  double volend_cm;           // volume of water
+  double volstart_cm;         // initial volume of water in the soil matrix (at timestep 0)
+  double volstart_cm_frac = 0.0;    // initial volume of water in the fracture domain (at timestep 0)
+  double volend_cm;           // volume of water in matrix
+  double volend_cm_frac;      // volume of water in fracture domain
   double volprecip_cm;        // volume of rainfall
   double volin_cm;            // volume of infiltrated water
+  double volin_cm_frac;       // volume of infiltrated water (fracture domain)
   double volon_cm;            // volume of water on the surface (ponded water)
   double volrunoff_cm;        // volume of water surface runoff
+  double volrunoff_cm_frac;        // volume of water surface runoff (fracture domain)
   double volAET_cm;           // volume of AET
   double volPET_cm;           // volume of PET
 
+  double mass_transfer_cm;    // mass transfer between fracture domain and soil matrix
   double volrech_cm;          // volume of water leaving soil through the bottom of the domain (ground water recharge)
+  double volrech_cm_frac;     // volume of water leaving soil through the bottom of the domain for fracture domain (ground water recharge)
   double volrunoff_giuh_cm;   // volume of giuh runoff
   double volQ_cm;             // total outgoing water
   double volQ_gw_cm;          // outgoing water from ground reservoir to stream channel
   double volchange_calib_cm;  // change in the amount of water due to calibratable parameters
   double local_mass_balance;  // local (per timestep) mass balance error
+  double cumulative_mbal = 0.0;// accumulation of local mbal over time 
+
+  double QF_storage_cm = 0.0;    //water stored in the conceptual quickflow reservoir
+  double volrunoff_QF_cm = 0.0;  //discharge to stream from QF reservoir
 };
 
 // Define a data structure for calibratable parameters
@@ -201,23 +238,45 @@ struct lgar_calib_parameters
   double *vg_n;                  // Van Genuchten n [-]
   double *vg_alpha;              // Van Genuchten alpha [1/cm]
   double *Ksat;                  // Hydraulic conductivity [cm/hr]
-  double field_capacity_psi;    // field capacity in capillary head [cm]
-  double ponded_depth_max;      // maximum ponded depth of surface water [cm]
+  double field_capacity_psi;     // field capacity in capillary head [cm]
+  double ponded_depth_max;       // maximum ponded depth of surface water [cm]
+  double a;                      // parameter for nonlinear groundwater reservoir
+  double b;                      // parameter for nonlinear groundwater reservoir
+  double frac_to_GW;             // parameter for nonlinear groundwater reservoir
+  double frac_to_pref;           // parameter controlling what fraction of precipitation and ponded head goes to the fracture (preferential flow) domain
+  double ratio_fracture_vol_to_total_vol; //parameter controlling ratio of volume of fracture domain to volume of total system, and therefore also controlling this ratio for the soil matrix.
+
+  double *theta_e_f;             // theta_e = smcmax [-] for fracture domain
+  double *theta_r_f;             // theta_r = smcmin [-] for fracture domain
+  double *vg_n_f;                // Van Genuchten n [-] for fracture domain
+  double *vg_alpha_f;            // Van Genuchten alpha [1/cm] for fracture domain
+  double *Ksat_f;                // Hydraulic conductivity [cm/hr] for fracture domain
+
+  // parameters describing the mass trasnfer between the fracture domain and soil matrix: see "Evaluation of a first-order water transfer term for variably saturated dual-porosity flow models", Water Resour. Res., 29, 1225-1238, 1993.
+  double *a_f;                   // effective 'diffusion' pathlength [cm] (i.e. half the aggregate width or half the fracture spacing), sometime given the name 'd'.
+  double *beta_f;                // a shape factor that depends on the geometry [-]
+  double *K_sa_f;                // effective saturated hydraulic conductivity of the fracture - matrix interface [cm/hr]
+  double *gamma_f;               // scaling factor [-]
 
 };
 
 // nested structure of structures; main structure for the use in bmi
 struct model_state
 {
-  struct wetting_front*               head           = NULL; // head pointer to the current state
-  struct wetting_front*               state_previous = NULL; // head pointer to the previous state,
-                                                             // used in computing derivatives and mass balance
-  struct soil_properties_*            soil_properties;       // dynamic allocation
-  struct lgar_bmi_parameters          lgar_bmi_params;
-  struct lgar_mass_balance_variables  lgar_mass_balance;
-  struct unit_conversion              units;
-  struct lgar_bmi_input_parameters*   lgar_bmi_input_params;
-  struct lgar_calib_parameters        lgar_calib_params;
+  struct wetting_front*                  head                = NULL;    // head pointer to the current state
+  struct wetting_front*                  state_previous      = NULL;    // head pointer to the previous state,
+  struct wetting_front*                  head_frac           = NULL;    // head pointer to the current state for the fracture domain (used in dual perm mode)
+  struct wetting_front*                  state_previous_frac = NULL;    // head pointer to the previous state for the fracture domain (used in dual perm mode)
+                                                                        // used in computing derivatives and mass balance
+  struct soil_properties_*               soil_properties;               // dynamic allocation
+  struct soil_properties_*               soil_properties_frac;          // dynamic allocation
+  struct mass_transfer_soil_properties_* mass_transfer_soil_properties; // dynamic allocation
+
+  struct lgar_bmi_parameters             lgar_bmi_params;
+  struct lgar_mass_balance_variables     lgar_mass_balance;
+  struct unit_conversion                 units;
+  struct lgar_bmi_input_parameters*      lgar_bmi_input_params;
+  struct lgar_calib_parameters           lgar_calib_params;
 };
 
 
@@ -270,7 +329,7 @@ extern double calc_h_from_Se(double Se, double alpha, double m, double n);
 extern double calc_Se_from_h(double h, double alpha, double m, double n);
 extern double calc_theta_from_h(double h, double alpha, double m, double n, double theta_e, double theta_r);
 extern double calc_Se_from_theta(double theta,double effsat,double residual);
-extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, double theta_e, double theta_r,
+extern double calc_Geff(bool use_closed_form_G, bool calc_for_frac_domain, double theta1, double theta2, double theta_e, double theta_r,
                         double alpha, double n, double m, double h_min, double Ks, int nint, double lambda, double bc_psib_cm);
 
 /*########################################*/
@@ -287,16 +346,20 @@ extern bool correct_close_psis(int *soil_type, struct soil_properties_ *soil_pro
 
 // computes derivatives; called derivs() in Python code
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, double timestep_h, double h_p, int *soil_type, double *cum_layer_thickness_cm,
-			   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, int num_layers);
+			   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, int num_layers, bool calc_for_frac_domain);
 
 // computes dry depth
-extern double lgar_calc_dry_depth(bool use_closed_form_G, bool TO_enabled, int nint, double timestep_h, double *deltheta, int *soil_type,
+extern double lgar_calc_dry_depth(bool use_closed_form_G, bool calc_for_frac_domain, bool TO_enabled, int nint, double timestep_h, double *deltheta, int *soil_type,
                                   double *cum_layer_thickness_cm, double *frozen_factor,
 				  struct wetting_front* head, struct soil_properties_ *soil_properties);
 
 // reads van Genuchten parameters from a file
-extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_types, double wilting_point_psi_cm,
-                                    struct soil_properties_ *soil_properties);
+extern int lgar_read_vG_param_file(bool dual_perm, char const* vG_param_file_name, int num_soil_types, double wilting_point_psi_cm,
+                                    struct soil_properties_ *soil_properties, struct soil_properties_ *soil_properties_frac);
+
+// reads matrix / fracture interface parameters from a file
+extern int lgar_read_vG_param_file_mass_transfer(char const* frac_matrix_interface_param_file_name, int num_soil_types,
+				                                         struct mass_transfer_soil_properties_ *mass_transfer_soil_properties);
 
 // creates a surficial front (new top most wetting front)
 extern double lgar_create_surficial_front(bool TO_enabled, int num_layers, double *ponded_depth_cm, double *volin, double dry_depth,
@@ -304,7 +367,7 @@ extern double lgar_create_surficial_front(bool TO_enabled, int num_layers, doubl
 					double *frozen_factor, struct wetting_front **head, struct soil_properties_ *soil_properties);
 
 // computes the infiltration capacity, fp, of the soil
-extern double lgar_insert_water(bool use_closed_form_G, int nint, double timestep_h, double *free_drainage_subtimestep_cm, double *AET_demand_cm, double *ponded_depth,
+extern double lgar_insert_water(bool use_closed_form_G, bool calc_for_frac_domain, int nint, double timestep_h, double *free_drainage_subtimestep_cm, double *AET_demand_cm, double *ponded_depth,
 				double *volin_this_timestep, double precip_timestep_cm, int wf_free_drainge_demand,
 				int num_layers, double ponded_depth_max_cm, int *soil_type, double *cum_layer_thickness_cm,
 				double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties);
@@ -392,6 +455,29 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
 				      double prior_mass, double *AET_demand_cm, double *delta_theta, double *layer_thickness_cm,
 				      int *soil_type, struct soil_properties_ *soil_properties);
 
+// computes updated theta (soil moisture content) only when mass transfer occurs between fracture domain and soil matrix when dual permeability is enabled
+extern double lgar_theta_mass_balance_for_multilayer_mass_transfer(int layer_num, int front_num, int soil_num, int count_for_num_wfs_above_to_include_in_mbal_calc, 
+              double psi_cm, double new_mass, double prior_mass, double *delta_thickness, int *soil_type, struct soil_properties_ *soil_properties);
+
+// subroutine used by lgar_dual_perm_mass_transfer to make an array of unique WF depths between both domains
+void insert_unique_depth(double *array, int *size, double value);
+
+// subroutine used by lgar_dual_perm_mass_transfer to make an array of unique WF depths between both domains
+void collect_unique_depths(struct wetting_front **head, struct wetting_front **head_frac, double *depth_array, int *size);
+
+// Function to compare values for sorting
+int compare(const void *a, const void *b);
+
+// Function to print the unique sorted depths
+void print_depths(double *depths, int size);
+
+extern double lgar_dual_perm_mass_transfer(bool TO_enabled, int num_layers, double ratio_fracture_vol_to_total_vol, double subtimestep_h, double *rch_matrix, double *rch_frac, struct wetting_front** head, struct wetting_front** head_frac, double *cum_layer_thickness, 
+                                         double *frozen_factor, int *soil_type, struct soil_properties_ *soil_properties, struct soil_properties_ *soil_properties_frac, struct mass_transfer_soil_properties_ *mass_transfer_soil_properties);
+
+//this fxn does layer boundary corssing, merging, etc. until no longer necessary after mass transfer in dual permeability mode
+extern void correct_WFs_after_mass_transfer(bool TO_enabled, int num_layers, double *inc_rch, struct wetting_front** head, double *cum_layer_thickness, double *frozen_factor,
+                                            int *soil_type, struct soil_properties_ *soil_properties);
+
 /********************************************************************/
 // Bmi functions
 /********************************************************************/
@@ -399,7 +485,7 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
 extern void lgar_initialize(string config_file, struct model_state *state);
 extern void InitFromConfigFile(string config_file, struct model_state *state);
 extern vector<double> ReadVectorData(string key);
-extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double initial_psi_cm, int *layer_soil_type, double *cum_layer_thickness_cm,
+extern void InitializeWettingFronts(bool TO_enabled, int num_layers, int number_of_WFs_per_layer, double initial_psi_cm, int *layer_soil_type, double *cum_layer_thickness_cm,
 				    double *layer_thickness_cm, double *frozen_factor, struct wetting_front** head, struct soil_properties_ *soil_properties);
 
 /********************************************************************/
@@ -455,5 +541,8 @@ extern void f_alloc(float **var,int size);
 /*   utility function prototypes */
 /*###############################*/
 extern bool is_epsilon_less_than(double a, double eps);
+
+//functions for conceptual quickflow model
+extern double calc_QF_Q(double subtimestep_h, double a, double b, double precip_for_QF_subtimestep_cm, double *QF_storage_cm);
 
 #endif  // _ALL_HXX

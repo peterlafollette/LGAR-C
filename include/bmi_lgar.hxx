@@ -128,7 +128,7 @@ public:
   void GetGridFaceNodes(const int grid, int *face_nodes);
   void GetGridNodesPerFace(const int grid, int *nodes_per_face);
   void global_mass_balance();
-  double update_calibratable_parameters();
+  double update_calibratable_parameters(bool dual_perm, double ratio_fracture_vol_to_total_vol);
   struct model_state* get_model();
   
 private:
@@ -151,15 +151,20 @@ private:
   struct bmi_unit_conversion {
     double volprecip_timestep_m;
     double volin_timestep_m;
+    double volin_timestep_m_frac;
     double volend_timestep_m;
+    double volend_timestep_m_frac;
     double volAET_timestep_m;
     double volrech_timestep_m;
+    double volrech_timestep_m_frac;
     double volrunoff_timestep_m;
+    double volrunoff_timestep_m_frac;
     double volrunoff_giuh_timestep_m;
     double volQ_timestep_m;
     double volQ_gw_timestep_m;
     double volPET_timestep_m;
     double mass_balance_m;
+    double mass_transfer_timestep_m;
   };
 
   struct bmi_unit_conversion bmi_unit_conv;

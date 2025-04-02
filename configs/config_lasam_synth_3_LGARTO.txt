@@ -1,6 +1,7 @@
 verbosity=none
 forcing_file=./forcing/forcing_data_synth_3_LGARTO.txt
-soil_params_file=./data/vG_default_params_HYDRUS.dat
+soil_params_file=./data/vG_default_params_HYDRUS_frac.dat
+soil_params_file_mfi=./data/vG_default_params_mfi.dat
 layer_thickness=10.0,45.0,45.0[cm]
 initial_psi=100.0[cm]
 timestep=300[sec]
@@ -13,6 +14,12 @@ wilting_point_psi=15495.0[cm]
 field_capacity_psi=340.9[cm]
 root_zone_depth=50.0[cm]
 giuh_ordinates=0.0,0.0,0.0,0.0,0.0
-adaptive_timestep=false
+adaptive_timestep=true
 TO_enabled=true
+free_drainage_enabled=false
+dual_perm=true
+frac_to_pref=0.1
+ratio_fracture_vol_to_total_vol=0.1
+mbal_tol=0.1
+PET_affects_precip=false
 

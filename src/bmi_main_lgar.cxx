@@ -55,21 +55,47 @@ int main(int argc, char *argv[])
   std::string var_name_wf     = "soil_moisture_wetting_fronts";
   std::string var_name_thickness_wf = "soil_depth_wetting_fronts";
 
-  int num_output_var = 11;
+  int num_output_var;
+
+  if (model_state.get_model()->lgar_bmi_params.dual_perm){
+    num_output_var = 15;
+  }
+  else {
+    num_output_var = 11;
+  }
   std::vector<std::string> output_var_names(num_output_var);
   std::vector<double> output_var_data(num_output_var);
 
-  output_var_names[0]  = "precipitation";
-  output_var_names[1]  = "potential_evapotranspiration";
-  output_var_names[2]  = "actual_evapotranspiration";
-  output_var_names[3]  = "surface_runoff"; // direct surface runoff
-  output_var_names[4]  = "giuh_runoff";
-  output_var_names[5]  = "soil_storage";
-  output_var_names[6]  = "total_discharge";
-  output_var_names[7]  = "infiltration";
-  output_var_names[8]  = "percolation";
-  output_var_names[9]  = "groundwater_to_stream_recharge";
-  output_var_names[10] = "mass_balance";
+  if (model_state.get_model()->lgar_bmi_params.dual_perm){
+    output_var_names[0]  = "precipitation";
+    output_var_names[1]  = "potential_evapotranspiration";
+    output_var_names[2]  = "actual_evapotranspiration";
+    output_var_names[3]  = "surface_runoff_frac"; // direct surface runoff
+    output_var_names[4]  = "giuh_runoff";
+    output_var_names[5]  = "soil_storage";
+    output_var_names[6]  = "soil_storage_frac";
+    output_var_names[7]  = "total_discharge";
+    output_var_names[8]  = "infiltration";
+    output_var_names[9]  = "infiltration_frac";
+    output_var_names[10] = "percolation";
+    output_var_names[11] = "percolation_frac";
+    output_var_names[12] = "groundwater_to_stream_recharge";
+    output_var_names[13] = "mass_transfer";
+    output_var_names[14] = "mass_balance";
+  }
+  else {
+    output_var_names[0]  = "precipitation";
+    output_var_names[1]  = "potential_evapotranspiration";
+    output_var_names[2]  = "actual_evapotranspiration";
+    output_var_names[3]  = "surface_runoff"; // direct surface runoff
+    output_var_names[4]  = "giuh_runoff";
+    output_var_names[5]  = "soil_storage";
+    output_var_names[6]  = "total_discharge";
+    output_var_names[7]  = "infiltration";
+    output_var_names[8]  = "percolation";
+    output_var_names[9]  = "groundwater_to_stream_recharge";
+    output_var_names[10] = "mass_balance";
+  }
 
 
   // total number of timesteps
@@ -90,23 +116,30 @@ int main(int argc, char *argv[])
   if (verbosity.compare("high") == 0 && !is_IO_supress) {
     std::cout<<"Variables are written to file           : \'data_variables.csv\' \n";
     std::cout<<"Wetting fronts state is written to file : \'data_layers.csv\' \n";
+    if (model_state.get_model()->lgar_bmi_params.dual_perm){
+      std::cout<<"Wetting fronts state for fracture domain is written to file : \'data_layers_frac.csv\' \n";
+    }
   }
 
   FILE *outdata_fptr = NULL;
   FILE *outlayer_fptr = NULL;
+  FILE *outlayer_fptr_frac = NULL;
 
   if (!is_IO_supress) {
     outdata_fptr = fopen("data_variables.csv", "w");  // write output variables (e.g. infiltration, storage etc.) to this file pointer
     outlayer_fptr = fopen("data_layers.csv", "w");    // write output layers to this file pointer
+    if (model_state.get_model()->lgar_bmi_params.dual_perm){
+      outlayer_fptr_frac = fopen("data_layers_frac.csv", "w");    // write output layers to this file pointer, for fracture domain
+    }
 
     // write heading (variable names)
     fprintf(outdata_fptr,"Time,");
     for (int j = 0; j < num_output_var; j++) {
       fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
       if (j == num_output_var-1)
-	fprintf(outdata_fptr,"\n");
+	      fprintf(outdata_fptr,"\n");
       else
-      fprintf(outdata_fptr,",");
+        fprintf(outdata_fptr,",");
     }
 
   }
@@ -155,6 +188,10 @@ int main(int argc, char *argv[])
       // write layers data to file
       fprintf(outlayer_fptr,"# Timestep = %d, %s \n", i, time[i].c_str());
       write_state(outlayer_fptr, model_state.get_model()->head);
+      if (model_state.get_model()->lgar_bmi_params.dual_perm){
+        fprintf(outlayer_fptr_frac,"# Timestep = %d, %s \n", i, time[i].c_str());
+        write_state(outlayer_fptr_frac, model_state.get_model()->head_frac);
+      }
       delete [] soil_moisture_wetting_front;
       delete [] soil_thickness_wetting_front;
     }
@@ -167,6 +204,9 @@ int main(int argc, char *argv[])
   if (outdata_fptr) {
     fclose(outdata_fptr);
     fclose(outlayer_fptr);
+    if (model_state.get_model()->lgar_bmi_params.dual_perm){
+      fclose(outlayer_fptr_frac);
+    }
   }
 
   end_time = clock();
@@ -174,7 +214,12 @@ int main(int argc, char *argv[])
   elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
 
   std::cout<<setprecision(4);
-  std::cout<<"Time                      =   "<< elapsed <<" sec \n";
+  if (model_state.get_model()->lgar_bmi_params.dual_perm){
+    std::cout<<"Time                           =   "<< elapsed <<" sec \n";
+  }
+  else {
+    std::cout<<"Time                     =   "<< elapsed <<" sec \n";
+  }
 
   return SUCCESS;
 }

@@ -31,11 +31,15 @@
 //This really helps when the limits of integration in terms of psi are quite far apart, and also helps to save runtime.
 /***********************************************************************************************/
 
-extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, double theta_e, double theta_r,
+extern double calc_Geff(bool use_closed_form_G, bool calc_for_frac_domain, double theta1, double theta2, double theta_e, double theta_r,
                         double vg_alpha, double vg_n, double vg_m, double h_min, double Ksat, int nint, double lambda, double bc_psib_cm)
 
 {
   double Geff;       // this is the result to be returned.
+
+  if (calc_for_frac_domain){
+    // return 0.0;
+  }
 
   if (!use_closed_form_G){
     // local variables
