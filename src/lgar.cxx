@@ -111,6 +111,7 @@ extern void lgar_initialize(string config_file, struct model_state *state)
   state->lgar_calib_params.a = state->lgar_bmi_params.a;
   state->lgar_calib_params.b = state->lgar_bmi_params.b;
   state->lgar_calib_params.frac_to_GW = state->lgar_bmi_params.frac_to_GW;
+  state->lgar_calib_params.spf_factor = state->lgar_bmi_params.spf_factor;
   state->lgar_calib_params.frac_to_pref = state->lgar_bmi_params.frac_to_pref;
   state->lgar_calib_params.ratio_fracture_vol_to_total_vol = state->lgar_bmi_params.ratio_fracture_vol_to_total_vol;
 
@@ -280,6 +281,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_a_set                     = false;
   bool is_b_set                     = false;
   bool is_frac_to_GW_set            = false;
+  bool is_spf_factor_set            = false;
   bool is_frac_to_pref_set          = false;
   bool is_soil_params_file_set      = false;
   bool is_soil_params_file_mfi_set  = false; //for the matrix - fracture interface
@@ -484,6 +486,16 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       if (verbosity.compare("high") == 0) {
 	std::cerr<<"frac_to_GW : "<<state->lgar_bmi_params.frac_to_GW<<"\n";
+	std::cerr<<"          *****         \n";
+      }
+      continue;
+    }
+    else if (param_key == "spf_factor") {
+      state->lgar_bmi_params.spf_factor = stod(param_value);
+      is_spf_factor_set = true;
+
+      if (verbosity.compare("high") == 0) {
+	std::cerr<<"spf_factor : "<<state->lgar_bmi_params.spf_factor<<"\n";
 	std::cerr<<"          *****         \n";
       }
       continue;

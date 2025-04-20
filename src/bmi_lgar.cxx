@@ -225,6 +225,8 @@ Update()
   double a = state->lgar_bmi_params.a;
   double b = state->lgar_bmi_params.b;
   double frac_to_GW = state->lgar_bmi_params.frac_to_GW;
+  double frac_to_GW_adjusted = 0.0;
+  double spf_factor = state->lgar_bmi_params.spf_factor;
   double frac_to_pref = state->lgar_bmi_params.frac_to_pref;
   double ratio_fracture_vol_to_total_vol = state->lgar_bmi_params.ratio_fracture_vol_to_total_vol;
   double root_zone_depth_cm = state->lgar_bmi_params.root_zone_depth_cm;
@@ -326,10 +328,14 @@ Update()
     precip_subtimestep_cm_per_h = state->lgar_bmi_input_params->precipitation_mm_per_h * mm_to_cm; // rate [cm/hour]
     double precip_for_QF_subtimestep_cm_per_h = 0.0;
 
-    if (state->lgar_bmi_params.runoff_in_prev_step){ // || state->lgar_mass_balance.QF_storage_cm > 0.001 //do the thing here
+    if (state->lgar_bmi_params.runoff_in_prev_step){ // || state->lgar_mass_balance.QF_storage_cm > 0.001
       double precip_subtimestep_cm_per_h_total = precip_subtimestep_cm_per_h;
-      precip_for_QF_subtimestep_cm_per_h = frac_to_GW * precip_subtimestep_cm_per_h_total;
-      precip_subtimestep_cm_per_h = (1.0 - frac_to_GW) * precip_subtimestep_cm_per_h_total;
+      if (frac_to_GW_adjusted<1.E-5){
+        frac_to_GW_adjusted = 0.0;
+      }
+      frac_to_GW_adjusted = frac_to_GW_adjusted * frac_to_GW;
+      precip_for_QF_subtimestep_cm_per_h = frac_to_GW_adjusted * precip_subtimestep_cm_per_h_total;
+      precip_subtimestep_cm_per_h = (1.0 - frac_to_GW_adjusted) * precip_subtimestep_cm_per_h_total;
     }
 
     PET_subtimestep_cm_per_h = state->lgar_bmi_input_params->PET_mm_per_h * mm_to_cm;
@@ -465,11 +471,15 @@ Update()
     double theta_e = state->soil_properties[soil_num].theta_e;
     bool is_top_wf_saturated = false;
     bool top_near_sat = false;
-    double psi_below_which_precip_contribs_to_GW = 5.0; //if psi goes below this value and the GW reservoir is enabled, then some fraction of precipitation will be directed to GW.
+    double psi_below_which_precip_contribs_to_GW = 5000000000000.0; //if psi goes below this value and the GW reservoir is enabled, then some fraction of precipitation will be directed to GW.
+    double factor_for_simple_pref_flow = spf_factor;
+    double theta_above_which_precip_contribs_to_GW = theta_e * factor_for_simple_pref_flow;
     //The idea here is that it should be more necessary in humid environments with highly conductive soils, such that contribtions to GW are expected but runoff is rare. In most semi arid or arid environments, it's probably not necessary / can be set to a low value.
     if (!state->lgar_bmi_params.TO_enabled){
       is_top_wf_saturated = (state->head->theta+1.0E-12) >= theta_e ? true : false; //sometimes a machine precision error would erroneously create a new wetting front during saturated conditions. The + 1.0E-12 seems to prevent this.
       top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+      frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor));
+      // top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
     }
     else {
       if (listLength_surface(state->head)>0){
@@ -485,11 +495,15 @@ Update()
 
         is_top_wf_saturated = (top_most_surface_WF->theta+1.0E-12) >= theta_e_highest_surf ? true : false; 
         top_near_sat = top_most_surface_WF->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        frac_to_GW_adjusted = fmin(1, pow((top_most_surface_WF->theta / theta_e_highest_surf), spf_factor));
+        // top_near_sat = top_most_surface_WF->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
 
       }
       else {
         is_top_wf_saturated = (state->head->theta+1.0E-12) >= theta_e ? true : false;
         top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor));
+        // top_near_sat = state->head->psi_cm > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
       }
     }
 
@@ -701,10 +715,12 @@ Update()
       int soil_num_frac = state->lgar_bmi_params.layer_soil_type[state->head_frac->layer_num];
       double theta_e_frac = state->soil_properties_frac[soil_num_frac].theta_e;
       // double psi_below_which_precip_contribs_to_GW = 5.0; //if psi goes below this value and the GW reservoir is enabled, then some fraction of precipitation will be directed to GW.
+      double theta_above_which_precip_contribs_to_GW_frac = theta_e_frac * factor_for_simple_pref_flow;
       // //The idea here is that it should be more necessary in humid environments with highly conductive soils, such that contribtions to GW are expected but runoff is rare. In most semi arid or arid environments, it's probably not necessary / can be set to a low value.
       if (!state->lgar_bmi_params.TO_enabled){
         is_top_wf_saturated_frac = (state->head_frac->theta+1.0E-12) >= theta_e_frac ? true : false; //sometimes a machine precision error would erroneously create a new wetting front during saturated conditions. The + 1.0E-12 seems to prevent this.
         top_near_sat_frac = state->head_frac->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        // top_near_sat_frac = state->head_frac->theta > theta_above_which_precip_contribs_to_GW_frac ? true : false; //is the top WF near saturation
       }
       else {
         if (listLength_surface(state->head_frac)>0){
@@ -720,11 +736,13 @@ Update()
 
           is_top_wf_saturated_frac = (top_most_surface_WF->theta+1.0E-12) >= theta_e_highest_surf ? true : false; 
           top_near_sat_frac = top_most_surface_WF->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+          // top_near_sat_frac = top_most_surface_WF->theta > theta_above_which_precip_contribs_to_GW_frac ? true : false;
 
         }
         else {
           is_top_wf_saturated_frac = (state->head->theta+1.0E-12) >= theta_e_frac ? true : false;
           top_near_sat_frac = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+          // top_near_sat_frac = state->head->theta > theta_above_which_precip_contribs_to_GW_frac ? true : false; //is the top WF near saturation
         }
       }
 
@@ -1473,6 +1491,7 @@ update_calibratable_parameters(bool dual_perm, double ratio_fracture_vol_to_tota
       <<", b = "     << state->lgar_bmi_params.b
       <<", frac_to_GW = "     << state->lgar_bmi_params.frac_to_GW
       <<", frac_to_pref = "     << state->lgar_bmi_params.frac_to_pref
+      <<", spf_factor = "     << state->lgar_bmi_params.spf_factor
       <<", ratio_fracture_vol_to_total_vol = "     << state->lgar_bmi_params.ratio_fracture_vol_to_total_vol <<
       "\n";
   }
@@ -1482,6 +1501,7 @@ update_calibratable_parameters(bool dual_perm, double ratio_fracture_vol_to_tota
   state->lgar_bmi_params.a                     = state->lgar_calib_params.a;
   state->lgar_bmi_params.b                     = state->lgar_calib_params.b;
   state->lgar_bmi_params.frac_to_GW            = state->lgar_calib_params.frac_to_GW;
+  state->lgar_bmi_params.spf_factor            = state->lgar_calib_params.spf_factor;
   state->lgar_bmi_params.frac_to_pref          = state->lgar_calib_params.frac_to_pref;
   state->lgar_bmi_params.ratio_fracture_vol_to_total_vol          = state->lgar_calib_params.ratio_fracture_vol_to_total_vol;
 
@@ -1493,6 +1513,7 @@ update_calibratable_parameters(bool dual_perm, double ratio_fracture_vol_to_tota
       <<", b = "     << state->lgar_bmi_params.b
       <<", frac_to_GW = "     << state->lgar_bmi_params.frac_to_GW
       <<", frac_to_pref = "     << state->lgar_bmi_params.frac_to_pref
+      <<", spf_factor = "     << state->lgar_bmi_params.spf_factor
       <<", ratio_fracture_vol_to_total_vol = "     << state->lgar_bmi_params.ratio_fracture_vol_to_total_vol <<
       "\n";
   }
@@ -1566,7 +1587,7 @@ GetVarGrid(std::string name)
 	   || name.compare("actual_evapotranspiration") == 0) // double
     return 1;
   else if (name.compare("surface_runoff") == 0 || name.compare("giuh_runoff") == 0 || name.compare("surface_runoff_frac") == 0 || name.compare("ratio_fracture_vol_to_total_vol") == 0
-	   || name.compare("soil_storage") == 0 || name.compare("soil_storage_frac") == 0 || name.compare("field_capacity") == 0 || name.compare("a") == 0 || name.compare("b") == 0 || name.compare("frac_to_GW") == 0 || name.compare("frac_to_pref") == 0 || name.compare("ponded_depth_max") == 0)// double
+	   || name.compare("soil_storage") == 0 || name.compare("soil_storage_frac") == 0 || name.compare("field_capacity") == 0 || name.compare("a") == 0 || name.compare("b") == 0 || name.compare("frac_to_GW") == 0 || name.compare("spf_factor") == 0 || name.compare("frac_to_pref") == 0 || name.compare("ponded_depth_max") == 0)// double
     return 1;
   else if (name.compare("total_discharge") == 0 || name.compare("infiltration") == 0 || name.compare("infiltration_frac") == 0 || name.compare("initial_psi_cm") == 0
 	   || name.compare("percolation") == 0 || name.compare("percolation_frac") == 0 || name.compare("groundwater_to_stream_recharge") == 0) // double
@@ -1838,6 +1859,8 @@ GetValuePtr (std::string name)
     return (void*)&this->state->lgar_calib_params.b;
   else if (name.compare("frac_to_GW") == 0)
     return (void*)&this->state->lgar_calib_params.frac_to_GW;
+    else if (name.compare("spf_factor") == 0)
+    return (void*)&this->state->lgar_calib_params.spf_factor;
   else if (name.compare("frac_to_pref") == 0)
     return (void*)&this->state->lgar_calib_params.frac_to_pref;
   else if (name.compare("ratio_fracture_vol_to_total_vol") == 0)

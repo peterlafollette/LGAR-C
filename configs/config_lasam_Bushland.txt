@@ -19,3 +19,4 @@ a=0.1
 b=3.0
 frac_to_GW=0.25
 PET_affects_precip=true
+spf_factor=20

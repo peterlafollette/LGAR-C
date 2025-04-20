@@ -147,6 +147,7 @@ struct lgar_bmi_parameters
   double a = 0.0;                        // parameter for nonlinear GW reservoir
   double b = 0.0;                        // parameter for nonlinear GW reservoir
   double frac_to_GW = 0.0;               // parameter for nonlinear GW reservoir 
+  double spf_factor = 0.98;              // parameter that controls the theta value above which contributions to the GW reservoir will be made
   double frac_to_pref = 0.0;             // parameter controlling what fraction of precipitation and ponded head goes to the fracture (preferential flow) domain
   double ratio_fracture_vol_to_total_vol = 0.0; //parameter controlling ratio of volume of fracture domain to volume of total system, and therefore also controlling this ratio for the soil matrix.
   double root_zone_depth_cm;             // maximum depth from which roots extract water
@@ -243,6 +244,7 @@ struct lgar_calib_parameters
   double a;                      // parameter for nonlinear groundwater reservoir
   double b;                      // parameter for nonlinear groundwater reservoir
   double frac_to_GW;             // parameter for nonlinear groundwater reservoir
+  double spf_factor;             // parameter for nonlinear groundwater reservoir
   double frac_to_pref;           // parameter controlling what fraction of precipitation and ponded head goes to the fracture (preferential flow) domain
   double ratio_fracture_vol_to_total_vol; //parameter controlling ratio of volume of fracture domain to volume of total system, and therefore also controlling this ratio for the soil matrix.
 
