@@ -1533,46 +1533,55 @@ update_calibratable_parameters(bool dual_perm, double ratio_fracture_vol_to_tota
   return volstart_after - volstart_before;
 }
 
-void BmiLGAR::
-Finalize()
+void BmiLGAR::Finalize()
 {
-  global_mass_balance();
-  listDelete(state->head);
-  listDelete(state->state_previous);
+    global_mass_balance();
 
-  listDelete(state->head_frac);
-  listDelete(state->state_previous_frac);
+    listDelete(state->head);
+    listDelete(state->state_previous);
+    listDelete(state->head_frac);
+    listDelete(state->state_previous_frac);
 
-  delete [] state->soil_properties;
-  delete [] state->soil_properties_frac;
-  delete [] state->mass_transfer_soil_properties;
+    delete [] state->soil_properties;
+    delete [] state->soil_properties_frac;
+    delete [] state->mass_transfer_soil_properties;
 
-  delete [] state->lgar_bmi_params.soil_depth_wetting_fronts;
-  delete [] state->lgar_bmi_params.soil_moisture_wetting_fronts;
+    delete [] state->lgar_bmi_params.soil_depth_wetting_fronts;
+    delete [] state->lgar_bmi_params.soil_moisture_wetting_fronts;
+    delete [] state->lgar_bmi_params.soil_temperature;
+    delete [] state->lgar_bmi_params.soil_temperature_z;
+    delete [] state->lgar_bmi_params.layer_soil_type;
+    delete [] state->lgar_bmi_params.layer_thickness_cm;
+    delete [] state->lgar_bmi_params.cum_layer_thickness_cm;
+    delete [] state->lgar_bmi_params.giuh_ordinates;
+    delete [] state->lgar_bmi_params.frozen_factor;
 
-  delete [] state->lgar_bmi_params.soil_temperature;
-  delete [] state->lgar_bmi_params.soil_temperature_z;
-  delete [] state->lgar_bmi_params.layer_soil_type;
+    delete [] state->lgar_calib_params.theta_e;
+    delete [] state->lgar_calib_params.theta_r;
+    delete [] state->lgar_calib_params.vg_n;
+    delete [] state->lgar_calib_params.vg_alpha;
+    delete [] state->lgar_calib_params.Ksat;
 
-  delete [] state->lgar_calib_params.theta_e;
-  delete [] state->lgar_calib_params.theta_r;
-  delete [] state->lgar_calib_params.vg_n;
-  delete [] state->lgar_calib_params.vg_alpha;
-  delete [] state->lgar_calib_params.Ksat;
+    // Only delete fracture-domain parameters if they were allocated
+    if (state->lgar_calib_params.theta_e_f != nullptr)
+        delete [] state->lgar_calib_params.theta_e_f;
 
-  delete [] state->lgar_calib_params.theta_e_f;
-  delete [] state->lgar_calib_params.theta_r_f;
-  delete [] state->lgar_calib_params.vg_n_f;
-  delete [] state->lgar_calib_params.vg_alpha_f;
-  delete [] state->lgar_calib_params.Ksat_f;
+    if (state->lgar_calib_params.theta_r_f != nullptr)
+        delete [] state->lgar_calib_params.theta_r_f;
 
-  delete [] state->lgar_bmi_params.layer_thickness_cm;
-  delete [] state->lgar_bmi_params.cum_layer_thickness_cm;
-  delete [] state->lgar_bmi_params.giuh_ordinates;
-  delete [] state->lgar_bmi_params.frozen_factor;
-  delete state->lgar_bmi_input_params;
-  delete state;
+    if (state->lgar_calib_params.vg_n_f != nullptr)
+        delete [] state->lgar_calib_params.vg_n_f;
+
+    if (state->lgar_calib_params.vg_alpha_f != nullptr)
+        delete [] state->lgar_calib_params.vg_alpha_f;
+
+    if (state->lgar_calib_params.Ksat_f != nullptr)
+        delete [] state->lgar_calib_params.Ksat_f;
+
+    delete state->lgar_bmi_input_params;
+    delete state;
 }
+
 
 
 int BmiLGAR::

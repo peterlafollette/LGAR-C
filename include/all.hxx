@@ -248,11 +248,11 @@ struct lgar_calib_parameters
   double frac_to_pref;           // parameter controlling what fraction of precipitation and ponded head goes to the fracture (preferential flow) domain
   double ratio_fracture_vol_to_total_vol; //parameter controlling ratio of volume of fracture domain to volume of total system, and therefore also controlling this ratio for the soil matrix.
 
-  double *theta_e_f;             // theta_e = smcmax [-] for fracture domain
-  double *theta_r_f;             // theta_r = smcmin [-] for fracture domain
-  double *vg_n_f;                // Van Genuchten n [-] for fracture domain
-  double *vg_alpha_f;            // Van Genuchten alpha [1/cm] for fracture domain
-  double *Ksat_f;                // Hydraulic conductivity [cm/hr] for fracture domain
+  double *theta_e_f=nullptr;             // theta_e = smcmax [-] for fracture domain
+  double *theta_r_f=nullptr;             // theta_r = smcmin [-] for fracture domain
+  double *vg_n_f=nullptr;                // Van Genuchten n [-] for fracture domain
+  double *vg_alpha_f=nullptr;            // Van Genuchten alpha [1/cm] for fracture domain
+  double *Ksat_f=nullptr;                // Hydraulic conductivity [cm/hr] for fracture domain
 
   // parameters describing the mass trasnfer between the fracture domain and soil matrix: see "Evaluation of a first-order water transfer term for variably saturated dual-porosity flow models", Water Resour. Res., 29, 1225-1238, 1993.
   double *a_f;                   // effective 'diffusion' pathlength [cm] (i.e. half the aggregate width or half the fracture spacing), sometime given the name 'd'.
