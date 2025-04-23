@@ -330,9 +330,15 @@ Update()
 
     if (state->lgar_bmi_params.runoff_in_prev_step){ // || state->lgar_mass_balance.QF_storage_cm > 0.001
       double precip_subtimestep_cm_per_h_total = precip_subtimestep_cm_per_h;
-      if (frac_to_GW_adjusted<1.E-5){
+
+      int soil_num = state->lgar_bmi_params.layer_soil_type[state->head->layer_num];
+      double theta_e = state->soil_properties[soil_num].theta_e;
+      frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor)); //this is absolutely hacked, will only work in LGAR mode, and for sure should be made a variable that is part of state
+
+      if (frac_to_GW_adjusted<1.E-7){
         frac_to_GW_adjusted = 0.0;
       }
+      // frac_to_GW_adjusted = 1.0; //hacked for simple threshold bypass method
       frac_to_GW_adjusted = frac_to_GW_adjusted * frac_to_GW;
       precip_for_QF_subtimestep_cm_per_h = frac_to_GW_adjusted * precip_subtimestep_cm_per_h_total;
       precip_subtimestep_cm_per_h = (1.0 - frac_to_GW_adjusted) * precip_subtimestep_cm_per_h_total;
@@ -477,9 +483,9 @@ Update()
     //The idea here is that it should be more necessary in humid environments with highly conductive soils, such that contribtions to GW are expected but runoff is rare. In most semi arid or arid environments, it's probably not necessary / can be set to a low value.
     if (!state->lgar_bmi_params.TO_enabled){
       is_top_wf_saturated = (state->head->theta+1.0E-12) >= theta_e ? true : false; //sometimes a machine precision error would erroneously create a new wetting front during saturated conditions. The + 1.0E-12 seems to prevent this.
-      top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+      // top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
       frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor));
-      // top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+      top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
     }
     else {
       if (listLength_surface(state->head)>0){
@@ -494,16 +500,16 @@ Update()
         double theta_e_highest_surf = state->soil_properties[soil_num_highest_surf].theta_e;
 
         is_top_wf_saturated = (top_most_surface_WF->theta+1.0E-12) >= theta_e_highest_surf ? true : false; 
-        top_near_sat = top_most_surface_WF->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        // top_near_sat = top_most_surface_WF->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
         frac_to_GW_adjusted = fmin(1, pow((top_most_surface_WF->theta / theta_e_highest_surf), spf_factor));
-        // top_near_sat = top_most_surface_WF->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        top_near_sat = top_most_surface_WF->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
 
       }
       else {
         is_top_wf_saturated = (state->head->theta+1.0E-12) >= theta_e ? true : false;
-        top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        // top_near_sat = state->head->psi_cm < psi_below_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
         frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor));
-        // top_near_sat = state->head->psi_cm > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
+        top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation
       }
     }
 
@@ -1091,6 +1097,7 @@ Update()
     QF_Q_timestep_cm += QF_Q_subtimestep_cm;
 
     // set runoff_in_prev_step for next step
+    top_near_sat = true; //hacked for power law bypass method
     if ((volrunoff_subtimestep_cm > 1.E-9) || (top_near_sat) || (top_near_sat_frac)){
       state->lgar_bmi_params.runoff_in_prev_step = true;
     }
@@ -1581,7 +1588,6 @@ void BmiLGAR::Finalize()
     delete state->lgar_bmi_input_params;
     delete state;
 }
-
 
 
 int BmiLGAR::
