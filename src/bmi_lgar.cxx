@@ -330,15 +330,10 @@ Update()
 
     if (state->lgar_bmi_params.runoff_in_prev_step){ // || state->lgar_mass_balance.QF_storage_cm > 0.001
       double precip_subtimestep_cm_per_h_total = precip_subtimestep_cm_per_h;
-
-      int soil_num = state->lgar_bmi_params.layer_soil_type[state->head->layer_num];
-      double theta_e = state->soil_properties[soil_num].theta_e;
-      frac_to_GW_adjusted = fmin(1, pow((state->head->theta / theta_e), spf_factor)); //this is absolutely hacked, will only work in LGAR mode, and for sure should be made a variable that is part of state
-
       if (frac_to_GW_adjusted<1.E-7){
         frac_to_GW_adjusted = 0.0;
       }
-      // frac_to_GW_adjusted = 1.0; //hacked for simple threshold bypass method
+      frac_to_GW_adjusted = 1.0;
       frac_to_GW_adjusted = frac_to_GW_adjusted * frac_to_GW;
       precip_for_QF_subtimestep_cm_per_h = frac_to_GW_adjusted * precip_subtimestep_cm_per_h_total;
       precip_subtimestep_cm_per_h = (1.0 - frac_to_GW_adjusted) * precip_subtimestep_cm_per_h_total;
@@ -1097,7 +1092,6 @@ Update()
     QF_Q_timestep_cm += QF_Q_subtimestep_cm;
 
     // set runoff_in_prev_step for next step
-    top_near_sat = true; //hacked for power law bypass method
     if ((volrunoff_subtimestep_cm > 1.E-9) || (top_near_sat) || (top_near_sat_frac)){
       state->lgar_bmi_params.runoff_in_prev_step = true;
     }
