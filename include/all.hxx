@@ -176,6 +176,8 @@ struct lgar_bmi_parameters
   bool   is_invalid_soil_type  = true;  // checks if the provided soil type is valid for the model, if not then return Q_out = precip
 
   bool   runoff_in_prev_step = false; // true if there was there runoff in the previous time step. Used for conceptual quickflow model
+  bool   allow_flux_caching = false; //if set to true, allows for the use of cached fluxes rather than computing new ones when internal states are changing slowly. 
+  int    cache_count = 1;            //used for caching to accumulate fluxes
 };
 
 // Define a data structure for local (timestep) and global mass balance parameters
@@ -228,6 +230,12 @@ struct lgar_mass_balance_variables
 
   double QF_storage_cm = 0.0;    //water stored in the conceptual quickflow reservoir
   double volrunoff_QF_cm = 0.0;  //discharge to stream from QF reservoir
+
+  double previous_AET = 0.0;  // used to determine if fluxes can be cached rather than computed
+  double previous_PET = 0.0;  // used to determine if fluxes can be cached rather than computed
+  double previous_recharge = 0.0;  // used to determine if fluxes can be cached rather than computed
+  bool cache_fluxes = FALSE;
+  double accumulated_PET = 0.0;
 };
 
 // Define a data structure for calibratable parameters
@@ -348,7 +356,7 @@ extern bool correct_close_psis(int *soil_type, struct soil_properties_ *soil_pro
 
 // computes derivatives; called derivs() in Python code
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, double timestep_h, double h_p, int *soil_type, double *cum_layer_thickness_cm,
-			   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, int num_layers, bool calc_for_frac_domain);
+			   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, int num_layers, bool calc_for_frac_domain, bool switch_caching, int cache_count, int new_front);
 
 // computes dry depth
 extern double lgar_calc_dry_depth(bool use_closed_form_G, bool calc_for_frac_domain, bool TO_enabled, int nint, double timestep_h, double *deltheta, int *soil_type,
