@@ -267,6 +267,8 @@ Update()
   bool caching_at_start = state->lgar_mass_balance.cache_fluxes;
   bool switch_caching = FALSE;
 
+  int num_timesteps_before_reset_cache = 24;
+
   if (state->lgar_bmi_params.allow_flux_caching){
     //The idea here is that, during very dry periods, AET will become a small fraction of PET and wetting fronts will be very slow moving. In these cases, it is not necessary to compute fluxes for every time step.
     //To save on runtime, and if allow_flux_caching is set to true in the config file, we simply cache cmputed fluxes to be used for subsequent time steps rather than recomputing them. During these cases, fluxes are recomputed every 6 hours. 
@@ -275,7 +277,7 @@ Update()
     //Testing shows that there is very little change to the simulation when this is enabled.
     //Note that for NextGen models, it is ultimately desirable that there is technically output for every hour, so simply relaxing the adaptive time step to be coarser than 1 hour isn't the best solution
     if ( (subtimestep_h == state->lgar_bmi_params.forcing_resolution_h) ){
-      if ( (state->lgar_bmi_input_params->precipitation_mm_per_h < 1.E-8) && ( (state->lgar_mass_balance.previous_AET / state->lgar_mass_balance.previous_PET) < 0.8) && (state->lgar_bmi_params.cache_count!=6) && (volon_timestep_cm==0) && (state->lgar_mass_balance.previous_recharge<1.E-4) ){
+      if ( (state->lgar_bmi_input_params->precipitation_mm_per_h < 1.E-8) && ( (state->lgar_mass_balance.previous_AET / state->lgar_mass_balance.previous_PET) < 0.75) && (state->lgar_bmi_params.cache_count!=num_timesteps_before_reset_cache) && (volon_timestep_cm==0) && (state->lgar_mass_balance.previous_recharge<1.E-4) ){
         state->lgar_mass_balance.cache_fluxes = TRUE;
       }
       if ( state->lgar_mass_balance.previous_PET<1.E-10 && state->head->dzdt_cm_per_h<1.E-1 && (state->lgar_mass_balance.previous_recharge<1.E-4) ){
@@ -284,7 +286,7 @@ Update()
       if (volon_timestep_cm>0.0){
         state->lgar_mass_balance.cache_fluxes = FALSE;
       }
-      if ( (state->lgar_bmi_params.cache_count==6) || (state->lgar_bmi_input_params->precipitation_mm_per_h >= 1.E-8) ){
+      if ( (state->lgar_bmi_params.cache_count==num_timesteps_before_reset_cache ) || (state->lgar_bmi_input_params->precipitation_mm_per_h >= 1.E-8) ){
         state->lgar_mass_balance.cache_fluxes = FALSE;
       }
     }
