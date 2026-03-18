@@ -288,6 +288,10 @@ Update()
     }
   }
 
+  if (state->lgar_bmi_params.timesteps==1){ //might no longer be necessary now that dz/dt values are loaded during init, but probably a good idea
+    state->lgar_mass_balance.cache_fluxes = FALSE;
+  }
+
   if (caching_at_start && !state->lgar_mass_balance.cache_fluxes){
     switch_caching = TRUE;//if you switch from cached to not, you need to add the "missing" PET back into the mass balance and AET calculation 
   }
@@ -419,6 +423,10 @@ Update()
         state->lgar_mass_balance.accumulated_PET = 0.0;
         mass_correction_for_cached_free_drainage_fluxes += state->lgar_mass_balance.accumulated_free_drainage;
         state->lgar_mass_balance.accumulated_free_drainage = 0.0;
+        if (verbosity.compare("high") == 0) {
+          printf("flux caching increments PET \n");
+          printf("PET_subtimestep_cm_per_h: %lf \n", PET_subtimestep_cm_per_h);
+        }
       }
 
       if (state->lgar_bmi_params.free_drainage_enabled){
@@ -679,6 +687,10 @@ Update()
     volend_timestep_cm = volend_subtimestep_cm;
     state->lgar_bmi_params.precip_previous_timestep_cm = precip_subtimestep_cm;
 
+    if (verbosity.compare("high") == 0) {
+      printf("volCRstart_subtimestep_cm before: %lf \n", volCRstart_subtimestep_cm);
+    }
+
     volCRstart_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
     double volin_CR_subtimestep_cm = (precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR)*subtimestep_h + free_drainage_for_CR;
     double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow, frac_slow, precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + free_drainage_for_CR/subtimestep_h, &state->lgar_mass_balance.CR_fast_storage_cm, &state->lgar_mass_balance.CR_slow_storage_cm);
@@ -686,6 +698,10 @@ Update()
     volQ_CR_timestep_cm += volQ_CR_subtimestep_cm;
     volCRend_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
     volCRend_timestep_cm = volCRend_subtimestep_cm;
+
+    if (verbosity.compare("high") == 0) {
+      printf("volCRstart_subtimestep_cm after: %lf \n", volCRend_timestep_cm);
+    }
 
     // set runoff_in_prev_step for next step
     if ((volrunoff_subtimestep_cm > SMALL_EPS) || (top_near_sat)){

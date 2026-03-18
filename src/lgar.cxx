@@ -286,6 +286,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_giuh_ordinates_set        = false;
   bool is_soil_z_set                = false;
   bool is_ponded_depth_max_cm_set   = false;
+  bool is_state_path_set            = false;
 
   string soil_params_file;
 
@@ -536,6 +537,22 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       continue;
     }
+  else if (param_key == "init_state_path") {
+
+      // remove potential whitespace
+      param_value.erase(0, param_value.find_first_not_of(" \t"));
+      param_value.erase(param_value.find_last_not_of(" \t") + 1);
+
+      state->lgar_bmi_params.init_state_path = param_value;
+      is_state_path_set = true;
+
+      if (verbosity.compare("high") == 0) {
+          std::cerr << "init_state_path set to: "
+                    << state->lgar_bmi_params.init_state_path << "\n";
+          std::cerr << "          *****         \n";
+      }
+      continue;
+  }
     else if (param_key == "free_drainage_enabled") { 
       if (param_value == "false") {
         state->lgar_bmi_params.free_drainage_enabled = false;
@@ -947,9 +964,23 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   for (int i=0; i <= state->lgar_bmi_params.num_layers; i++)
     state->lgar_bmi_params.frozen_factor[i] = 1.0;
 
-  InitializeWettingFronts(state->lgar_bmi_params.num_layers, state->lgar_bmi_params.initial_psi_cm,
-			  state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
-			  state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
+  if (!is_state_path_set){
+    InitializeWettingFronts(state->lgar_bmi_params.num_layers, state->lgar_bmi_params.initial_psi_cm,
+          state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
+          state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
+  }
+  else {
+    InitializeWettingFrontsFromCSV( //note that loading can yield a small mass balance error if theta and psi values were not recorded to high precision
+        //will load the first line of the .csv 
+        state->lgar_bmi_params.num_layers,
+        state->lgar_bmi_params.init_state_path.c_str(),
+        state->lgar_bmi_params.layer_soil_type,
+        state->lgar_bmi_params.cum_layer_thickness_cm,
+        state->lgar_bmi_params.frozen_factor,
+        &state->head,
+        state->soil_properties
+    );
+  }
   
   if (verbosity.compare("none") != 0) {
     std::cerr<<"--- Initial state/conditions --- \n";
@@ -962,9 +993,10 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
   state->lgar_bmi_params.ponded_depth_cm    = 0.0; // initially we start with a dry surface (no surface ponding)
   state->lgar_bmi_params.nint               = 120; // hacked, not needed to be an input option
-  state->lgar_bmi_params.num_wetting_fronts = state->lgar_bmi_params.num_layers;
 
-  assert (state->lgar_bmi_params.num_layers == listLength(state->head));
+  // state->lgar_bmi_params.num_wetting_fronts = state->lgar_bmi_params.num_layers; // only if using InitializeWettingFronts and not InitializeWettingFrontsFromCSV
+  state->lgar_bmi_params.num_wetting_fronts = listLength(state->head);
+  // assert (state->lgar_bmi_params.num_layers == listLength(state->head)); // only if InitializeWettingFronts used and not InitializeWettingFrontsFromCSV
 
   if (verbosity.compare("high") == 0) {
     std::cerr<<"Initial ponded depth is set to zero. \n";
@@ -2905,6 +2937,10 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
     current->dzdt_cm_per_h = dzdt;
 
     current = current->next;  // point to the next link
+
+    if (verbosity.compare("high") == 0) {
+      printf("dzdt: %lf \n", dzdt);
+    }
 
   } while(current != NULL );   // putting conditional at end of do looop makes sure it executes at least once
 

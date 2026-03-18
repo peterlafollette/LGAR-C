@@ -270,9 +270,9 @@ extern void write_state(FILE *out, struct wetting_front* head){
   while(current != NULL)
   {
     if (current == head)
-      fprintf(out,"(%lf,%lf,%d,%d,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.);
+      fprintf(out,"(%lf,%lf,%d,%d,%lf,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h);
     else
-      fprintf(out,"|(%lf,%lf,%d,%d,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.);
+      fprintf(out,"|(%lf,%lf,%d,%d,%lf,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h);
   current = current->next;
   }
   fprintf(out, "]\n");
