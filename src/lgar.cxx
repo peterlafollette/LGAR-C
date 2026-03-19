@@ -328,7 +328,8 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_soil_z_set                = false;
   bool is_ponded_depth_max_cm_set   = false;
   bool is_state_path_set            = false;
-  bool is_non_vadose_state_path_set  = false;
+  bool is_non_vadose_state_path_set = false;
+  bool is_giuh_state_path_set       = false;
 
   string soil_params_file;
 
@@ -580,7 +581,6 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       continue;
     }
   else if (param_key == "init_state_path") {
-
       // remove potential whitespace
       param_value.erase(0, param_value.find_first_not_of(" \t"));
       param_value.erase(param_value.find_last_not_of(" \t") + 1);
@@ -596,7 +596,6 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       continue;
   }
   else if (param_key == "init_non_vadose_state_path") {
-
       // remove potential whitespace
       param_value.erase(0, param_value.find_first_not_of(" \t"));
       param_value.erase(param_value.find_last_not_of(" \t") + 1);
@@ -607,6 +606,21 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       if (verbosity.compare("high") == 0) {
           std::cerr << "init_non_vaodse_state_path set to: "
                     << state->lgar_bmi_params.init_non_vadose_state_path << "\n";
+          std::cerr << "          *****         \n";
+      }
+      continue;
+  }
+  else if (param_key == "init_giuh_state_path") {
+      // remove potential whitespace
+      param_value.erase(0, param_value.find_first_not_of(" \t"));
+      param_value.erase(param_value.find_last_not_of(" \t") + 1);
+
+      state->lgar_bmi_params.init_giuh_state_path = param_value;
+      is_giuh_state_path_set = true;
+
+      if (verbosity.compare("high") == 0) {
+          std::cerr << "init_giuh_state_path set to: "
+                    << state->lgar_bmi_params.init_giuh_state_path << "\n";
           std::cerr << "          *****         \n";
       }
       continue;
@@ -965,6 +979,12 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   if (state->lgar_bmi_params.free_drainage_to_CR && !state->lgar_bmi_params.free_drainage_enabled){
     stringstream errMsg;
     errMsg << "The configuration file \'" << config_file <<"\' sets free_drainage_to_CR as true but sets free_drainage_enabled as false. free_drainage_to_CR being true requires free drainage being enabled \n";
+    throw runtime_error(errMsg.str());
+  }
+
+  if (is_giuh_ordinates_set && !is_giuh_state_path_set && is_state_path_set){
+    stringstream errMsg;
+    errMsg << "The configuration file \'" << config_file <<"\' sets GIUH ordinates and is loading wetting fronts but is not loading a GIUH queue. Either do not set GIUH ordinates, provide a GIUH file to load from, or do not load a soil moisture profile. \n";
     throw runtime_error(errMsg.str());
   }
 

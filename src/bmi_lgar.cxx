@@ -91,8 +91,16 @@ Initialize (std::string config_file)
     giuh_ordinates[i] = state->lgar_bmi_params.giuh_ordinates[i+1]; // note lgar uses 1-indexing
   }
 
-  for (int i=0; i<=num_giuh_ordinates;i++){
-    giuh_runoff_queue[i] = 0.0;
+  if (!state->lgar_bmi_params.init_giuh_state_path.empty()) {
+    InitializeGIUHRunoffQueueFromCSV(
+        state->lgar_bmi_params.init_giuh_state_path.c_str(),
+        giuh_runoff_queue,
+        num_giuh_ordinates);
+  }
+  else {
+    for (int i=0; i<=num_giuh_ordinates; i++) {
+      giuh_runoff_queue[i] = 0.0;
+    }
   }
 
 }
@@ -1658,6 +1666,17 @@ GetGridNodesPerFace(const int grid, int *nodes_per_face)
   // this is not needed but printing here to avoid compiler warnings
   std::cerr<<"GetGridNodesPerFace: "<<grid<<" "<<nodes_per_face[0]<<"\n";
   throw bmi_lgar::NotImplemented();
+}
+
+// helper functions that enable GIUH queue saving
+double* BmiLGAR::get_giuh_runoff_queue()
+{
+    return giuh_runoff_queue;
+}
+
+int BmiLGAR::get_num_giuh_ordinates()
+{
+    return num_giuh_ordinates;
 }
 
 #endif

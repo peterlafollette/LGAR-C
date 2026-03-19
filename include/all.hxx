@@ -134,6 +134,7 @@ struct lgar_bmi_parameters
 					    for capillary drive calculation is desired */
   string init_state_path;                // the path for the WFs used to initialize the simulation, only used if a path is provided
   string init_non_vadose_state_path;      // path for conceptual reservoir / restart state
+  string init_giuh_state_path;
   bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution.
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
@@ -420,6 +421,16 @@ extern void InitializenonvadoseStateFromCSV(
     struct model_state *state);
 
 extern void write_non_vadose_state(FILE *out, struct model_state *state);
+
+extern void InitializeGIUHRunoffQueueFromCSV(
+    const char *giuh_state_csv_path,
+    double *giuh_runoff_queue,
+    int num_giuh_ordinates);
+
+extern void write_giuh_runoff_queue_state(
+    FILE *out,
+    const double *giuh_runoff_queue,
+    int num_giuh_ordinates);
 
 /********************************************************************/
 /*Other function prototypes for doing hydrology calculations, etc.  */

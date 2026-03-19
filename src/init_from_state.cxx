@@ -181,7 +181,7 @@ extern void InitializeWettingFrontsFromCSV(
     exit(1);
   }
 
-  // 3) Insert in front_num order so listInsertFront() works (and doesn’t renumber)
+  // 3) Insert in front_num order so listInsertFront() works (and does not renumber)
   qsort(recs, nrecs, sizeof(WFRecord), cmp_record_by_front_num);
 
   // Sanity: ensure we start at 1 and are contiguous
@@ -252,11 +252,6 @@ extern void InitializeWettingFrontsFromCSV(
 
   free(recs);
 }
-
-
-
-
-
 
 
 typedef struct {
@@ -414,4 +409,141 @@ extern void InitializenonvadoseStateFromCSV(
 
   state->lgar_mass_balance.volCRend_timestep_cm =
       rst.CR_fast_storage_cm + rst.CR_slow_storage_cm;
+}
+
+
+typedef struct {
+  int num_giuh_ordinates;
+  double *queue_vals;
+} GIUHRestartState;
+
+static int parse_giuh_state_line(
+    const char *line_in,
+    GIUHRestartState *rst)
+{
+  rst->num_giuh_ordinates = -1;
+  rst->queue_vals = NULL;
+
+  char *line = strdup(line_in);
+  if (!line) return 1;
+
+  char *num_ptr = strstr(line, "num_giuh_ordinates=");
+  char *queue_ptr = strstr(line, "queue=[");
+  if (!num_ptr || !queue_ptr) {
+    free(line);
+    return 2;
+  }
+
+  if (sscanf(num_ptr, "num_giuh_ordinates=%d", &rst->num_giuh_ordinates) != 1) {
+    free(line);
+    return 3;
+  }
+
+  char *lbr = strchr(queue_ptr, '[');
+  char *rbr = strrchr(queue_ptr, ']');
+  if (!lbr || !rbr || rbr <= lbr) {
+    free(line);
+    return 4;
+  }
+
+  *rbr = '\0';
+  char *vals = lbr + 1;
+
+  int expected_n = rst->num_giuh_ordinates + 1;
+  rst->queue_vals = (double*)malloc(sizeof(double) * expected_n);
+  if (!rst->queue_vals) {
+    free(line);
+    return 5;
+  }
+
+  int nread = 0;
+  char *saveptr = NULL;
+  for (char *tok = strtok_r(vals, ",", &saveptr);
+       tok != NULL;
+       tok = strtok_r(NULL, ",", &saveptr)) {
+
+    while (*tok == ' ' || *tok == '\t') tok++;
+
+    if (nread >= expected_n) {
+      free(rst->queue_vals);
+      free(line);
+      return 6;
+    }
+
+    rst->queue_vals[nread++] = strtod(tok, NULL);
+  }
+
+  free(line);
+
+  if (nread != expected_n) {
+    free(rst->queue_vals);
+    rst->queue_vals = NULL;
+    return 7;
+  }
+
+  return 0;
+}
+
+extern void InitializeGIUHRunoffQueueFromCSV(
+    const char *giuh_state_csv_path,
+    double *giuh_runoff_queue,
+    int num_giuh_ordinates)
+{
+  FILE *fp = fopen(giuh_state_csv_path, "r");
+  if (!fp) {
+    fprintf(stderr, "ERROR: could not open GIUH state file: %s\n", giuh_state_csv_path);
+    exit(1);
+  }
+
+  char line[65536];
+  if (!read_next_data_line(fp, line, sizeof(line))) {
+    fclose(fp);
+    fprintf(stderr, "ERROR: no data lines found in GIUH state file: %s\n", giuh_state_csv_path);
+    exit(1);
+  }
+
+  GIUHRestartState rst;
+  int perr = 0;
+
+  if (strncmp(line, "Time,", 5) == 0) {
+    if (!read_next_data_line(fp, line, sizeof(line))) {
+      fclose(fp);
+      fprintf(stderr, "ERROR: header found but no GIUH restart row in %s\n", giuh_state_csv_path);
+      exit(1);
+    }
+
+    char *comma = strchr(line, ',');
+    if (!comma || *(comma + 1) == '\0') {
+      fclose(fp);
+      fprintf(stderr, "ERROR: malformed GIUH restart row in %s\n", giuh_state_csv_path);
+      exit(1);
+    }
+
+    perr = parse_giuh_state_line(comma + 1, &rst);
+  }
+  else {
+    perr = parse_giuh_state_line(line, &rst);
+  }
+
+  fclose(fp);
+
+  if (perr != 0) {
+    fprintf(stderr, "ERROR: failed to parse GIUH restart state in %s (err=%d)\n",
+            giuh_state_csv_path, perr);
+    exit(1);
+  }
+
+  if (rst.num_giuh_ordinates != num_giuh_ordinates) {
+    fprintf(stderr,
+            "ERROR: GIUH restart file has num_giuh_ordinates=%d but model expects %d\n",
+            rst.num_giuh_ordinates, num_giuh_ordinates);
+    free(rst.queue_vals);
+    exit(1);
+  }
+
+  for (int i = 0; i <= num_giuh_ordinates; i++) {
+    giuh_runoff_queue[i] = rst.queue_vals[i];
+  }
+
+  free(rst.queue_vals);
 }
