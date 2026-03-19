@@ -133,6 +133,7 @@ struct lgar_bmi_parameters
   bool   use_closed_form_G = false;      /* true if closed form of capillary drive calculation is desired, false if numeric integral
 					    for capillary drive calculation is desired */
   string init_state_path;                // the path for the WFs used to initialize the simulation, only used if a path is provided
+  string init_non_vadose_state_path;      // path for conceptual reservoir / restart state
   bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution.
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
@@ -413,6 +414,12 @@ extern void InitializeWettingFrontsFromCSV(
     double *frozen_factor,
     struct wetting_front **head,
     struct soil_properties_ *soil_properties);
+
+extern void InitializenonvadoseStateFromCSV(
+    const char *non_vadose_state_csv_path,
+    struct model_state *state);
+
+extern void write_non_vadose_state(FILE *out, struct model_state *state);
 
 /********************************************************************/
 /*Other function prototypes for doing hydrology calculations, etc.  */

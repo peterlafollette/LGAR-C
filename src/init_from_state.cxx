@@ -252,3 +252,166 @@ extern void InitializeWettingFrontsFromCSV(
 
   free(recs);
 }
+
+
+
+
+
+
+
+typedef struct {
+  double CR_fast_storage_cm;
+  double CR_slow_storage_cm;
+  double volon_timestep_cm;
+  bool runoff_in_prev_step;
+  double precip_previous_timestep_cm;
+} nonvadoseRestartState;
+
+static bool parse_bool_01(const char *s, bool *out)
+{
+  if (strcmp(s, "1") == 0) {
+    *out = true;
+    return true;
+  }
+  if (strcmp(s, "0") == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartState *rst)
+{
+  char *line = strdup(line_in);
+  if (!line) return 1;
+
+  bool got_fast = false;
+  bool got_slow = false;
+  bool got_volon = false;
+  bool got_runoff = false;
+  bool got_precip_prev = false;
+
+  char *saveptr = NULL;
+  for (char *tok = strtok_r(line, ",\r\n", &saveptr);
+       tok != NULL;
+       tok = strtok_r(NULL, ",\r\n", &saveptr)) {
+
+    while (*tok == ' ' || *tok == '\t') tok++;
+
+    char *eq = strchr(tok, '=');
+    if (!eq) {
+      free(line);
+      return 2;
+    }
+
+    *eq = '\0';
+    const char *key = tok;
+    const char *val = eq + 1;
+
+    if (strcmp(key, "CR_fast_storage_cm") == 0) {
+      rst->CR_fast_storage_cm = strtod(val, NULL);
+      got_fast = true;
+    }
+    else if (strcmp(key, "CR_slow_storage_cm") == 0) {
+      rst->CR_slow_storage_cm = strtod(val, NULL);
+      got_slow = true;
+    }
+    else if (strcmp(key, "volon_timestep_cm") == 0) {
+      rst->volon_timestep_cm = strtod(val, NULL);
+      got_volon = true;
+    }
+    else if (strcmp(key, "runoff_in_prev_step") == 0) {
+      if (!parse_bool_01(val, &rst->runoff_in_prev_step)) {
+        free(line);
+        return 3;
+      }
+      got_runoff = true;
+    }
+    else if (strcmp(key, "precip_previous_timestep_cm") == 0) {
+      rst->precip_previous_timestep_cm = strtod(val, NULL);
+      got_precip_prev = true;
+    }
+  }
+
+  free(line);
+
+  if (!(got_fast && got_slow && got_volon && got_runoff && got_precip_prev)) {
+    return 4;
+  }
+
+  return 0;
+}
+
+extern void InitializenonvadoseStateFromCSV(
+    const char *non_vadose_state_csv_path,
+    struct model_state *state)
+{
+  FILE *fp = fopen(non_vadose_state_csv_path, "r");
+  if (!fp) {
+    fprintf(stderr, "ERROR: could not open non vadose state file: %s\n",
+            non_vadose_state_csv_path);
+    exit(1);
+  }
+
+  char line[65536];
+
+  if (!read_next_data_line(fp, line, sizeof(line))) {
+    fclose(fp);
+    fprintf(stderr, "ERROR: no data lines found in non vadose state file: %s\n",
+            non_vadose_state_csv_path);
+    exit(1);
+  }
+
+  nonvadoseRestartState rst;
+  int perr = 0;
+
+  // Allow either:
+  //   Time,CR_fast_storage_cm,...
+  // followed by:
+  //   2024-...,CR_fast_storage_cm=...
+  //
+  // or simply:
+  //   CR_fast_storage_cm=...,CR_slow_storage_cm=...
+  if (strncmp(line, "Time,", 5) == 0) {
+    if (!read_next_data_line(fp, line, sizeof(line))) {
+      fclose(fp);
+      fprintf(stderr, "ERROR: header found but no restart row in %s\n",
+              non_vadose_state_csv_path);
+      exit(1);
+    }
+
+    char *comma = strchr(line, ',');
+    if (!comma || *(comma + 1) == '\0') {
+      fclose(fp);
+      fprintf(stderr, "ERROR: malformed restart row in %s\n",
+              non_vadose_state_csv_path);
+      exit(1);
+    }
+
+    perr = parse_non_vadose_state_kv_line(comma + 1, &rst);
+  }
+  else {
+    perr = parse_non_vadose_state_kv_line(line, &rst);
+  }
+
+  fclose(fp);
+
+  if (perr != 0) {
+    fprintf(stderr, "ERROR: failed to parse non vadose restart state in %s (err=%d)\n",
+            non_vadose_state_csv_path, perr);
+    exit(1);
+  }
+
+  state->lgar_mass_balance.CR_fast_storage_cm = rst.CR_fast_storage_cm;
+  state->lgar_mass_balance.CR_slow_storage_cm = rst.CR_slow_storage_cm;
+  state->lgar_mass_balance.volon_timestep_cm = rst.volon_timestep_cm;
+  state->lgar_bmi_params.runoff_in_prev_step = rst.runoff_in_prev_step;
+  state->lgar_bmi_params.precip_previous_timestep_cm = rst.precip_previous_timestep_cm;
+
+  // Keep the "current total CR volume" field consistent with the restored storages.
+  state->lgar_mass_balance.volCRend_cm =
+      rst.CR_fast_storage_cm + rst.CR_slow_storage_cm;
+
+  state->lgar_mass_balance.volCRend_timestep_cm =
+      rst.CR_fast_storage_cm + rst.CR_slow_storage_cm;
+}

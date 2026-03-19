@@ -160,23 +160,64 @@ extern void lgar_initialize(string config_file, struct model_state *state)
   state->lgar_bmi_input_params->precipitation_mm_per_h = -1.0;
   state->lgar_bmi_input_params->PET_mm_per_h           = -1.0;
 
-  // initialize all global mass balance variables to zero
-  state->lgar_mass_balance.volprecip_cm              = 0.0;
-  state->lgar_mass_balance.volin_cm                  = 0.0;
-  state->lgar_mass_balance.volend_cm                 = 0.0;
-  state->lgar_mass_balance.volCRend_cm               = 0.0;
-  state->lgar_mass_balance.volAET_cm                 = 0.0;
-  state->lgar_mass_balance.volrech_cm                = 0.0;
-  state->lgar_mass_balance.volrunoff_cm              = 0.0;
-  state->lgar_mass_balance.volrunoff_giuh_cm         = 0.0;
-  state->lgar_mass_balance.volQ_cm                   = 0.0;
-  state->lgar_mass_balance.volQ_CR_cm                = 0.0;
-  state->lgar_mass_balance.volPET_cm                 = 0.0;
-  state->lgar_mass_balance.volon_cm                  = 0.0;
-  state->lgar_mass_balance.volon_timestep_cm         = 0.0; /* setting volon and precip at the initial time to 0.0
-							       as they determine the creation of surficail wetting front */
-  state->lgar_bmi_params.precip_previous_timestep_cm = 0.0;
-  state->lgar_mass_balance.volchange_calib_cm        = 0.0;
+  // // initialize all global mass balance variables to zero
+  // state->lgar_mass_balance.volprecip_cm              = 0.0;
+  // state->lgar_mass_balance.volin_cm                  = 0.0;
+  // state->lgar_mass_balance.volend_cm                 = 0.0;
+  // state->lgar_mass_balance.volCRend_cm               = 0.0;
+  // state->lgar_mass_balance.volAET_cm                 = 0.0;
+  // state->lgar_mass_balance.volrech_cm                = 0.0;
+  // state->lgar_mass_balance.volrunoff_cm              = 0.0;
+  // state->lgar_mass_balance.volrunoff_giuh_cm         = 0.0;
+  // state->lgar_mass_balance.volQ_cm                   = 0.0;
+  // state->lgar_mass_balance.volQ_CR_cm                = 0.0;
+  // state->lgar_mass_balance.volPET_cm                 = 0.0;
+  // state->lgar_mass_balance.volon_cm                  = 0.0;
+  // state->lgar_mass_balance.volon_timestep_cm         = 0.0; /* setting volon and precip at the initial time to 0.0
+	// 						       as they determine the creation of surficail wetting front */
+  // state->lgar_bmi_params.precip_previous_timestep_cm = 0.0;
+  // state->lgar_mass_balance.volchange_calib_cm        = 0.0;
+
+  bool non_vadose_restart_loaded =
+    !state->lgar_bmi_params.init_state_path.empty() &&
+    !state->lgar_bmi_params.init_non_vadose_state_path.empty();
+
+  state->lgar_mass_balance.volprecip_cm      = 0.0;
+  state->lgar_mass_balance.volin_cm          = 0.0;
+  state->lgar_mass_balance.volend_cm         = 0.0;
+  state->lgar_mass_balance.volAET_cm         = 0.0;
+  state->lgar_mass_balance.volrech_cm        = 0.0;
+  state->lgar_mass_balance.volrunoff_cm      = 0.0;
+  state->lgar_mass_balance.volrunoff_giuh_cm = 0.0;
+  state->lgar_mass_balance.volQ_cm           = 0.0;
+  state->lgar_mass_balance.volQ_CR_cm        = 0.0;
+  state->lgar_mass_balance.volPET_cm         = 0.0;
+  state->lgar_mass_balance.volon_cm          = 0.0;
+  state->lgar_mass_balance.volchange_calib_cm = 0.0;
+
+  if (!non_vadose_restart_loaded) {
+    state->lgar_mass_balance.CR_fast_storage_cm = 0.0;
+    state->lgar_mass_balance.CR_slow_storage_cm = 0.0;
+    state->lgar_mass_balance.volCRend_cm = 0.0;
+    state->lgar_mass_balance.volCRend_timestep_cm = 0.0;
+    state->lgar_mass_balance.volon_timestep_cm = 0.0;
+    state->lgar_bmi_params.precip_previous_timestep_cm = 0.0;
+    state->lgar_bmi_params.runoff_in_prev_step = false;
+    state->lgar_mass_balance.volCRstart_cm = 0.0;
+  }
+  else {
+    state->lgar_mass_balance.volCRend_cm =
+        state->lgar_mass_balance.CR_fast_storage_cm +
+        state->lgar_mass_balance.CR_slow_storage_cm;
+
+    state->lgar_mass_balance.volCRend_timestep_cm =
+        state->lgar_mass_balance.CR_fast_storage_cm +
+        state->lgar_mass_balance.CR_slow_storage_cm;
+    state->lgar_mass_balance.volCRstart_cm =
+      state->lgar_mass_balance.CR_fast_storage_cm +
+      state->lgar_mass_balance.CR_slow_storage_cm;
+  }
+
 }
 
 
@@ -287,6 +328,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_soil_z_set                = false;
   bool is_ponded_depth_max_cm_set   = false;
   bool is_state_path_set            = false;
+  bool is_non_vadose_state_path_set  = false;
 
   string soil_params_file;
 
@@ -549,6 +591,22 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       if (verbosity.compare("high") == 0) {
           std::cerr << "init_state_path set to: "
                     << state->lgar_bmi_params.init_state_path << "\n";
+          std::cerr << "          *****         \n";
+      }
+      continue;
+  }
+  else if (param_key == "init_non_vadose_state_path") {
+
+      // remove potential whitespace
+      param_value.erase(0, param_value.find_first_not_of(" \t"));
+      param_value.erase(param_value.find_last_not_of(" \t") + 1);
+
+      state->lgar_bmi_params.init_non_vadose_state_path = param_value;
+      is_non_vadose_state_path_set = true;
+
+      if (verbosity.compare("high") == 0) {
+          std::cerr << "init_non_vaodse_state_path set to: "
+                    << state->lgar_bmi_params.init_non_vadose_state_path << "\n";
           std::cerr << "          *****         \n";
       }
       continue;
@@ -898,6 +956,12 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     throw runtime_error(errMsg.str());
   }
 
+  if ( ((is_non_vadose_state_path_set && !is_state_path_set) || (!is_non_vadose_state_path_set && is_state_path_set)) && (is_a_set) ){
+    stringstream errMsg;
+    errMsg << "The configuration file \'" << config_file <<"\' sets one of init_non_vadose_state_path or init_state_path but not both, while a nonlinear reservoir is desired. Either both or none of init_non_vadose_state_path and init_state_path must be set in this case. \n";
+    throw runtime_error(errMsg.str());
+  }
+
   if (state->lgar_bmi_params.free_drainage_to_CR && !state->lgar_bmi_params.free_drainage_enabled){
     stringstream errMsg;
     errMsg << "The configuration file \'" << config_file <<"\' sets free_drainage_to_CR as true but sets free_drainage_enabled as false. free_drainage_to_CR being true requires free drainage being enabled \n";
@@ -980,6 +1044,11 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
         &state->head,
         state->soil_properties
     );
+    if (!state->lgar_bmi_params.init_non_vadose_state_path.empty()) {
+      InitializenonvadoseStateFromCSV(
+          state->lgar_bmi_params.init_non_vadose_state_path.c_str(),
+          state);
+    }
   }
   
   if (verbosity.compare("none") != 0) {
@@ -1169,6 +1238,7 @@ extern void lgar_global_mass_balance(struct model_state *state, double *giuh_run
   double volrech            = state->lgar_mass_balance.volrech_cm;
   double volend             = state->lgar_mass_balance.volend_cm;
   double volCRend           = state->lgar_mass_balance.volCRend_cm;
+  double volCRstart         = state->lgar_mass_balance.volCRstart_cm;
   double volrunoff_giuh     = state->lgar_mass_balance.volrunoff_giuh_cm;
   double volend_giuh_cm     = 0.0;
   double total_Q_cm         = state->lgar_mass_balance.volQ_cm;
@@ -1179,7 +1249,7 @@ extern void lgar_global_mass_balance(struct model_state *state, double *giuh_run
   for(int i=0; i <= state->lgar_bmi_params.num_giuh_ordinates; i++)
     volend_giuh_cm += giuh_runoff_queue_cm[i];
 
-  double global_error_cm = volstart + volprecip - volrunoff - volAET - volon - volrech - volend + volchange_calib_cm - volrunoff_CR - volCRend;
+  double global_error_cm = volstart + volprecip - volrunoff - volAET - volon - volrech - volend + volchange_calib_cm - volrunoff_CR - volCRend + volCRstart;
   
   printf("\n********************************************************* \n");
   printf("-------------------- Simulation Summary ----------------- \n");

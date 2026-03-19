@@ -94,13 +94,17 @@ int main(int argc, char *argv[])
 
   FILE *outdata_fptr = NULL;
   FILE *outlayer_fptr = NULL;
+  FILE *outnonvadose_fptr = NULL;
 
   if (!is_IO_supress) {
     outdata_fptr = fopen("data_variables.csv", "w");  // write output variables (e.g. infiltration, storage etc.) to this file pointer
     outlayer_fptr = fopen("data_layers.csv", "w");    // write output layers to this file pointer
+    outnonvadose_fptr = fopen("data_non_vadose_state.csv", "w"); //writes reservoir states and other states that are not realted to the vadose zone but required for a restart 
 
     // write heading (variable names)
     fprintf(outdata_fptr,"Time,");
+    fprintf(outnonvadose_fptr,
+        "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm\n");
     for (int j = 0; j < num_output_var; j++) {
       fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
       if (j == num_output_var-1)
@@ -150,6 +154,8 @@ int main(int argc, char *argv[])
 	else
 	  fprintf(outdata_fptr,",");
       }
+      fprintf(outnonvadose_fptr, "%s,", time[i].c_str());
+      write_non_vadose_state(outnonvadose_fptr, model_state.get_model());
 
 
       // write layers data to file
@@ -166,6 +172,7 @@ int main(int argc, char *argv[])
   if (outdata_fptr) {
     fclose(outdata_fptr);
     fclose(outlayer_fptr);
+    fclose(outnonvadose_fptr);
   }
 
   end_time = clock();
@@ -277,4 +284,20 @@ extern void write_state(FILE *out, struct wetting_front* head){
   }
   fprintf(out, "]\n");
 
+}
+
+
+extern void write_non_vadose_state(FILE *out, struct model_state* state)
+{
+  fprintf(out,
+          "CR_fast_storage_cm=%0.17g,"
+          "CR_slow_storage_cm=%0.17g,"
+          "volon_timestep_cm=%0.17g,"
+          "runoff_in_prev_step=%d,"
+          "precip_previous_timestep_cm=%0.17g\n",
+          state->lgar_mass_balance.CR_fast_storage_cm,
+          state->lgar_mass_balance.CR_slow_storage_cm,
+          state->lgar_mass_balance.volon_timestep_cm,
+          state->lgar_bmi_params.runoff_in_prev_step ? 1 : 0,
+          state->lgar_bmi_params.precip_previous_timestep_cm);
 }
