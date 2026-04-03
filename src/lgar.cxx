@@ -6630,11 +6630,11 @@ extern double lgar_dual_perm_mass_transfer(bool TO_enabled, int num_layers, doub
       printf("delta mass: %lf \n", ratio_fracture_vol_to_total_vol*lgar_calc_mass_bal(cum_layer_thickness, *head_frac) + (1 - ratio_fracture_vol_to_total_vol)*lgar_calc_mass_bal(cum_layer_thickness, *head) - init_mass);
     }
 
-    // this code will be deleted eventually -- the mass trasnfer function itself seems to be mostly error free, but it exposes errors in LGARTO merging etc. and probably necessitates new functionality. 
-    if (fabs(*rch_frac)>.10 || fabs(*rch_matrix)>.10){
-      printf("aborting due to large mass balance error correction, it's not necessarily a bug but could be imporved. Investigat here \n");
-      abort();
-    }
+    // // this code will be deleted eventually -- the mass trasnfer function itself seems to be mostly error free, but it exposes errors in LGARTO merging etc. and probably necessitates new functionality. 
+    // if (fabs(*rch_frac)>.10 || fabs(*rch_matrix)>.10){
+    //   printf("aborting due to large mass balance error correction, it's not necessarily a bug but could be imporved. Investigat here \n");
+    //   abort();
+    // }
 
     return(mass_transfer_term_cm);
 
