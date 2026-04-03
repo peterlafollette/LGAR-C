@@ -1068,7 +1068,7 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, int number_
     int wf_in_layer = 1;
     //extra_moisture_factor and extra_height_factor, when not equal to 0, initalize the model with wetting fronts that are not at their hydrostatic positions. Using 0 for both is preferred unless you want initial conditions to deviate from hydrostatic. 
     //extra_moisture_factor and extra_height_factor have been useful for testing and development but are note recommended to be changed anymore. 
-    double extra_moisture_factor = -900.0;  //20
+    double extra_moisture_factor = 0.0;  //20
     double extra_height_factor = 0.0;
 
     for(int front=1;front<=(num_layers*number_of_WFs_per_layer);front++) {
