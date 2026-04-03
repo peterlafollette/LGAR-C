@@ -2224,8 +2224,8 @@ extern double lgar_move_wetting_fronts(bool TO_enabled, double timestep_h, doubl
       if (next->depth_cm>cum_layer_thickness_cm[next->layer_num]){//there is a rare case where TO layer boundary crossing is necessary, but this code occurs before that. So, in the event that TO WF layer boundary crossing is necessary, then TO WF density ensuring at the root zone depth is deferred to another subtimestep.
         break;
       }
-      if ( (current->is_WF_GW==1) && (current->depth_cm>0.0) && (current->psi_cm>(next->psi_cm + 0.99*cum_layer_thickness_cm[num_layers]) ) && (current->to_bottom==FALSE) && (in_order) && (current->psi_cm > cum_layer_thickness_cm[num_layers]) && (current->psi_cm<5*cum_layer_thickness_cm[num_layers]) ){
-      // if ( (current->is_WF_GW==1) && (current->depth_cm>0.0) && (current->psi_cm>(next->psi_cm + 0.1*cum_layer_thickness_cm[num_layers]) ) && (current->to_bottom==FALSE) && (in_order) ){
+      // if ( (current->is_WF_GW==1) && (current->depth_cm>0.0) && (current->psi_cm>(next->psi_cm + 0.99*cum_layer_thickness_cm[num_layers]) ) && (current->to_bottom==FALSE) && (in_order) && (current->psi_cm > cum_layer_thickness_cm[num_layers]) && (current->psi_cm<5*cum_layer_thickness_cm[num_layers]) ){
+      if ( (current->is_WF_GW==1) && (current->depth_cm>0.0) && (current->psi_cm>(next->psi_cm + 0.1*cum_layer_thickness_cm[num_layers]) ) && (current->to_bottom==FALSE) && (in_order) ){
         //high accuracy version: change the factor 0.99 above to 0.1
         //the factor 0.99 in the line above has also been 0.5, it's not terribly important. Basically it will determine how frequently a new WF will be inserted, becasue a larger factor here will make it so that a larger gap is psi is required before a new WF is inserted.
         //reducing this factor (values as low as 0.05 have been explored) theoretically increases both computational expense and accuracy, but in practice for year long simulations the impact seems fairly small.
@@ -2251,7 +2251,7 @@ extern double lgar_move_wetting_fronts(bool TO_enabled, double timestep_h, doubl
         new_corrective_WF->psi_cm=new_psi;
         new_corrective_WF->is_WF_GW=TRUE;
         
-        current->depth_cm = current->depth_cm - cum_layer_thickness_cm[num_layers]*4.E-6; //for most of LGARTO's development, the last factor in this line was 4.E-4
+        current->depth_cm = current->depth_cm - cum_layer_thickness_cm[num_layers]*4.E-4; //for most of LGARTO's development, the last factor in this line was 4.E-4
         if (current->front_num>1){
           if (current->depth_cm<listFindFront(current->front_num - 1, *head, NULL)->depth_cm){
             current->depth_cm = (current->next->depth_cm + listFindFront(current->front_num - 1, *head, NULL)->depth_cm)*0.5; 
@@ -4761,8 +4761,8 @@ extern void lgarto_ensure_rooting_zone_population(double rzd, double PET_timeste
   struct wetting_front *current;
   current = *head; 
 
-  // while (( (num_TO_WFs_in_rz - listLength_surface(*head))<4) && (PET_timestep_cm>0.0) && (listLength_surface(*head)==0) && current->psi_cm<1.E6 ){//the 1.E-6 ensures that we don't get absurdly dry WFs towards surface 
-  while (( (num_TO_WFs_in_rz - listLength_surface(*head))<15) && current->psi_cm<1.E6 ){//the 1.E-6 ensures that we don't get absurdly dry WFs towards surface 
+  while (( (num_TO_WFs_in_rz - listLength_surface(*head))<4) && (PET_timestep_cm>0.0) && (listLength_surface(*head)==0) && current->psi_cm<1.E6 ){//the 1.E-6 ensures that we don't get absurdly dry WFs towards surface 
+  // while (( (num_TO_WFs_in_rz - listLength_surface(*head))<15) && current->psi_cm<1.E6 ){//the 1.E-6 ensures that we don't get absurdly dry WFs towards surface 
     //high accuracy version: use the version where new wetting fronts are created regardless of PET
     current = *head; 
     // double new_psi = current->psi_cm + 30.0; //this could be a parameter ... or perhas calculated as some fraction of the thickness of the model domain. 
