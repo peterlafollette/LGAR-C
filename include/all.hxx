@@ -52,6 +52,7 @@ struct wetting_front
   int    front_num;        // the wetting front number (might be irrelevant), but useful to debug
   bool   to_bottom;        // TRUE iff this wetting front is in contact with the layer bottom
   double dzdt_cm_per_h;    // use to store the calculated wetting front speed
+  bool   is_WF_GW;         // true if the wetting front is in contact with groundwater
   struct wetting_front *next;  // pointer to the next wetting front.
 };
 
@@ -130,6 +131,7 @@ struct lgar_bmi_parameters
   double *frozen_factor;                 // frozen factor added to the hydraulic conductivity due to coupling to soil freeze-thaw
   double  wilting_point_psi_cm;          // wilting point (the amount of water not available for plants or not accessible by plants)
   double  field_capacity_psi_cm;          // field capacity represented as a capillary head. Note that both wilting point and field capacity are specified for the whole model domain with single values
+  double  root_zone_depth_cm;            // maximum depth from which roots extract water
   bool   use_closed_form_G = false;      /* true if closed form of capillary drive calculation is desired, false if numeric integral
 					    for capillary drive calculation is desired */
   string init_state_path;                // the path for the WFs used to initialize the simulation, only used if a path is provided
@@ -137,6 +139,7 @@ struct lgar_bmi_parameters
   string init_giuh_state_path;
   bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution.
+  bool   TO_enabled = false;             // if true, enable existence of TO WFs (that are in confact with a shallow water table), if false, no TO WFs are possible and the lower BC will be no flow or free drainage
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
   bool   free_drainage_to_CR   = false;  // This will specify whether free drainage is sent to the nonlinear conceptual reservoir (true) or lost to deep GW (false). Defaults to false.
   double mbal_tol;                       // if a substep's mass balance error is larger than this number, the model will abort. By default it is set to a large value (10 cm).
@@ -404,8 +407,9 @@ extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, 
 extern void lgar_initialize(string config_file, struct model_state *state);
 extern void InitFromConfigFile(string config_file, struct model_state *state);
 extern vector<double> ReadVectorData(string key);
-extern void InitializeWettingFronts(int num_layers, double initial_psi_cm, int *layer_soil_type, double *cum_layer_thickness_cm,
-				    double *frozen_factor, struct wetting_front** head, struct soil_properties_ *soil_properties);
+extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double initial_psi_cm, int *layer_soil_type,
+				    double *cum_layer_thickness_cm, double *layer_thickness_cm, double *frozen_factor,
+				    struct wetting_front** head, struct soil_properties_ *soil_properties);
 
 extern void InitializeWettingFrontsFromCSV(
     int num_layers,

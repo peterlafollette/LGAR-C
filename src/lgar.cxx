@@ -86,8 +86,6 @@ extern void lgar_initialize(string config_file, struct model_state *state)
   state->lgar_bmi_params.shape[0] = state->lgar_bmi_params.num_layers;
   state->lgar_bmi_params.shape[1] = state->lgar_bmi_params.num_wetting_fronts;
 
-  // initial number of wetting fronts are same are number of layers
-  state->lgar_bmi_params.num_wetting_fronts           = state->lgar_bmi_params.num_layers;
   state->lgar_bmi_params.soil_depth_wetting_fronts    = new double[state->lgar_bmi_params.num_wetting_fronts];
   state->lgar_bmi_params.soil_moisture_wetting_fronts = new double[state->lgar_bmi_params.num_wetting_fronts];
 
@@ -112,10 +110,13 @@ extern void lgar_initialize(string config_file, struct model_state *state)
   state->lgar_calib_params.spf_factor = state->lgar_bmi_params.spf_factor;
 
   struct wetting_front *current = state->head;
-  for (int i=0; i<state->lgar_bmi_params.num_wetting_fronts; i++) { // note that this only works because at init there is 1 WF per layer, otherwise get soil type from current
+  bool layer_1_params_set = false;
+  bool layer_2_params_set = false;
+  bool layer_3_params_set = false;
+  for (int i=0; i<state->lgar_bmi_params.num_wetting_fronts; i++) {
     assert (current != NULL);
     
-    soil = state->lgar_bmi_params.layer_soil_type[i+1];
+    soil = state->lgar_bmi_params.layer_soil_type[current->layer_num];
 
     state->lgar_bmi_params.soil_moisture_wetting_fronts[i] = current->theta;
     state->lgar_bmi_params.soil_depth_wetting_fronts[i]    = current->depth_cm * state->units.cm_to_m;
@@ -127,28 +128,31 @@ extern void lgar_initialize(string config_file, struct model_state *state)
     // state->lgar_calib_params.vg_alpha[i] = state->soil_properties[soil].vg_alpha_per_cm;
     // state->lgar_calib_params.Ksat[i]     = state->soil_properties[soil].Ksat_cm_per_h;
 
-    if (i==0){
+    if (current->layer_num == 1 && !layer_1_params_set){
       state->lgar_calib_params.theta_e_1  = state->soil_properties[soil].theta_e;
       state->lgar_calib_params.theta_r_1  = state->soil_properties[soil].theta_r;
       state->lgar_calib_params.vg_n_1     = state->soil_properties[soil].vg_n;
       state->lgar_calib_params.vg_alpha_1 = state->soil_properties[soil].vg_alpha_per_cm;
       state->lgar_calib_params.Ksat_1     = state->soil_properties[soil].Ksat_cm_per_h;
+      layer_1_params_set = true;
     }
 
-    if (i==1){
+    if (current->layer_num == 2 && !layer_2_params_set){
       state->lgar_calib_params.theta_e_2  = state->soil_properties[soil].theta_e;
       state->lgar_calib_params.theta_r_2  = state->soil_properties[soil].theta_r;
       state->lgar_calib_params.vg_n_2     = state->soil_properties[soil].vg_n;
       state->lgar_calib_params.vg_alpha_2 = state->soil_properties[soil].vg_alpha_per_cm;
       state->lgar_calib_params.Ksat_2     = state->soil_properties[soil].Ksat_cm_per_h;
+      layer_2_params_set = true;
     }
 
-    if (i==2){
+    if (current->layer_num == 3 && !layer_3_params_set){
       state->lgar_calib_params.theta_e_3  = state->soil_properties[soil].theta_e;
       state->lgar_calib_params.theta_r_3  = state->soil_properties[soil].theta_r;
       state->lgar_calib_params.vg_n_3     = state->soil_properties[soil].vg_n;
       state->lgar_calib_params.vg_alpha_3 = state->soil_properties[soil].vg_alpha_per_cm;
       state->lgar_calib_params.Ksat_3     = state->soil_properties[soil].Ksat_cm_per_h;
+      layer_3_params_set = true;
     }
     
     current = current->next;
@@ -303,6 +307,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   state->lgar_bmi_params.PET_affects_precip    = false;
   state->lgar_bmi_params.allow_flux_caching    = false;
   state->lgar_bmi_params.log_mode              = false;
+  state->lgar_bmi_params.TO_enabled            = false;
   state->lgar_bmi_params.free_drainage_enabled = false;
   state->lgar_bmi_params.free_drainage_to_CR   = false;
   // setting mass balance tolerance to be large by default; this can be specified in the config file
@@ -316,6 +321,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_layer_soil_type_set       = false;
   bool is_wilting_point_psi_cm_set  = false;
   bool is_field_capacity_psi_cm_set = false;
+  bool is_root_zone_depth_cm_set    = false;
   bool is_a_set                     = false;
   bool is_b_set                     = false;
   bool is_frac_to_CR_set            = false;
@@ -483,6 +489,23 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       if (verbosity.compare("high") == 0) {
 	std::cerr<<"Field capacity Psi [cm] : "<<state->lgar_bmi_params.field_capacity_psi_cm<<"\n";
 	std::cerr<<"          *****         \n";
+      }
+
+      continue;
+    }
+    else if (param_key == "root_zone_depth") {
+      state->lgar_bmi_params.root_zone_depth_cm = stod(param_value);
+
+      if (state->lgar_bmi_params.root_zone_depth_cm < 0.0) {
+        printf("root_zone_depth is less than 0 \n");
+        abort();
+      }
+
+      is_root_zone_depth_cm_set = true;
+
+      if (verbosity.compare("high") == 0) {
+        std::cerr<<"root zone depth [cm] : "<<state->lgar_bmi_params.root_zone_depth_cm<<"\n";
+        std::cerr<<"          *****         \n";
       }
 
       continue;
@@ -722,6 +745,20 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       continue;
     }
+    else if (param_key == "TO_enabled") {
+      if ((param_value == "false") || (param_value == "0")) {
+        state->lgar_bmi_params.TO_enabled = false;
+      }
+      else if ((param_value == "true") || (param_value == "1")) {
+        state->lgar_bmi_params.TO_enabled = true;
+      }
+      else {
+	std::cerr<<"Invalid option: TO_enabled must be true or false. \n";
+        abort();
+      }
+
+      continue;
+    }
     else if (param_key == "timestep") {
       state->lgar_bmi_params.timestep_h = stod(param_value);
 
@@ -953,6 +990,12 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     throw runtime_error(errMsg.str());
   }
 
+  if(!is_root_zone_depth_cm_set && state->lgar_bmi_params.TO_enabled) {
+    stringstream errMsg;
+    errMsg << "root zone depth not set in the config file while TO mode is enabled "<< config_file << "\n";
+    throw runtime_error(errMsg.str());
+  }
+
   if (! ( (is_a_set == is_b_set) && (is_frac_to_CR_set == is_b_set)) ){
     //in this case, it must be either the case that all of these have been set (the user wants a nonlinear reservoir), or that none of these are set (the user does not want this).
     //it can not be the case that only one or two of these three have been set.
@@ -1049,8 +1092,9 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     state->lgar_bmi_params.frozen_factor[i] = 1.0;
 
   if (!is_state_path_set){
-    InitializeWettingFronts(state->lgar_bmi_params.num_layers, state->lgar_bmi_params.initial_psi_cm,
-          state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
+    InitializeWettingFronts(state->lgar_bmi_params.TO_enabled, state->lgar_bmi_params.num_layers,
+          state->lgar_bmi_params.initial_psi_cm, state->lgar_bmi_params.layer_soil_type,
+          state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.layer_thickness_cm,
           state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
   }
   else {
@@ -1109,44 +1153,133 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   from the prescribed psi value for each of the soil layers
 */
 // #############################################################################
-extern void InitializeWettingFronts(int num_layers, double initial_psi_cm, int *layer_soil_type, double *cum_layer_thickness_cm,
-				    double *frozen_factor, struct wetting_front** head, struct soil_properties_ *soil_properties)
+extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double initial_psi_cm, int *layer_soil_type,
+				    double *cum_layer_thickness_cm, double *layer_thickness_cm, double *frozen_factor,
+				    struct wetting_front** head, struct soil_properties_ *soil_properties)
 {
-  int soil;
-  int front = 0;
-  double Se, theta_init;
-  bool bottom_flag;
-  double Ksat_cm_per_h;
-  struct wetting_front *current;
+  if (TO_enabled) {
+    int soil;
+    int layer = 1;
+    double Se, theta_init;
+    bool bottom_flag;
+    double Ksat_cm_per_h;
+    struct wetting_front *current;
+    const int number_of_WFs_per_layer = 16;
+    bool switch_to_next_layer_flag = false;
+    double prior_psi_cm = cum_layer_thickness_cm[num_layers];
+    double new_wf_depth;
+    int wf_in_layer = 1;
+    double extra_moisture_factor = 0.0;
+    double extra_height_factor = 0.0;
 
-  for(int layer=1;layer<=num_layers;layer++) {
-    front++;
+    for (int front = 1; front <= (num_layers * number_of_WFs_per_layer); front++) {
+      soil = layer_soil_type[layer];
+      double total_depth = cum_layer_thickness_cm[num_layers];
 
-    soil = layer_soil_type[layer];
-    theta_init = calc_theta_from_h(initial_psi_cm,soil_properties[soil].vg_alpha_per_cm,
-				   soil_properties[soil].vg_m,soil_properties[soil].vg_n,
-				   soil_properties[soil].theta_e,soil_properties[soil].theta_r);
+      if ((front % number_of_WFs_per_layer) == 0) {
+        wf_in_layer = 1;
+        initial_psi_cm = (layer_thickness_cm[layer] / number_of_WFs_per_layer) - extra_moisture_factor;
+        if (layer < num_layers) {
+          initial_psi_cm =
+            (total_depth -
+             (cum_layer_thickness_cm[layer - 1] +
+              (number_of_WFs_per_layer - 1) * layer_thickness_cm[layer] / number_of_WFs_per_layer)) -
+            extra_moisture_factor;
+        }
+        new_wf_depth = cum_layer_thickness_cm[layer - 1] + layer_thickness_cm[layer];
+        prior_psi_cm = initial_psi_cm;
+      }
+      else {
+        if (wf_in_layer == 1) {
+          initial_psi_cm = prior_psi_cm;
+        }
+        else {
+          initial_psi_cm =
+            (total_depth -
+             (cum_layer_thickness_cm[layer - 1] +
+              (wf_in_layer - 1) * layer_thickness_cm[layer] / number_of_WFs_per_layer)) -
+            extra_moisture_factor;
+        }
+        new_wf_depth =
+          (cum_layer_thickness_cm[layer - 1] +
+           wf_in_layer * layer_thickness_cm[layer] / number_of_WFs_per_layer) -
+          extra_height_factor;
+      }
 
-    if (verbosity.compare("high") == 0) {
-      printf("layer, theta, psi, alpha, m, n, theta_e, theta_r = %d, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f \n",
-	     layer, theta_init, initial_psi_cm, soil_properties[soil].vg_alpha_per_cm, soil_properties[soil].vg_m,
-	     soil_properties[soil].vg_n,soil_properties[soil].theta_e,soil_properties[soil].theta_r);
+      if (initial_psi_cm < 0.0) {
+        initial_psi_cm = 0.0;
+      }
+
+      theta_init = calc_theta_from_h(initial_psi_cm, soil_properties[soil].vg_alpha_per_cm,
+				     soil_properties[soil].vg_m, soil_properties[soil].vg_n,
+				     soil_properties[soil].theta_e, soil_properties[soil].theta_r);
+
+      if (verbosity.compare("high") == 0) {
+        printf("layer, theta, psi, alpha, m, n, theta_e, theta_r = %d, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f \n",
+	       layer, theta_init, initial_psi_cm, soil_properties[soil].vg_alpha_per_cm,
+	       soil_properties[soil].vg_m, soil_properties[soil].vg_n,
+	       soil_properties[soil].theta_e, soil_properties[soil].theta_r);
+      }
+
+      bottom_flag = ((front % number_of_WFs_per_layer) == 0);
+
+      if (new_wf_depth < cum_layer_thickness_cm[layer - 1]) {
+        new_wf_depth = cum_layer_thickness_cm[layer - 1];
+      }
+
+      current = listInsertFront(new_wf_depth, theta_init, front, layer, bottom_flag, head);
+      current->psi_cm = initial_psi_cm;
+      current->is_WF_GW = true;
+
+      Se = calc_Se_from_theta(current->theta, soil_properties[soil].theta_e, soil_properties[soil].theta_r);
+      Ksat_cm_per_h = frozen_factor[layer] * soil_properties[soil].Ksat_cm_per_h;
+      current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, soil_properties[soil].vg_m);
+
+      if (switch_to_next_layer_flag) {
+        layer++;
+        switch_to_next_layer_flag = false;
+      }
+      else {
+        wf_in_layer++;
+        if (((front + 1) % number_of_WFs_per_layer) == 0) {
+          switch_to_next_layer_flag = true;
+        }
+      }
     }
-
-    // the next lines create the initial moisture profile
-    bottom_flag = true;  // all initial wetting fronts are in contact with the bottom of the layer they exist in
-    // NOTE: The listInsertFront function does lots of stuff.
-
-    current = listInsertFront(cum_layer_thickness_cm[layer],theta_init,front,layer,bottom_flag, head);
-
-    current->psi_cm = initial_psi_cm;
-    Se = calc_Se_from_theta(current->theta,soil_properties[soil].theta_e,soil_properties[soil].theta_r);
-
-    Ksat_cm_per_h = frozen_factor[layer] * soil_properties[soil].Ksat_cm_per_h;
-    current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h , soil_properties[soil].vg_m);  // cm/s
-
   }
+  else {
+    int soil;
+    int front = 0;
+    double Se, theta_init;
+    bool bottom_flag;
+    double Ksat_cm_per_h;
+    struct wetting_front *current;
 
+    for(int layer=1;layer<=num_layers;layer++) {
+      front++;
+
+      soil = layer_soil_type[layer];
+      theta_init = calc_theta_from_h(initial_psi_cm,soil_properties[soil].vg_alpha_per_cm,
+				     soil_properties[soil].vg_m,soil_properties[soil].vg_n,
+				     soil_properties[soil].theta_e,soil_properties[soil].theta_r);
+
+      if (verbosity.compare("high") == 0) {
+        printf("layer, theta, psi, alpha, m, n, theta_e, theta_r = %d, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f, %6.6f \n",
+	       layer, theta_init, initial_psi_cm, soil_properties[soil].vg_alpha_per_cm, soil_properties[soil].vg_m,
+	       soil_properties[soil].vg_n,soil_properties[soil].theta_e,soil_properties[soil].theta_r);
+      }
+
+      bottom_flag = true;
+      current = listInsertFront(cum_layer_thickness_cm[layer],theta_init,front,layer,bottom_flag, head);
+
+      current->psi_cm = initial_psi_cm;
+      current->is_WF_GW = false;
+      Se = calc_Se_from_theta(current->theta,soil_properties[soil].theta_e,soil_properties[soil].theta_r);
+
+      Ksat_cm_per_h = frozen_factor[layer] * soil_properties[soil].Ksat_cm_per_h;
+      current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h , soil_properties[soil].vg_m);
+    }
+  }
 }
 
 // ##################################################################################
