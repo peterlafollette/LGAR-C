@@ -1164,12 +1164,12 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
     bool bottom_flag;
     double Ksat_cm_per_h;
     struct wetting_front *current;
-    const int number_of_WFs_per_layer = 16;
+    const int number_of_WFs_per_layer = 4;
     bool switch_to_next_layer_flag = false;
     double prior_psi_cm = cum_layer_thickness_cm[num_layers];
     double new_wf_depth;
     int wf_in_layer = 1;
-    double extra_moisture_factor = 0.0;
+    double extra_moisture_factor_cm = 0.0;
     double extra_height_factor = 0.0;
 
     for (int front = 1; front <= (num_layers * number_of_WFs_per_layer); front++) {
@@ -1178,13 +1178,13 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
 
       if ((front % number_of_WFs_per_layer) == 0) {
         wf_in_layer = 1;
-        initial_psi_cm = (layer_thickness_cm[layer] / number_of_WFs_per_layer) - extra_moisture_factor;
+        initial_psi_cm = (layer_thickness_cm[layer] / number_of_WFs_per_layer) - extra_moisture_factor_cm;
         if (layer < num_layers) {
           initial_psi_cm =
             (total_depth -
              (cum_layer_thickness_cm[layer - 1] +
               (number_of_WFs_per_layer - 1) * layer_thickness_cm[layer] / number_of_WFs_per_layer)) -
-            extra_moisture_factor;
+            extra_moisture_factor_cm;
         }
         new_wf_depth = cum_layer_thickness_cm[layer - 1] + layer_thickness_cm[layer];
         prior_psi_cm = initial_psi_cm;
@@ -1198,7 +1198,7 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
             (total_depth -
              (cum_layer_thickness_cm[layer - 1] +
               (wf_in_layer - 1) * layer_thickness_cm[layer] / number_of_WFs_per_layer)) -
-            extra_moisture_factor;
+            extra_moisture_factor_cm;
         }
         new_wf_depth =
           (cum_layer_thickness_cm[layer - 1] +
@@ -1512,10 +1512,31 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
   int layer_num, soil_num;
 
   int number_of_wetting_fronts = listLength(*head);
+  int number_of_surface_WFs = 0;
+  int number_of_TO_WFs_above_surface_WFs = 0;
+  bool encountered_surface_WF = false;
+
+  for (struct wetting_front *count_front = *head; count_front != NULL; count_front = count_front->next) {
+    if (count_front->is_WF_GW) {
+      if (!encountered_surface_WF) {
+        number_of_TO_WFs_above_surface_WFs++;
+      }
+    }
+    else {
+      encountered_surface_WF = true;
+      number_of_surface_WFs++;
+    }
+  }
+
+  if (number_of_surface_WFs == 0) {
+    number_of_TO_WFs_above_surface_WFs = 0;
+  }
 
   current = *head;
 
   int last_wetting_front_index = number_of_wetting_fronts;
+  int deepest_surface_front_index = number_of_surface_WFs + number_of_TO_WFs_above_surface_WFs;
+  int top_most_surface_front_index = number_of_surface_WFs > 0 ? (number_of_TO_WFs_above_surface_WFs + 1) : 1;
   int layer_num_above, layer_num_below;
 
   double precip_mass_to_add = (*volin_cm); // water to be added to the soil
@@ -1526,11 +1547,20 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
   double free_drainage_demand = *free_drainage_subtimestep_cm;
 
   /* ************************************************************ */
-  // main loop advancing all wetting fronts and doing the mass balance
-  // loop goes over deepest to top most wetting front
+  // main loop advancing only surface wetting fronts and doing the mass balance
+  // groundwater wetting fronts are updated in a separate TO-specific block below
   // wf denotes wetting front
 
-  for (int wf = number_of_wetting_fronts; wf != 0; wf--) {
+  for (int wf = deepest_surface_front_index; wf != 0; wf--) {
+
+    current = listFindFront(wf, *head, NULL);
+    if (current == NULL) {
+      break;
+    }
+
+    if (current->is_WF_GW) {
+      break;
+    }
 
     if (verbosity.compare("high") == 0) {
       printf("Moving |******** Wetting Front = %d *********| \n", wf);
@@ -1861,7 +1891,7 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     // depth of the wetting front is increased to close the mass balance when theta > theta_e.
     // l == 1 is the last iteration (top most wetting front), so do a check on the mass balance)
     // this part should be moved out of here to a subroutine; add a call to that subroutine
-    if (wf == 1) { 
+    if (wf == top_most_surface_front_index) { 
 
       wf_free_drainage_demand = wetting_front_free_drainage(*head);
     // if ((wf == wf_free_drainage_demand) && (current->theta>=theta_e) ) {
@@ -2031,6 +2061,66 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     correction_type_surf =  lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
     if (verbosity.compare("high") == 0) {
       printf("correction_type_surf at end of iteration in while loop: %d \n", correction_type_surf);
+    }
+  }
+
+  bool has_TO_fronts = false;
+  for (struct wetting_front *count_front = *head; count_front != NULL; count_front = count_front->next) {
+    if (count_front->is_WF_GW) {
+      has_TO_fronts = true;
+      break;
+    }
+  }
+
+  if (has_TO_fronts) {
+    if (verbosity.compare("high") == 0) {
+      printf("State before TO WF depth update via dzdt...\n");
+      listPrint(*head);
+    }
+
+    const int updated_wetting_front_count = listLength(*head);
+    for (int wf = updated_wetting_front_count - 1; wf >= 1; wf--) {
+      current = listFindFront(wf, *head, NULL);
+      if (current == NULL || !current->is_WF_GW || current->to_bottom) {
+        continue;
+      }
+
+      struct wetting_front *next_to_use = current->next;
+      while (next_to_use != NULL && !next_to_use->is_WF_GW) {
+        next_to_use = next_to_use->next;
+      }
+
+      if (next_to_use == NULL) {
+        continue;
+      }
+
+      const double delta_depth = current->dzdt_cm_per_h * timestep_h;
+      double delta_theta = 0.0;
+
+      if (current->layer_num == next_to_use->layer_num) {
+        delta_theta = next_to_use->theta - current->theta;
+      }
+      else {
+        const int soil_num_current = soil_type[current->layer_num];
+        const double theta_e_current = soil_properties[soil_num_current].theta_e;
+        const double theta_r_current = soil_properties[soil_num_current].theta_r;
+        const double vg_a_current = soil_properties[soil_num_current].vg_alpha_per_cm;
+        const double vg_m_current = soil_properties[soil_num_current].vg_m;
+        const double vg_n_current = soil_properties[soil_num_current].vg_n;
+        const double equiv_next_theta =
+          calc_theta_from_h(next_to_use->psi_cm, vg_a_current, vg_m_current, vg_n_current,
+                            theta_e_current, theta_r_current);
+        delta_theta = equiv_next_theta - current->theta;
+      }
+
+      current->depth_cm += delta_depth;
+      bottom_boundary_flux_cm += delta_depth * delta_theta;
+    }
+
+    if (verbosity.compare("high") == 0) {
+      printf("State after TO WF depth update via dzdt...\n");
+      listPrint(*head);
+      printf("Bottom boundary flux after TO WF movement = %lf \n", bottom_boundary_flux_cm);
     }
   }
 
@@ -2991,6 +3081,8 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
 
   struct wetting_front* current;
   struct wetting_front* next;
+  struct wetting_front* previous;
+  struct wetting_front* next_to_use;
 
   double vg_alpha_per_cm,vg_n,vg_m,Ksat_cm_per_h,theta_e,theta_r;  // local variables to make things clearer
   double delta_theta;
@@ -3017,6 +3109,7 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
 
   do {  // loop through the wetting fronts
     dzdt = 0.0;
+    bool apply_layer_crossing_limit = true;
 
     // copy structure elements into shorter variables names to increase readability
     // WETTING FRONT PROPERTIES
@@ -3049,72 +3142,228 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
     next = current->next;    // the next element in the linked list
     if (next == NULL) break; // we're done calculating dZ/dt's because we're at the end of the list
 
-    theta1 = next->theta;
-    theta2 = current->theta;
+    if (current->is_WF_GW) {
+      apply_layer_crossing_limit = false;
 
+      if (current->to_bottom == TRUE) {
+        dzdt = 0.0;
+      }
+      else {
+        next_to_use = next;
+        previous = listFindFront(current->front_num - 1, head, NULL);
+        const double D = cum_layer_thickness_cm[num_layers]; //This is the depth to GW. When we update LGARTO to have variable groundwater depth, this can vary; for now it doesn't 
 
-    bottom_sum = 0.0;  // needed ffor multi-layered dz/dt equation.  Equal to sum from n=1 to N-1 of (L_n/K_n(theta_n))
+        if (next_to_use->is_WF_GW == FALSE) {
+          while (next_to_use != NULL && next_to_use->is_WF_GW == FALSE) { //because there technically can be surface WFs between TO WFs just so long as the higher TO WFs have a depth of 0
+            next_to_use = next_to_use->next;
+          }
+          while (next_to_use != NULL && next_to_use->to_bottom == TRUE && next_to_use->next != NULL) {
+            next_to_use = next_to_use->next;
+          }
+        }
 
-    if(current->to_bottom == TRUE) {
-      if(layer_num > 1)
-	current->dzdt_cm_per_h = 0.0;
-      else
-	current->dzdt_cm_per_h = 0.0;
+        if (next_to_use == NULL) {
+          dzdt = 0.0;
+        }
+        else if (current->layer_num == num_layers) {
+          //Because the WF is in the lowest layer, the single layer form of dZ/dt for the TO WF can be used. 
+          //note that TO WFs extend from the bottom of the model domain up, whereas surface WFs extend from the top of the model domain down. Therefore, a TO WF spans just 1 layer if it is only in the bottom layer, but a TO WF that is in more than the bottom layer spans more than 1 layer. 
+          double avoid_div_by_zero_factor = 1.0E-9;
+          if ((next_to_use->theta - current->theta) == 1.0E-9) {
+            avoid_div_by_zero_factor = 1.0E-10;
+          }
 
-      current = current->next;  // point to the next link
-      continue;                 // go to next front, this one fully penetrates the layer
+          dzdt = (next_to_use->K_cm_per_h - current->K_cm_per_h) /
+                 (next_to_use->theta - current->theta + avoid_div_by_zero_factor) *
+                 (1.0 - (next_to_use->psi_cm + 1.0E-6) /
+                  (D - current->depth_cm + avoid_div_by_zero_factor));
+
+          if ((dzdt * subtimestep_h + current->depth_cm) > D) {
+            dzdt = (D - current->depth_cm - 1.0E-6) / subtimestep_h;
+          }
+
+          if (isnan(dzdt)) {
+            dzdt = 0.0;
+          }
+        }
+        else { //the TO WF is in a layer that is not the deepest layer, so multilayer composite dzdt has to be calculated
+          double K_composite = 0.0;
+          double K_composite_left = 0.0;
+          double denominator = 0.0;
+          double denominator_left = 0.0;
+
+          for (int k = num_layers; k > (current->layer_num - 1); k--) {
+            int soil_num_loc = soil_type[k];
+            double theta_prev_loc = calc_theta_from_h(next_to_use->psi_cm, soil_properties[soil_num_loc].vg_alpha_per_cm,
+                                                      soil_properties[soil_num_loc].vg_m,
+                                                      soil_properties[soil_num_loc].vg_n, soil_properties[soil_num_loc].theta_e,
+                                                      soil_properties[soil_num_loc].theta_r);
+
+            double Se_prev_loc = calc_Se_from_theta(theta_prev_loc, soil_properties[soil_num_loc].theta_e,
+                                                    soil_properties[soil_num_loc].theta_r);
+
+            double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,
+                                                        soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[k],
+                                                        soil_properties[soil_num_loc].vg_m);
+
+            if (k == current->layer_num) {
+              denominator += (cum_layer_thickness_cm[k] - current->depth_cm) / K_cm_per_h_prev_loc;
+            }
+            else {
+              denominator += (cum_layer_thickness_cm[k] - cum_layer_thickness_cm[k - 1]) / K_cm_per_h_prev_loc;
+            }
+          }
+
+          double temp_psi = current->psi_cm;
+          double temp_theta = current->theta;
+          bool identical_thetas = false;
+          if (current->psi_cm == next_to_use->psi_cm) {
+            temp_psi += 0.1;
+            identical_thetas = true;
+            int soil_num_loc = soil_type[current->layer_num];
+            temp_theta = calc_theta_from_h(temp_psi, soil_properties[soil_num_loc].vg_alpha_per_cm,
+                                           soil_properties[soil_num_loc].vg_m,
+                                           soil_properties[soil_num_loc].vg_n, soil_properties[soil_num_loc].theta_e,
+                                           soil_properties[soil_num_loc].theta_r);
+          }
+
+          for (int k = num_layers; k > (current->layer_num - 1); k--) {
+            int soil_num_loc = soil_type[k];
+            double theta_prev_loc = calc_theta_from_h(temp_psi, soil_properties[soil_num_loc].vg_alpha_per_cm,
+                                                      soil_properties[soil_num_loc].vg_m,
+                                                      soil_properties[soil_num_loc].vg_n, soil_properties[soil_num_loc].theta_e,
+                                                      soil_properties[soil_num_loc].theta_r);
+
+            double Se_prev_loc = calc_Se_from_theta(theta_prev_loc, soil_properties[soil_num_loc].theta_e,
+                                                    soil_properties[soil_num_loc].theta_r);
+
+            double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,
+                                                        soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[k],
+                                                        soil_properties[soil_num_loc].vg_m);
+            if (k == layer_num) {
+              if (previous != NULL) {
+                denominator_left += (cum_layer_thickness_cm[k] - current->depth_cm) / K_cm_per_h_prev_loc;
+              }
+              else {
+                denominator_left += cum_layer_thickness_cm[k] / K_cm_per_h_prev_loc;
+              }
+            }
+            else {
+              denominator_left += (cum_layer_thickness_cm[k] - cum_layer_thickness_cm[k - 1]) / K_cm_per_h_prev_loc;
+            }
+          }
+
+          K_composite = (D - current->depth_cm) / denominator;
+          if (previous == NULL) {
+            K_composite_left = D / denominator_left;
+          }
+          else {
+            K_composite_left = (D - current->depth_cm) / denominator_left;
+          }
+
+          if (current->layer_num == next_to_use->layer_num) {
+            if (!identical_thetas) {
+              dzdt = (K_composite - K_composite_left) / (next_to_use->theta - current->theta + 1.0E-9) *
+                     (1.0 - next_to_use->psi_cm / (D - current->depth_cm));
+            }
+            else {
+              dzdt = (K_composite - K_composite_left) / (next_to_use->theta - temp_theta + 1.0E-9) *
+                     (1.0 - next_to_use->psi_cm / (D - current->depth_cm));
+            }
+          }
+          else {
+            int soil_num_loc = soil_type[current->layer_num];
+            double theta_temp = calc_theta_from_h(next_to_use->psi_cm, soil_properties[soil_num_loc].vg_alpha_per_cm,
+                                                  soil_properties[soil_num_loc].vg_m,
+                                                  soil_properties[soil_num_loc].vg_n, soil_properties[soil_num_loc].theta_e,
+                                                  soil_properties[soil_num_loc].theta_r);
+            if (!identical_thetas) {
+              dzdt = (K_composite - K_composite_left) / (theta_temp - current->theta + 1.0E-9) *
+                     (1.0 - next_to_use->psi_cm / (D - current->depth_cm));
+            }
+            else {
+              dzdt = (K_composite - K_composite_left) / (next_to_use->theta - theta_temp + 1.0E-9) *
+                     (1.0 - next_to_use->psi_cm / (D - current->depth_cm));
+            }
+          }
+        }
+
+        if ((current->depth_cm + dzdt * subtimestep_h) < 0.0) {
+          dzdt = current->depth_cm / subtimestep_h;
+        }
+
+        if (current->next != NULL && current->next->theta == current->theta) {
+          dzdt = 0.0;
+        }
+      }
     }
-    else if(layer_num > 1) {
-      bottom_sum += (current->depth_cm-cum_layer_thickness_cm[layer_num-1])/K_cm_per_h;
-    }
+    else {
+      theta1 = next->theta;
+      theta2 = current->theta;
 
-    if(theta1 > theta2) {
-      printf("Calculating dzdt : theta1 > theta2 = (%lf, %lf) ... aborting \n", theta1, theta2);  // this should never happen
-      exit(0);
-    }
+      bottom_sum = 0.0;  // needed ffor multi-layered dz/dt equation.  Equal to sum from n=1 to N-1 of (L_n/K_n(theta_n))
 
-    Geff = calc_Geff(use_closed_form_G, theta1, theta2, theta_e, theta_r, vg_alpha_per_cm, vg_n, vg_m, h_min_cm, Ksat_cm_per_h, nint, lambda, bc_psib_cm); 
-    delta_theta = current->theta - next->theta;
+      if(current->to_bottom == TRUE) {
+        if(layer_num > 1)
+	  current->dzdt_cm_per_h = 0.0;
+        else
+	  current->dzdt_cm_per_h = 0.0;
 
-    if(current->layer_num == 1) { // this front is in the upper layer
-      if (delta_theta > 0){
-	dzdt = 1.0/delta_theta*(Ksat_cm_per_h*(Geff+h_p)/current->depth_cm+current->K_cm_per_h);}
-      else{
-	dzdt = 0.0;}
-    }
-    else {  // we are in the second or greater layer
-      double denominator = bottom_sum;
-
-      for (int k = 1; k < layer_num; k++) {
-	int soil_num_loc = soil_type[layer_num-k]; // _loc denotes the soil_num is local to this loop
-	double theta_prev_loc = calc_theta_from_h(current->psi_cm, soil_properties[soil_num_loc].vg_alpha_per_cm,
-						  soil_properties[soil_num_loc].vg_m,
-						  soil_properties[soil_num_loc].vg_n,soil_properties[soil_num_loc].theta_e,
-						  soil_properties[soil_num_loc].theta_r);
-
-
-	double Se_prev_loc = calc_Se_from_theta(theta_prev_loc,soil_properties[soil_num_loc].theta_e,soil_properties[soil_num_loc].theta_r);
-
-	double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[layer_num-k],
-						    soil_properties[soil_num_loc].vg_m);
-
-	denominator += (cum_layer_thickness_cm[k] - cum_layer_thickness_cm[k-1])/ K_cm_per_h_prev_loc;
-
+        current = current->next;  // point to the next link
+        continue;                 // go to next front, this one fully penetrates the layer
+      }
+      else if(layer_num > 1) {
+        bottom_sum += (current->depth_cm-cum_layer_thickness_cm[layer_num-1])/K_cm_per_h;
       }
 
-      double numerator = depth_cm;// + (Geff +h_p)* Ksat_cm_per_h / K_cm_per_h;
+      if(theta1 > theta2) {
+        printf("Calculating dzdt : theta1 > theta2 = (%lf, %lf) ... aborting \n", theta1, theta2);  // this should never happen
+        exit(0);
+      }
 
-      if (delta_theta > 0)
-	dzdt = (1.0/delta_theta) * ( (numerator / denominator) + Ksat_cm_per_h*(Geff+h_p)/depth_cm );
-      else
-	dzdt = 0.0;
-    }
+      Geff = calc_Geff(use_closed_form_G, theta1, theta2, theta_e, theta_r, vg_alpha_per_cm, vg_n, vg_m, h_min_cm, Ksat_cm_per_h, nint, lambda, bc_psib_cm); 
+      delta_theta = current->theta - next->theta;
 
-    if ((dzdt == 0.0) && (current->to_bottom==FALSE)){
-      //in lgar_move, we have: "if (current->dzdt_cm_per_h == 0.0 && current->to_bottom == FALSE) { // a new front was just created, so don't update it."
-      //the issue here is that when theta approaches theta_r, then dzdt can in some cases numerically evaluate to 0, even if the wetting front has to_bottom==FALSE.
-      //so, there are cases where a WF should be moving very slowly, but not being completely still. 
-      dzdt = 1e-9;
+      if(current->layer_num == 1) { // this front is in the upper layer
+        if (delta_theta > 0){
+	  dzdt = 1.0/delta_theta*(Ksat_cm_per_h*(Geff+h_p)/current->depth_cm+current->K_cm_per_h);}
+        else{
+	  dzdt = 0.0;}
+      }
+      else {  // we are in the second or greater layer
+        double denominator = bottom_sum;
+
+        for (int k = 1; k < layer_num; k++) {
+	  int soil_num_loc = soil_type[layer_num-k]; // _loc denotes the soil_num is local to this loop
+	  double theta_prev_loc = calc_theta_from_h(current->psi_cm, soil_properties[soil_num_loc].vg_alpha_per_cm,
+						    soil_properties[soil_num_loc].vg_m,
+						    soil_properties[soil_num_loc].vg_n,soil_properties[soil_num_loc].theta_e,
+						    soil_properties[soil_num_loc].theta_r);
+
+
+	  double Se_prev_loc = calc_Se_from_theta(theta_prev_loc,soil_properties[soil_num_loc].theta_e,soil_properties[soil_num_loc].theta_r);
+
+	  double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[layer_num-k],
+						      soil_properties[soil_num_loc].vg_m);
+
+	  denominator += (cum_layer_thickness_cm[k] - cum_layer_thickness_cm[k-1])/ K_cm_per_h_prev_loc;
+
+        }
+
+        double numerator = depth_cm;// + (Geff +h_p)* Ksat_cm_per_h / K_cm_per_h;
+
+        if (delta_theta > 0)
+	  dzdt = (1.0/delta_theta) * ( (numerator / denominator) + Ksat_cm_per_h*(Geff+h_p)/depth_cm );
+        else
+	  dzdt = 0.0;
+      }
+
+      if ((dzdt == 0.0) && (current->to_bottom==FALSE)){
+        //in lgar_move, we have: "if (current->dzdt_cm_per_h == 0.0 && current->to_bottom == FALSE) { // a new front was just created, so don't update it."
+        //the issue here is that when theta approaches theta_r, then dzdt can in some cases numerically evaluate to 0, even if the wetting front has to_bottom==FALSE.
+        //so, there are cases where a WF should be moving very slowly, but not being completely still. 
+        dzdt = 1e-9;
+      }
     }
 
     if (dzdt>1e4){//insanity check
@@ -3141,7 +3390,7 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
       is_next_to_bottom = next->to_bottom;
     }
 
-    if (is_next_to_bottom && dzdt*subtimestep_h + current->depth_cm > FACTOR_LIMITS_LAYER_CROSSING_SPEED*(cum_layer_thickness_cm[current->layer_num])){
+    if (apply_layer_crossing_limit && is_next_to_bottom && dzdt*subtimestep_h + current->depth_cm > FACTOR_LIMITS_LAYER_CROSSING_SPEED*(cum_layer_thickness_cm[current->layer_num])){
       count_correct_for_crossing ++;
       // idea is that we want to make sure that layer boundary crossing does not go crazy, should never cross more than
       // some factor of the current layer depth into the next layer. In most situations it won't matter, but in for example sand
@@ -3356,6 +3605,10 @@ extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickne
   }
 
   for (int wf = 1; wf != (listLength(*head)); wf++) {
+
+    if ( (current->depth_cm > 0.0) && (current->is_WF_GW) ){
+      break;
+    }
 
     if (next!=NULL){
       // if ( (current->is_WF_GW==0) && (next->is_WF_GW==0) && (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
