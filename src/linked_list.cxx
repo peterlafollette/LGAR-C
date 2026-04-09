@@ -168,6 +168,22 @@ int listLength(struct wetting_front* head)
   return listLength;
 }
 
+/*#######################################################*/
+/* listLength_surface - counts how many surface WFs are in the list */
+/*#######################################################*/
+int listLength_surface(struct wetting_front* head)
+{
+  int surface_count = 0;
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (!current->is_WF_GW) {
+      surface_count++;
+    }
+  }
+
+  return surface_count;
+}
+
 
 /*#######################################################################################*/
 /* listFindFront -searches linked list for a particular front number and returns that struct */
@@ -272,7 +288,7 @@ extern struct wetting_front* listDeleteFront(int front_num, struct wetting_front
       struct wetting_front *current_temp = listFindFront(wf, *head, NULL);
       struct wetting_front *next_temp = current_temp->next;
       if ( (current_temp->to_bottom) ){
-        // current_temp->is_WF_GW = next_temp->is_WF_GW; // LGARTO thing
+        current_temp->is_WF_GW = next_temp->is_WF_GW;
         current_temp->psi_cm = next_temp->psi_cm;
 
         int soil_num_k1 = soil_type[current_temp->layer_num]; 
@@ -532,30 +548,104 @@ extern void listSortFrontsByDepth(struct wetting_front *head)
     current = head;
     next = head->next;
 
-    for ( j = 1 ; j < k ; j++ ) {
-      if ( current->depth_cm > next->depth_cm ) {
-	tempData = current->depth_cm;
-	current->depth_cm = next->depth_cm;
-	next->depth_cm = tempData;
+	for ( j = 1 ; j < k ; j++ ) {
+	      if ( current->depth_cm > next->depth_cm ) {
+		tempData = current->depth_cm;
+		current->depth_cm = next->depth_cm;
+		next->depth_cm = tempData;
 
 	tempData = current->theta;
 	current->theta = next->theta;
 	next->theta = tempData;
 
-	tempKey = current->layer_num;
-	current->layer_num = next->layer_num;
-	next->layer_num = tempKey;
+		tempKey = current->layer_num;
+		current->layer_num = next->layer_num;
+		next->layer_num = tempKey;
 
-	tempKey = current->front_num;
-	current->front_num = next->front_num;
-	next->front_num = tempKey;
-      }
+		tempKey = current->to_bottom;
+		current->to_bottom = next->to_bottom;
+		next->to_bottom = tempKey;
+
+		tempData = current->psi_cm;
+		current->psi_cm = next->psi_cm;
+		next->psi_cm = tempData;
+
+		tempData = current->K_cm_per_h;
+		current->K_cm_per_h = next->K_cm_per_h;
+		next->K_cm_per_h = tempData;
+
+		tempData = current->dzdt_cm_per_h;
+		current->dzdt_cm_per_h = next->dzdt_cm_per_h;
+		next->dzdt_cm_per_h = tempData;
+
+		tempKey = current->is_WF_GW;
+		current->is_WF_GW = next->is_WF_GW;
+		next->is_WF_GW = tempKey;
+	      }
 
       current = current->next;
       next = next->next;
     }
   }
 
+}
+
+/*#################################################################################################*/
+/* listSendToTop - move zero-depth fronts to the top while preserving all other wetting-front data */
+/*#################################################################################################*/
+extern void listSendToTop(struct wetting_front *head)
+{
+  int i, j, k, tempKey;
+  double tempData;
+  struct wetting_front *current;
+  struct wetting_front *next;
+
+  int size = listLength(head);
+  k = size;
+
+  for (i = 0; i < size - 1; i++, k--) {
+    current = head;
+    next = head->next;
+
+    for (j = 1; j < k; j++) {
+      if ((current->depth_cm > next->depth_cm) && (next->depth_cm == 0.0)) {
+        tempData = current->depth_cm;
+        current->depth_cm = next->depth_cm;
+        next->depth_cm = tempData;
+
+        tempData = current->theta;
+        current->theta = next->theta;
+        next->theta = tempData;
+
+        tempKey = current->layer_num;
+        current->layer_num = next->layer_num;
+        next->layer_num = tempKey;
+
+        tempKey = current->to_bottom;
+        current->to_bottom = next->to_bottom;
+        next->to_bottom = tempKey;
+
+        tempData = current->psi_cm;
+        current->psi_cm = next->psi_cm;
+        next->psi_cm = tempData;
+
+        tempData = current->K_cm_per_h;
+        current->K_cm_per_h = next->K_cm_per_h;
+        next->K_cm_per_h = tempData;
+
+        tempData = current->dzdt_cm_per_h;
+        current->dzdt_cm_per_h = next->dzdt_cm_per_h;
+        next->dzdt_cm_per_h = tempData;
+
+        tempKey = current->is_WF_GW;
+        current->is_WF_GW = next->is_WF_GW;
+        next->is_WF_GW = tempKey;
+      }
+
+      current = current->next;
+      next = next->next;
+    }
+  }
 }
 
 

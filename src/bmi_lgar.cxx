@@ -516,20 +516,52 @@ Update()
 
       /*----------------------------------------------------------------------*/
       // Should a new wetting front be created?
-      int soil_num = state->lgar_bmi_params.layer_soil_type[state->head->layer_num];
-      double theta_e = state->soil_properties[soil_num].theta_e;
-      bool is_top_wf_saturated = (state->head->theta+SMALL_EPS) >= theta_e ? true : false; //sometimes a machine precision error would erroneously create a new wetting front during saturated conditions. The epsillon seems to prevent this.
-      double theta_above_which_precip_contribs_to_GW = theta_e * spf_factor;
-      top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation, thus triggering simple preferential flow if enabled
+	      int soil_num = state->lgar_bmi_params.layer_soil_type[state->head->layer_num];
+	      double theta_e = state->soil_properties[soil_num].theta_e;
+	      bool is_top_wf_saturated = false;
+	      if (!state->lgar_bmi_params.TO_enabled) {
+	        is_top_wf_saturated = (state->head->theta + SMALL_EPS) >= theta_e;
+	      }
+	      else {
+	        if (listLength_surface(state->head) > 0) {
+	          struct wetting_front *top_most_surface_WF = state->head;
+	          while (top_most_surface_WF != NULL && top_most_surface_WF->is_WF_GW) {
+	            top_most_surface_WF = top_most_surface_WF->next;
+	          }
+
+	          if (top_most_surface_WF != NULL) {
+	            const int soil_num_highest_surf =
+	              state->lgar_bmi_params.layer_soil_type[top_most_surface_WF->layer_num];
+	            const double theta_e_highest_surf = state->soil_properties[soil_num_highest_surf].theta_e;
+	            is_top_wf_saturated = (top_most_surface_WF->theta + SMALL_EPS) >= theta_e_highest_surf;
+	          }
+	        }
+	        else {
+	          is_top_wf_saturated = (state->head->theta + SMALL_EPS) >= theta_e;
+	        }
+	      }
+	      double theta_above_which_precip_contribs_to_GW = theta_e * spf_factor;
+	      top_near_sat = state->head->theta > theta_above_which_precip_contribs_to_GW ? true : false; //is the top WF near saturation, thus triggering simple preferential flow if enabled
 
       // checks on creatign a new surficial front
       // 1. check current and previous timestep precipitation
       // bool create_surficial_front = (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0);
-      bool create_surficial_front = (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0 && volon_timestep_cm == 0) || ( (precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0) && (listLength(state->head)==num_layers) );
-      
-      // 2. check soil top wetting front condition (saturated/unsaturated), and surface ponded water
-      if (is_top_wf_saturated || volon_timestep_cm > 0.0)
-        create_surficial_front = false;
+	      bool create_surficial_front =
+	        (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0 && volon_timestep_cm == 0.0) ||
+	        ((precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0.0) &&
+	         (listLength(state->head) == num_layers) &&
+	         !(state->lgar_bmi_params.TO_enabled));
+	      
+	      // 2. check soil top wetting front condition (saturated/unsaturated), and surface ponded water
+	      if (is_top_wf_saturated)
+	        create_surficial_front = false;
+
+	      if (state->lgar_bmi_params.TO_enabled &&
+	          (precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0.0) &&
+	          (listLength_surface(state->head) == 0) &&
+	          (state->head->theta < (theta_e - SMALL_EPS))) {
+	        create_surficial_front = true;
+	      }
 
       if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0) {
         std::string flag        = (create_surficial_front && !is_top_wf_saturated) == true ? "Yes" : "No";
@@ -559,7 +591,7 @@ Update()
         // }
         
         // depth of the surficial front to be created
-        dry_depth = lgar_calc_dry_depth(use_closed_form_G, nint, subtimestep_h, &delta_theta, state->lgar_bmi_params.layer_soil_type,
+        dry_depth = lgar_calc_dry_depth(state->lgar_bmi_params.TO_enabled, use_closed_form_G, nint, subtimestep_h, &delta_theta, state->lgar_bmi_params.layer_soil_type,
                 state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
                 state->head, state->soil_properties);
 
@@ -568,9 +600,25 @@ Update()
           listPrint(state->head);
         }
         
-        lgar_create_surficial_front(num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, state->head->theta,
-            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
-            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
+	        double theta_for_new_wf = state->head->theta;
+	        struct wetting_front *top_most_surface_WF = state->head;
+	        if (listLength_surface(state->head) > 0) {
+	          while (top_most_surface_WF != NULL && top_most_surface_WF->is_WF_GW) {
+	            top_most_surface_WF = top_most_surface_WF->next;
+	          }
+	        }
+	        if (top_most_surface_WF != NULL && top_most_surface_WF->depth_cm == 0.0) {
+	          while (top_most_surface_WF != NULL && top_most_surface_WF->depth_cm == 0.0) {
+	            top_most_surface_WF = top_most_surface_WF->next;
+	          }
+	        }
+	        if (top_most_surface_WF != NULL) {
+	          theta_for_new_wf = top_most_surface_WF->theta;
+	        }
+
+	        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
+	            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
+	            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
 
         if (verbosity.compare("high") == 0) {
           printf("State after moving creating new WF...\n");
@@ -797,7 +845,7 @@ Update()
     // store local mass balance error to the struct
     state->lgar_mass_balance.local_mass_balance = local_mb;
 
-    assert (state->head->depth_cm > 0.0); // check on negative layer depth --> move this to somewhere else AJ (later)
+    assert (state->head->depth_cm >= -1.E-10); // check on negative layer depth --> move this to somewhere else AJ (later)
 
     bool lasam_standalone = true;
 #ifdef NGEN
