@@ -473,37 +473,51 @@ Update()
       num_layers = state->lgar_bmi_params.num_layers;
       double delta_theta;   // the width of a front, such that its volume=depth*delta_theta
       double dry_depth;
+      double surf_frac_rz = 0.0;
+      std::vector<double> surf_AET_vec(listLength(state->head) + 1, 0.0);
 
       // Calculate AET from PET if PET is non-zero
       if (PET_subtimestep_cm_per_h > 0.0) {
-        AET_subtimestep_cm = calc_aet(PET_subtimestep_cm_per_h, subtimestep_h, wilting_point_psi_cm, field_capacity_psi_cm,
-                                      state->lgar_bmi_params.layer_soil_type, AET_thresh_Theta, AET_expon,
-                                      state->head, state->soil_properties);
+        if (!state->lgar_bmi_params.TO_enabled) {
+          AET_subtimestep_cm = calc_aet(PET_subtimestep_cm_per_h, subtimestep_h, wilting_point_psi_cm,
+                                        field_capacity_psi_cm, state->lgar_bmi_params.layer_soil_type,
+                                        AET_thresh_Theta, AET_expon, state->head, state->soil_properties);
+        }
+        else {
+          calc_aet(state->lgar_bmi_params.TO_enabled, PET_subtimestep_cm_per_h, subtimestep_h,
+                   wilting_point_psi_cm, field_capacity_psi_cm,
+                   state->lgar_bmi_params.root_zone_depth_cm, &surf_frac_rz,
+                   state->lgar_bmi_params.layer_soil_type, AET_thresh_Theta, AET_expon,
+                   state->head, state->soil_properties, surf_AET_vec.data());
+          AET_subtimestep_cm = 0.0;
+        }
       }
 
-      int iter_mass_check_AET = 0;
-      while ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm < min_storage) || (storage_in_FD_WF - AET_subtimestep_cm < min_water_possible_for_FD_WF) ){
-        AET_subtimestep_cm *= 0.5; //give it a chance to merely become smaller before setting to 0
-        if (iter_mass_check_AET > 5){
-          AET_subtimestep_cm = 0.0;
-          break;
+      if (!state->lgar_bmi_params.TO_enabled) {
+        int iter_mass_check_AET = 0;
+        while ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm < min_storage) || (storage_in_FD_WF - AET_subtimestep_cm < min_water_possible_for_FD_WF) ){
+          AET_subtimestep_cm *= 0.5; //give it a chance to merely become smaller before setting to 0
+          if (iter_mass_check_AET > 5){
+            AET_subtimestep_cm = 0.0;
+            break;
+          }
+          iter_mass_check_AET ++;
         }
-        iter_mass_check_AET ++;
-      }
 
-      int iter_mass_check_AET_and_FD = 0;
-      while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_storage) || ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_water_possible_for_FD_WF) ){ 
-        // both should also be checked at the same because while individually these might not make an impossible storage, together they might
-        AET_subtimestep_cm *= 0.5;
-        free_drainage_subtimestep_cm *= 0.5;
-        mass_correction_for_cached_free_drainage_fluxes *=0.5;
-        if (iter_mass_check_AET_and_FD > 5){
-          AET_subtimestep_cm = 0.0;
-          free_drainage_subtimestep_cm = 0.0;
-          mass_correction_for_cached_free_drainage_fluxes = 0.0;
-          break;
+        int iter_mass_check_AET_and_FD = 0;
+        while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_storage) || ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_water_possible_for_FD_WF) ){ 
+          // both should also be checked at the same because while individually these might not make an impossible storage, together they might
+          AET_subtimestep_cm *= 0.5;
+          free_drainage_subtimestep_cm *= 0.5;
+          mass_correction_for_cached_free_drainage_fluxes *=0.5;
+          if (iter_mass_check_AET_and_FD > 5){
+            AET_subtimestep_cm = 0.0;
+            free_drainage_subtimestep_cm = 0.0;
+            mass_correction_for_cached_free_drainage_fluxes = 0.0;
+            break;
+          }
+          iter_mass_check_AET_and_FD ++;
         }
-        iter_mass_check_AET_and_FD ++;
       }
 
       // precip_timestep_cm += precip_subtimestep_cm;
@@ -582,7 +596,10 @@ Update()
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
-              &state->head, state->state_previous, state->soil_properties);
+              &state->head, state->state_previous, state->soil_properties,
+              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz);
 
         // if (temp_pd != 0.0){ //if temp_pd != 0.0, that means that some water left the model through the lower model bdy. For LGARTO preparation, this has been refactored such that temp_rch handles this now.
         //   // volrech_subtimestep_cm = temp_pd;
@@ -687,7 +704,10 @@ Update()
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
-              &state->head, state->state_previous, state->soil_properties);
+              &state->head, state->state_previous, state->soil_properties,
+              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz);
 
         // this is the volume of water leaving through the bottom
         volrech_subtimestep_cm = volin_subtimestep_cm;
