@@ -394,6 +394,8 @@ Update()
     volrunoff_subtimestep_cm      = 0.0;
     volrech_subtimestep_cm        = 0.0;
     double temp_rch               = 0.0; //handles case when a fraction of a wetting front technically crosses the lower boundary of the vadose zone
+    double creation_excess_gw_flux_subtimestep_cm = 0.0;
+    double creation_excess_runoff_subtimestep_cm = 0.0;
     double free_drainage_subtimestep_cm = 0.0;
     double free_drainage_for_CR = 0.0;
 
@@ -633,9 +635,14 @@ Update()
 	          theta_for_new_wf = top_most_surface_WF->theta;
 	        }
 
+          double creation_excess_gw_flux_cm = 0.0;
+          double creation_excess_runoff_cm = 0.0;
 	        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
 	            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
-	            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties);
+	            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties,
+              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm);
+          creation_excess_gw_flux_subtimestep_cm += creation_excess_gw_flux_cm;
+          creation_excess_runoff_subtimestep_cm += creation_excess_runoff_cm;
 
         if (verbosity.compare("high") == 0) {
           printf("State after moving creating new WF...\n");
@@ -716,7 +723,23 @@ Update()
         volin_subtimestep_cm = volin_subtimestep_cm_temp;
       }
 
-      lgar_clean_redundant_fronts(&state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties); //deletes WFs that are very close in capillary head value
+      lgar_clean_redundant_fronts(&state->head, state->lgar_bmi_params.layer_soil_type,
+                                  state->soil_properties,
+                                  PET_subtimestep_cm_per_h > 0.0); // deletes redundant WFs; leading zero-depth TO/GW capping is limited to PET-active substeps
+
+      int correction_type_surf_after_cleanup =
+        lgarto_correction_type_surf(num_layers, state->lgar_bmi_params.cum_layer_thickness_cm, &state->head);
+      while (correction_type_surf_after_cleanup == 4) {
+        double cleanup_mass_change_cm = 0.0;
+        lgar_fix_dry_over_wet_wetting_fronts(&cleanup_mass_change_cm,
+                                             state->lgar_bmi_params.cum_layer_thickness_cm,
+                                             state->lgar_bmi_params.layer_soil_type, &state->head,
+                                             state->soil_properties);
+        AET_subtimestep_cm -= cleanup_mass_change_cm;
+        correction_type_surf_after_cleanup =
+          lgarto_correction_type_surf(num_layers, state->lgar_bmi_params.cum_layer_thickness_cm,
+                                      &state->head);
+      }
 
       /*----------------------------------------------------------------------*/
       // calculate derivative (dz/dt) for all wetting fronts
@@ -741,6 +764,20 @@ Update()
       else {
         free_drainage_for_CR += free_drainage_subtimestep_cm + volrech_subtimestep_cm;
         volrech_subtimestep_cm = 0.0;
+      }
+
+      volrech_subtimestep_cm += creation_excess_gw_flux_subtimestep_cm;
+      volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
+      if (creation_excess_runoff_subtimestep_cm > 0.0) {
+        const double accepted_creation_infiltration_cm =
+          volin_subtimestep_cm - creation_excess_runoff_subtimestep_cm;
+        if (verbosity.compare("high") == 0) {
+          printf("creation-time runoff reclassification updated infiltration bookkeeping: "
+                 "volin %.12e -> %.12e cm after subtracting runoff %.12e cm\n",
+                 volin_subtimestep_cm, fmax(0.0, accepted_creation_infiltration_cm),
+                 creation_excess_runoff_subtimestep_cm);
+        }
+        volin_subtimestep_cm = fmax(0.0, accepted_creation_infiltration_cm);
       }
 
     }
@@ -866,6 +903,7 @@ Update()
     state->lgar_mass_balance.local_mass_balance = local_mb;
 
     assert (state->head->depth_cm >= -1.E-10); // check on negative layer depth --> move this to somewhere else AJ (later)
+    lgar_assert_boundary_psi_continuity(state->head);
 
     bool lasam_standalone = true;
 #ifdef NGEN

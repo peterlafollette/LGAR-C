@@ -333,7 +333,9 @@ extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, do
 // computed mass balance
 extern double lgar_calc_mass_bal(double *cum_layer_thickness, struct wetting_front* head);
 
-extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_type, struct soil_properties_ *soil_properties);
+extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_type,
+                                        struct soil_properties_ *soil_properties,
+                                        bool apply_zero_depth_groundwater_cap = true);
 
 // computes derivatives; called derivs() in Python code
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, double h_p, double subtimestep_h, int *soil_type, double *cum_layer_thickness,
@@ -351,7 +353,9 @@ extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_
 // creates a surficial front (new top most wetting front)
 extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double *ponded_depth_cm, double *volin, double dry_depth,
 					double theta1, int *soil_type, double *cum_layer_thickness_cm,
-					double *frozen_factor, struct wetting_front **head, struct soil_properties_ *soil_properties);
+					double *frozen_factor, struct wetting_front **head, struct soil_properties_ *soil_properties,
+					double *creation_excess_gw_flux_cm = nullptr,
+					double *creation_excess_runoff_cm = nullptr);
 
 // computes the infiltration capacity, fp, of the soil
 extern double lgar_insert_water(bool use_closed_form_G, int nint, double timestep_h, double AET_demand_cm, double free_drainage_subtimestep_cm, double *ponded_depth,
@@ -407,6 +411,9 @@ extern void lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(bool merg
 // updates psi globally from theta after TO corrections that modify theta directly
 extern void lgar_global_psi_update(int *soil_type, struct soil_properties_ *soil_properties,
 				   struct wetting_front **head);
+
+// aborts if psi is not continuous across an active soil-layer boundary
+extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head);
 
 // updates theta globally from psi after TO surface-flux extraction changes psi continuity
 extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_WFs_cm,
@@ -513,8 +520,9 @@ extern double calc_aet(bool TO_enabled, double PET_timestep_cm, double time_step
 
 extern double lgarto_calc_aet_from_TO_WFs(int num_layers, double deepest_surf_depth_at_start, double root_zone_depth_cm,
 					  double PET_timestep_cm, double timestep_h, double surf_frac_rz,
+					  bool allow_root_zone_to_population,
 					  double wilting_point_psi_cm, double field_capacity_psi_cm,
-					  int *soil_type, double *cum_layer_thickness_cm,
+					  int *soil_type, double *cum_layer_thickness_cm, double *frozen_factor,
 					  struct soil_properties_ *soil_properties, struct wetting_front **head);
 
 //returns an integer that describes which type of layer boundary crossing or WF merging is necessary
