@@ -412,6 +412,25 @@ extern void lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(bool merg
 extern void lgar_global_psi_update(int *soil_type, struct soil_properties_ *soil_properties,
 				   struct wetting_front **head);
 
+// aborts if any wetting front persists below the vadose-zone lower boundary
+extern void lgar_assert_wetting_fronts_within_vadose_zone(double domain_depth_cm,
+                                                          struct wetting_front *head);
+
+// aborts if adjacent same-layer TO wetting fronts reverse psi ordering with depth
+extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head);
+
+// aborts if the to_bottom scaffold does not contain exactly one boundary front per soil layer
+extern void lgar_assert_to_bottom_scaffold(int num_layers,
+                                           double *cum_layer_thickness_cm,
+                                           struct wetting_front *head);
+
+// truncates an overshooting last-layer GW wetting front into the bottom front and routes the excess to bottom flux
+extern double lgarto_truncate_last_layer_GW_overshoot(double lower_boundary_depth_cm,
+                                                      int num_layers,
+                                                      struct wetting_front **head,
+                                                      int *soil_type,
+                                                      struct soil_properties_ *soil_properties);
+
 // aborts if psi is not continuous across an active soil-layer boundary
 extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head);
 
@@ -464,7 +483,7 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
 				      int *soil_type, struct soil_properties_ *soil_properties);
 
 // computes updated theta (soil moisture content) after fixing a dry over wet front or after layer boundary crossing to address edge cases 
-extern void lgar_theta_mass_balance_correction(int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties);
+extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties);
 
 extern double calc_min_water_possible_for_free_drainage_wetting_front(int wf_free_drainage, struct wetting_front** head, int *soil_type, struct soil_properties_ *soil_properties);
 

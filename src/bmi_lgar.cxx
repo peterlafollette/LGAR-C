@@ -902,8 +902,15 @@ Update()
     // store local mass balance error to the struct
     state->lgar_mass_balance.local_mass_balance = local_mb;
 
+    const double column_depth_cm =
+      state->lgar_bmi_params.cum_layer_thickness_cm[state->lgar_bmi_params.num_layers];
     assert (state->head->depth_cm >= -1.E-10); // check on negative layer depth --> move this to somewhere else AJ (later)
+    lgar_assert_wetting_fronts_within_vadose_zone(column_depth_cm, state->head);
+    lgar_assert_to_psi_monotonic_with_depth(state->head);
     lgar_assert_boundary_psi_continuity(state->head);
+    lgar_assert_to_bottom_scaffold(state->lgar_bmi_params.num_layers,
+                                   state->lgar_bmi_params.cum_layer_thickness_cm,
+                                   state->head);
 
     bool lasam_standalone = true;
 #ifdef NGEN
@@ -914,6 +921,10 @@ Update()
       break;
 
   } // end of subcycling
+
+  lgar_assert_to_bottom_scaffold(state->lgar_bmi_params.num_layers,
+                                 state->lgar_bmi_params.cum_layer_thickness_cm,
+                                 state->head);
 
   //update giuh at the time step level (was previously updated at the sub time step level)
   volrunoff_giuh_timestep_cm = giuh_convolution_integral(volrunoff_timestep_cm + volQ_CR_timestep_cm , num_giuh_ordinates, giuh_ordinates, giuh_runoff_queue);

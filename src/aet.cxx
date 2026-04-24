@@ -586,7 +586,7 @@ static bool lgarto_try_insert_root_zone_to_population_front(int num_layers,
       printf("root-zone TO population falling back to iterative theta repair with residual %.17lf cm\n",
              residual_mass_error_cm);
     }
-    lgar_theta_mass_balance_correction(lower_front->front_num, prior_mass, head,
+    lgar_theta_mass_balance_correction(false, lower_front->front_num, prior_mass, head,
                                        cum_layer_thickness_cm, soil_type, soil_properties);
     residual_mass_error_cm = prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
   }
@@ -860,6 +860,27 @@ static double calc_aet_for_individual_TO_WFs(int WF_num,
   }
 
   return actual_ET_demand;
+}
+
+static double cap_to_aet_extraction_to_local_interval_cm(const wetting_front *front,
+                                                         double requested_aet_cm)
+{
+  if (front == NULL || front->next == NULL) {
+    return 0.0;
+  }
+
+  const double delta_theta = front->next->theta - front->theta;
+  if (delta_theta <= 1.0e-12) {
+    return 0.0;
+  }
+
+  const double available_depth_cm = front->next->depth_cm - front->depth_cm - 1.0e-8;
+  if (available_depth_cm <= 0.0) {
+    return 0.0;
+  }
+
+  const double max_extractable_aet_cm = available_depth_cm * delta_theta;
+  return fmax(0.0, fmin(requested_aet_cm, max_extractable_aet_cm));
 }
 
 static wetting_front *find_surface_supported_to_reference_front(wetting_front *head)
@@ -1278,7 +1299,13 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       fmax(0.0, root_zone_depth_cm - allocations.back().front->depth_cm);
   }
 
+  wetting_front *surface_supported_interval_limited_front = NULL;
+  if (surface_front_count > 0) {
+    surface_supported_interval_limited_front = find_surface_supported_to_aet_target_front(*head);
+  }
+
   double cumulative_ET_from_TO_WFs_cm = 0.0;
+  double unmet_interval_limited_to_aet_cm = 0.0;
   for (const TOAETAllocation &allocation : allocations) {
     wetting_front *current = allocation.front;
     if (current == NULL || current->next == NULL || allocation.thickness_cm <= 0.0) {
@@ -1302,8 +1329,31 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       continue;
     }
 
-    current->depth_cm += temp_AET_value / delta_theta;
-    cumulative_ET_from_TO_WFs_cm += temp_AET_value;
+    const bool limit_this_to_aet_extraction_to_local_interval =
+      (surface_supported_interval_limited_front != NULL &&
+       current == surface_supported_interval_limited_front &&
+       current->next != NULL &&
+       current->next->to_bottom == TRUE);
+    const double capped_AET_value =
+      limit_this_to_aet_extraction_to_local_interval ?
+      cap_to_aet_extraction_to_local_interval_cm(current, temp_AET_value) :
+      temp_AET_value;
+    if (capped_AET_value <= 0.0) {
+      if (verbosity.compare("high") == 0) {
+        printf("Skipping TO AET extraction for front %d because it would overtake the next GW front.\n",
+               current->front_num);
+      }
+      continue;
+    }
+
+    if (verbosity.compare("high") == 0 && capped_AET_value + 1.0e-12 < temp_AET_value) {
+      printf("Capping TO AET extraction for front %d from %.17lf cm to %.17lf cm to keep it within its local interval.\n",
+             current->front_num, temp_AET_value, capped_AET_value);
+    }
+
+    unmet_interval_limited_to_aet_cm += fmax(0.0, temp_AET_value - capped_AET_value);
+    current->depth_cm += capped_AET_value / delta_theta;
+    cumulative_ET_from_TO_WFs_cm += capped_AET_value;
   }
 
   if (surface_front_count > 0) {
@@ -1318,6 +1368,7 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
                                        wilting_point_psi_cm, field_capacity_psi_cm, soil_type,
                                        soil_properties, head);
       missing_to_aet_cm = fmax(0.0, missing_to_aet_cm - cumulative_ET_from_TO_WFs_cm);
+      missing_to_aet_cm += unmet_interval_limited_to_aet_cm;
 
       if (missing_to_aet_cm > 1.0e-12) {
         const double extracted_to_aet_from_surface_cm =
@@ -1339,6 +1390,13 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
                                                       soil_properties, head);
       }
     }
+  }
+  else if (unmet_interval_limited_to_aet_cm > 1.0e-12 && !allocations.empty()) {
+    wetting_front *fallback_front = allocations.back().front;
+    cumulative_ET_from_TO_WFs_cm +=
+      lgarto_extract_missing_to_aet_from_to_chain(fallback_front, unmet_interval_limited_to_aet_cm,
+                                                  cum_layer_thickness_cm, soil_type, frozen_factor,
+                                                  soil_properties, head);
   }
 
   const bool no_surface_needs_post_aet_sparse_support =

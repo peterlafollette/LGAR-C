@@ -61,11 +61,12 @@ using namespace std;
 // depth
 
 #define THRESHOLD_NO_MOISTURE_DIFF 1.E-15      // threshold that will be used to check if adjacent WFs are redundant
-#define CREATION_COLOCATED_TOLERANCE_CM 1.E-6
+#define CREATION_COLOCATED_TOLERANCE_CM 0.0//1.E-8
 #define MBAL_ITERATIVE_TOLERANCE 1.E-10        // in the loops that close mass balance across multiple layers, the before and after masses (considering fluxes as well) must match by this number or less
 #define MAX_ITER_MBAL_LOOP 1.E5                // the loop that adjusts theta after WFs move (shich that psi will be equal across soil layer boundaries) will iterate this many times before accepting a mass balance error.
 #define MAX_ITER_SATURATION_MBAL_LOOP 1.E4     // the loop that adjusts the depth of a saturated WF after the WF becomes saturated to conserve mass has this maximum number of iterations before it just accepts that there will be a mass balance error
 #define TRUNCATION_DEPTH 1.E-9                 // when a WF exceeds the lower boundary, we want it to only slightly do this in order to keep the lower boundary condition effectively no flow but also correctly set psi for WFs that it passed
+#define LOWER_BOUNDARY_FINAL_TOL_CM 1.E-6      // end-of-step lower-boundary assertion tolerance; ignores intentional epsilon overshoots from internal boundary handling
 #define FACTOR_LIMITS_LAYER_CROSSING_SPEED 2.0 // when a WF crosses a layer boundary, it shouldn't go too far into the next layer -- for example in the case of sand over clay, a WF in sand might have a large dzdt value that leads to crossing to an unrealistic depth in the clay below
 #define DEPTH_AVOIDS_SAME_WF_DEPTH 1.E-6       // in the event that multiple WFs all would cross a layer boundary and would each have their depth in the new layer limited by FACTOR_LIMITS_LAYER_CROSSING_SPEED, this just prevents these WFs from being exactly at the same depth.
 #define PSI_UPPER_LIM 1.E7                     // in loops that close the mass balance by iterating theta and psi, we impose an upper limit on capillary head because some values are just not physically realistic
@@ -111,6 +112,73 @@ static double lgar_limit_TO_dzdt_near_hydrostatic_target(double dzdt_cm_per_h,
   return dzdt_cm_per_h;
 }
 
+static bool lgarto_is_last_layer_GW_overshoot_pair(struct wetting_front *current,
+                                                   int num_layers)
+{
+  if (current == NULL || current->next == NULL) {
+    return false;
+  }
+
+  struct wetting_front *next = current->next;
+  return current->is_WF_GW && !current->to_bottom &&
+         next->is_WF_GW && next->to_bottom &&
+         current->layer_num == num_layers &&
+         next->layer_num == num_layers &&
+         current->layer_num == next->layer_num &&
+         current->depth_cm > next->depth_cm;
+}
+
+extern double lgarto_truncate_last_layer_GW_overshoot(double lower_boundary_depth_cm,
+                                                      int num_layers,
+                                                      struct wetting_front **head,
+                                                      int *soil_type,
+                                                      struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || *head == NULL) {
+    return 0.0;
+  }
+
+  struct wetting_front *overshooting_front = NULL;
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (lgarto_is_last_layer_GW_overshoot_pair(current, num_layers)) {
+      overshooting_front = current;
+    }
+  }
+
+  if (overshooting_front == NULL) {
+    return 0.0;
+  }
+
+  struct wetting_front *bottom_front = overshooting_front->next;
+  const double bottom_flux_cm =
+    (overshooting_front->depth_cm - bottom_front->depth_cm) *
+    (overshooting_front->theta - bottom_front->theta);
+
+  if (verbosity.compare("high") == 0) {
+    printf("TO/general correction type 9 truncating last-layer GW front %d into bottom front %d.\n",
+           overshooting_front->front_num, bottom_front->front_num);
+    printf("  overshoot_depth_cm=%.15f bottom_depth_cm=%.15f lower_boundary_depth_cm=%.15f\n",
+           overshooting_front->depth_cm, bottom_front->depth_cm, lower_boundary_depth_cm);
+    printf("  overshoot_theta=%.15f bottom_theta=%.15f routed_bottom_flux_cm=%.15f\n",
+           overshooting_front->theta, bottom_front->theta, bottom_flux_cm);
+  }
+
+  bottom_front->depth_cm = lower_boundary_depth_cm;
+  bottom_front->theta = overshooting_front->theta;
+  bottom_front->psi_cm = overshooting_front->psi_cm;
+  bottom_front->K_cm_per_h = overshooting_front->K_cm_per_h;
+  bottom_front->is_WF_GW = TRUE;
+  bottom_front->to_bottom = TRUE;
+
+  listDeleteFront(overshooting_front->front_num, head, soil_type, soil_properties);
+
+  if (verbosity.compare("high") == 0) {
+    printf("State after truncating last-layer GW overshoot into the bottom boundary...\n");
+    listPrint(*head);
+  }
+
+  return bottom_flux_cm;
+}
 
 // ############################################################################################
 /*
@@ -579,6 +647,13 @@ static bool lgarto_find_large_to_psi_gap_candidate(int num_layers,
       continue;
     }
 
+    // Leave the boundary-support interval alone. Refining the gap immediately above a
+    // to_bottom scaffold front can create deep, high-psi TO structure that changes
+    // recharge behavior much more than it helps missing-gradient coverage.
+    if (next->to_bottom == TRUE) {
+      continue;
+    }
+
     if (next->depth_cm <= current->depth_cm + CREATION_COLOCATED_TOLERANCE_CM) {
       continue;
     }
@@ -673,7 +748,6 @@ static int lgarto_refine_large_to_psi_gaps(int num_layers,
   }
   return insertions;
 }
-
 
 // #############################################################################################################################
 /*
@@ -1614,7 +1688,7 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
     bool bottom_flag;
     double Ksat_cm_per_h;
     struct wetting_front *current;
-    const int number_of_WFs_per_layer = 8;
+    const int number_of_WFs_per_layer = 16;
     bool switch_to_next_layer_flag = false;
     double prior_psi_cm = cum_layer_thickness_cm[num_layers];
     double new_wf_depth;
@@ -2690,11 +2764,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
                                            frozen_factor, soil_properties, head);
     }
 
+    // Only refine TO psi gaps when there is no surface structure left. With active
+    // surface fronts, inserting extra deep TO fronts can change recharge behavior
+    // much more than it helps missing-gradient coverage.
     const int psi_gap_refinement_count =
       lgarto_refine_large_to_psi_gaps(num_layers, cum_layer_thickness_cm, soil_type,
                                       frozen_factor, soil_properties, head,
                                       listLength_surface(*head) == 0 ?
-                                        NO_SURFACE_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS : 1);
+                                        NO_SURFACE_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS : 0);
     if (psi_gap_refinement_count > 0 && verbosity.compare("high") == 0) {
       printf("State after %d TO psi-gap refinement iteration(s) and before TO/general correction loop...\n",
              psi_gap_refinement_count);
@@ -2810,6 +2887,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         }
       }
 
+      if (correction_type == 9) {
+        bottom_boundary_flux_cm +=
+          lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm[num_layers], num_layers,
+                                                  head, soil_type, soil_properties);
+      }
+
       correction_type = lgarto_correction_type(num_layers, cum_layer_thickness_cm, head);
       if (verbosity.compare("high") == 0) {
         printf("correction_type at end of TO/general correction iteration: %d \n", correction_type);
@@ -2861,7 +2944,6 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     printf("Moving/merging wetting fronts done... \n");
     listPrint(*head);
   }
-
 
   //Just a check to make sure that, when there is only 1 layer, than the existing wetting front is at the correct depth.
   //This might have been fixed with other debugging related to scenarios with just 1 layer where the wetting front is completely satruated. Not sure this is necessary.
@@ -3108,7 +3190,7 @@ extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers,
           current->depth_cm = cum_layer_thickness_cm[num_layers] + 1.E-6;
           int front_num_correction = current->front_num;
           // first, lgar_theta_mass_balance_correction will attempt to close the mass balance by adjusting the theta value of the WF that crossed the layer boundary and other WFs sharing a psi value with it.
-          lgar_theta_mass_balance_correction(front_num_correction, prior_mass, head, cum_layer_thickness_cm, soil_type, soil_properties); 
+          lgar_theta_mass_balance_correction(false, front_num_correction, prior_mass, head, cum_layer_thickness_cm, soil_type, soil_properties); 
             if (verbosity.compare("high") == 0) {
               printf("States after wetting fronts cross layer boundary and after theta correction...\n");
               listPrint(*head);
@@ -3515,6 +3597,117 @@ extern void lgar_global_psi_update(int *soil_type, struct soil_properties_ *soil
 
 // ############################################################################################
 /*
+  Checks that no wetting front persists below the vadose-zone lower boundary once a
+  substep or timestep has completed.
+*/
+// ############################################################################################
+
+extern void lgar_assert_wetting_fronts_within_vadose_zone(double domain_depth_cm,
+                                                          struct wetting_front *head)
+{
+  const double depth_tol_cm = LOWER_BOUNDARY_FINAL_TOL_CM;
+
+  if (head == NULL) {
+    return;
+  }
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->depth_cm <= domain_depth_cm + depth_tol_cm) {
+      continue;
+    }
+
+    fprintf(stderr,
+            "Error: wetting front persisted below the vadose-zone lower boundary.\n"
+            "  offending WF front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d\n"
+            "  lower_boundary_depth_cm=%.16g written_lower_boundary_mm=%.16g\n"
+            "  depth_excess_cm=%.16g > %.16g\n"
+            "  Wetting front list follows:\n",
+            current->front_num,
+            current->layer_num,
+            current->depth_cm,
+            current->depth_cm * 10.0,
+            current->theta,
+            current->psi_cm,
+            current->dzdt_cm_per_h,
+            current->is_WF_GW,
+            domain_depth_cm,
+            domain_depth_cm * 10.0,
+            current->depth_cm - domain_depth_cm,
+            depth_tol_cm);
+    fflush(stderr);
+    listPrint(head);
+    fflush(stdout);
+    abort();
+  }
+}
+
+// ############################################################################################
+/*
+  Checks that adjacent TO wetting fronts in the same layer become no wetter in psi as depth
+  increases. Equal-depth support fronts are ignored, and fronts on opposite sides of a soil
+  layer boundary are intentionally not checked here.
+*/
+// ############################################################################################
+
+extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head)
+{
+  const double depth_tol_cm = 1.E-10;
+  const double psi_tol_cm = 1.E-8;
+
+  for (struct wetting_front *current = head; current != NULL && current->next != NULL; current = current->next) {
+    struct wetting_front *next = current->next;
+
+    if (!current->is_WF_GW || !next->is_WF_GW) {
+      continue;
+    }
+
+    if (current->layer_num != next->layer_num) {
+      continue;
+    }
+
+    if (next->depth_cm <= current->depth_cm + depth_tol_cm) {
+      continue;
+    }
+
+    if (next->psi_cm <= current->psi_cm + psi_tol_cm) {
+      continue;
+    }
+
+    fprintf(stderr,
+            "Error: adjacent TO wetting fronts reverse psi ordering with depth in the same soil layer.\n"
+            "  shallower front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g to_bottom=%d\n"
+            "  deeper   front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g to_bottom=%d\n"
+            "  delta_depth_cm=%.16g delta_psi_cm=%.16g > %.16g\n"
+            "  Note: this check intentionally skips adjacent TO fronts that straddle a soil layer boundary.\n"
+            "  Wetting front list follows:\n",
+            current->front_num,
+            current->layer_num,
+            current->depth_cm,
+            current->depth_cm * 10.0,
+            current->theta,
+            current->psi_cm,
+            current->dzdt_cm_per_h,
+            current->to_bottom,
+            next->front_num,
+            next->layer_num,
+            next->depth_cm,
+            next->depth_cm * 10.0,
+            next->theta,
+            next->psi_cm,
+            next->dzdt_cm_per_h,
+            next->to_bottom,
+            next->depth_cm - current->depth_cm,
+            next->psi_cm - current->psi_cm,
+            psi_tol_cm);
+    fflush(stderr);
+    listPrint(head);
+    fflush(stdout);
+    abort();
+  }
+}
+
+// ############################################################################################
+/*
   Checks that psi is continuous across active soil-layer boundaries represented by a to_bottom
   wetting front and the front immediately below it.
 */
@@ -3551,6 +3744,146 @@ extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head)
       listPrint(head);
       abort();
     }
+  }
+}
+
+// ############################################################################################
+/*
+  Checks that the to_bottom scaffold contains exactly one wetting front per soil layer, and
+  that each such front sits at that layer's lower boundary.
+*/
+// ############################################################################################
+
+extern void lgar_assert_to_bottom_scaffold(int num_layers,
+                                           double *cum_layer_thickness_cm,
+                                           struct wetting_front *head)
+{
+  const double depth_tol_cm = 1.E-10;
+
+  if (head == NULL) {
+    fprintf(stderr,
+            "Error: to_bottom scaffold check failed because the wetting-front list is empty.\n");
+    fflush(stderr);
+    abort();
+  }
+
+  std::vector<int> counts(num_layers + 1, 0);
+  std::vector<struct wetting_front *> first_to_bottom(num_layers + 1, NULL);
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (!current->to_bottom) {
+      continue;
+    }
+
+    if (current->layer_num < 1 || current->layer_num > num_layers) {
+      fprintf(stderr,
+              "Error: to_bottom wetting front has an invalid layer number.\n"
+              "  offending front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d\n"
+              "  valid_layer_range=[1,%d]\n"
+              "  Wetting front list follows:\n",
+              current->front_num,
+              current->layer_num,
+              current->depth_cm,
+              current->depth_cm * 10.0,
+              current->theta,
+              current->psi_cm,
+              current->dzdt_cm_per_h,
+              current->is_WF_GW,
+              num_layers);
+      fflush(stderr);
+      listPrint(head);
+      fflush(stdout);
+      abort();
+    }
+
+    const double expected_depth_cm = cum_layer_thickness_cm[current->layer_num];
+    const double depth_error_cm = std::fabs(current->depth_cm - expected_depth_cm);
+    if (depth_error_cm > depth_tol_cm) {
+      fprintf(stderr,
+              "Error: to_bottom wetting front is not located at its soil-layer lower boundary.\n"
+              "  offending front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d\n"
+              "  expected_boundary_depth_cm=%.16g written_expected_boundary_mm=%.16g\n"
+              "  |depth_error_cm|=%.16g > %.16g\n"
+              "  Wetting front list follows:\n",
+              current->front_num,
+              current->layer_num,
+              current->depth_cm,
+              current->depth_cm * 10.0,
+              current->theta,
+              current->psi_cm,
+              current->dzdt_cm_per_h,
+              current->is_WF_GW,
+              expected_depth_cm,
+              expected_depth_cm * 10.0,
+              depth_error_cm,
+              depth_tol_cm);
+      fflush(stderr);
+      listPrint(head);
+      fflush(stdout);
+      abort();
+    }
+
+    counts[current->layer_num] += 1;
+    if (first_to_bottom[current->layer_num] == NULL) {
+      first_to_bottom[current->layer_num] = current;
+      continue;
+    }
+
+    struct wetting_front *previous = first_to_bottom[current->layer_num];
+    fprintf(stderr,
+            "Error: multiple to_bottom wetting fronts were found for the same soil layer.\n"
+            "  layer=%d expected_exactly_one=1 found=%d\n"
+            "  first offending pair:\n"
+            "    front_num=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d\n"
+            "    front_num=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d\n"
+            "  Wetting front list follows:\n",
+            current->layer_num,
+            counts[current->layer_num],
+            previous->front_num,
+            previous->depth_cm,
+            previous->depth_cm * 10.0,
+            previous->theta,
+            previous->psi_cm,
+            previous->dzdt_cm_per_h,
+            previous->is_WF_GW,
+            current->front_num,
+            current->depth_cm,
+            current->depth_cm * 10.0,
+            current->theta,
+            current->psi_cm,
+            current->dzdt_cm_per_h,
+            current->is_WF_GW);
+    fflush(stderr);
+    listPrint(head);
+    fflush(stdout);
+    abort();
+  }
+
+  int total_to_bottom_count = 0;
+  for (int layer = 1; layer <= num_layers; layer++) {
+    total_to_bottom_count += counts[layer];
+  }
+
+  for (int layer = 1; layer <= num_layers; layer++) {
+    if (counts[layer] == 1) {
+      continue;
+    }
+
+    fprintf(stderr,
+            "Error: the to_bottom scaffold does not contain exactly one boundary front per soil layer.\n"
+            "  missing_or_invalid_layer=%d expected_exactly_one=1 found=%d total_to_bottom_found=%d expected_total=%d\n"
+            "  expected_boundary_depth_cm=%.16g written_expected_boundary_mm=%.16g\n"
+            "  Wetting front list follows:\n",
+            layer,
+            counts[layer],
+            total_to_bottom_count,
+            num_layers,
+            cum_layer_thickness_cm[layer],
+            cum_layer_thickness_cm[layer] * 10.0);
+    fflush(stderr);
+    listPrint(head);
+    fflush(stdout);
+    abort();
   }
 }
 
@@ -4136,7 +4469,6 @@ extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cu
       /***************************************************/
 
       if ((current->theta <= next->theta) && (current->layer_num == next->layer_num)) {
-
         double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         current = listDeleteFront(current->front_num, head, soil_type, soil_properties); // current will be the WF directly after the one that got deleted
         if (current == NULL) {
@@ -4144,7 +4476,8 @@ extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cu
         }
 
         int front_num_correction = current->front_num;
-        lgar_theta_mass_balance_correction(front_num_correction, prior_mass, head, cum_layer_thickness_cm,
+        bool use_dry_over_wet = true;
+        lgar_theta_mass_balance_correction(use_dry_over_wet, front_num_correction, prior_mass, head, cum_layer_thickness_cm,
                                            soil_type, soil_properties);
         double mass_after = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         *mass_change += (mass_after - prior_mass);
@@ -4377,13 +4710,15 @@ static struct wetting_front* lgar_insert_surficial_front(bool TO_enabled,
   // In TO mode, keep the corrected list geometry intact by inserting the new
   // surface front directly after the last front that is shallower than, or at,
   // the requested dry depth.
-  if ((*head)->depth_cm > dry_depth) {
+  // if ((*head)->depth_cm > dry_depth) {
+  if ((*head)->depth_cm >= dry_depth) {
     listInsertFirst(dry_depth, theta_new, 1, layer_num, to_bottom, head);
     return *head;
   }
 
   struct wetting_front *previous = *head;
-  while (previous->next != NULL && previous->next->depth_cm <= dry_depth) {
+  // while (previous->next != NULL && previous->next->depth_cm <= dry_depth) {
+  while (previous->next != NULL && previous->next->depth_cm < dry_depth) {
     previous = previous->next;
   }
 
@@ -4620,6 +4955,51 @@ static struct wetting_front *lgar_find_surface_creation_repair_target(struct wet
   return current != NULL ? current : head;
 }
 
+static bool lgar_should_delay_surface_creation_gw_conversion(struct wetting_front *head)
+{
+  struct wetting_front *repair_target = lgar_find_surface_creation_repair_target(head);
+  if (repair_target == NULL || repair_target->is_WF_GW || repair_target->to_bottom ||
+      repair_target->next == NULL) {
+    return false;
+  }
+
+  if (!repair_target->next->is_WF_GW) {
+    return false;
+  }
+
+  if (repair_target->layer_num != repair_target->next->layer_num) {
+    return false;
+  }
+
+  return repair_target->theta < repair_target->next->theta;
+}
+
+static bool lgar_connected_surface_creation_structure_is_effectively_saturated(struct wetting_front *front_start,
+                                                                               int *soil_type,
+                                                                               struct soil_properties_ *soil_properties);
+
+static bool lgar_created_surface_front_can_fold_into_connected_gw_chain(struct wetting_front *repair_target,
+                                                                        int *soil_type,
+                                                                        struct soil_properties_ *soil_properties)
+{
+  if (repair_target == NULL || repair_target->next == NULL) {
+    return false;
+  }
+
+  struct wetting_front *chain_head = repair_target->next;
+  if (!chain_head->is_WF_GW || !chain_head->to_bottom) {
+    return false;
+  }
+
+  const bool downstream_gw_structure_is_saturated =
+    lgar_connected_surface_creation_structure_is_effectively_saturated(chain_head, soil_type,
+                                                                       soil_properties);
+  const bool hydraulically_redundant_with_chain_head =
+    std::fabs(repair_target->psi_cm - chain_head->psi_cm) <= 1.0e-3;
+
+  return downstream_gw_structure_is_saturated || hydraulically_redundant_with_chain_head;
+}
+
 static struct wetting_front *lgar_fold_redundant_created_gw_front_into_connected_chain(struct wetting_front *repair_target,
                                                                                        struct wetting_front **head,
                                                                                        int *soil_type,
@@ -4655,18 +5035,32 @@ static struct wetting_front *lgar_fold_redundant_created_surface_front_into_conn
     return repair_target;
   }
 
-  if (!repair_target->is_WF_GW &&
-      !repair_target->to_bottom &&
-      repair_target->next->to_bottom &&
-      repair_target->layer_num == repair_target->next->layer_num &&
-      std::fabs(repair_target->depth_cm - repair_target->next->depth_cm) <= CREATION_COLOCATED_TOLERANCE_CM &&
-      repair_target->theta >= repair_target->next->theta - 1.0e-10) {
+  const bool same_layer_and_depth =
+    repair_target->layer_num == repair_target->next->layer_num &&
+    std::fabs(repair_target->depth_cm - repair_target->next->depth_cm) <= CREATION_COLOCATED_TOLERANCE_CM;
+  const bool created_surface_not_drier =
+    !repair_target->is_WF_GW &&
+    !repair_target->to_bottom &&
+    repair_target->next->to_bottom &&
+    repair_target->theta >= repair_target->next->theta - 1.0e-10;
+  const bool can_fold_into_surface_chain =
+    created_surface_not_drier && !repair_target->next->is_WF_GW && same_layer_and_depth;
+  const bool can_fold_into_gw_chain =
+    created_surface_not_drier && repair_target->next->is_WF_GW && same_layer_and_depth &&
+    lgar_created_surface_front_can_fold_into_connected_gw_chain(repair_target, soil_type,
+                                                                soil_properties);
+
+  if (can_fold_into_surface_chain || can_fold_into_gw_chain) {
     if (verbosity.compare("high") == 0) {
       printf("surface creation folding redundant surface front %d into connected chain below "
              "because it shares depth %.15f with front %d (GW=%d, to_bottom=%d, theta=%.15f, psi=%.15f).\n",
              repair_target->front_num, repair_target->depth_cm, repair_target->next->front_num,
              repair_target->next->is_WF_GW, repair_target->next->to_bottom, repair_target->next->theta,
              repair_target->next->psi_cm);
+      if (can_fold_into_gw_chain) {
+        printf("  fold into GW chain allowed because the downstream GW structure is effectively saturated "
+               "or hydraulically redundant with the created surface front.\n");
+      }
     }
     return listDeleteFront(repair_target->front_num, head, soil_type, soil_properties);
   }
@@ -4692,7 +5086,7 @@ static double lgar_restore_surface_creation_mass_on_connected_gw_chain(struct we
            repair_target->theta, repair_target->psi_cm);
   }
 
-  lgar_theta_mass_balance_correction(repair_target->front_num, target_mass, head,
+  lgar_theta_mass_balance_correction(false, repair_target->front_num, target_mass, head,
                                      cum_layer_thickness_cm, soil_type, soil_properties);
 
   if (verbosity.compare("high") == 0) {
@@ -4722,7 +5116,7 @@ static double lgar_restore_surface_creation_mass_on_connected_surface_chain(stru
            repair_target->theta, repair_target->psi_cm);
   }
 
-  lgar_theta_mass_balance_correction(repair_target->front_num, target_mass, head,
+  lgar_theta_mass_balance_correction(false, repair_target->front_num, target_mass, head,
                                      cum_layer_thickness_cm, soil_type, soil_properties);
 
   if (verbosity.compare("high") == 0) {
@@ -5050,6 +5444,13 @@ static void lgar_apply_creation_general_correction(int correction_type,
       temp_WF = temp_WF->next;
     }
   }
+
+  if (correction_type == 9) {
+    const double flux_out_cm =
+      lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm[num_layers], num_layers,
+                                              head, soil_type, soil_properties);
+    *target_mass -= flux_out_cm;
+  }
 }
 
 static void lgar_normalize_after_surface_front_creation(int num_layers,
@@ -5069,8 +5470,10 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
 
   const double column_depth = cum_layer_thickness_cm[num_layers];
   (void) lgar_reset_overtaken_groundwater_fronts_to_surface(*head, new_surface_front);
+  bool delayed_surface_creation_gw_conversion = false;
 
   for (int phase = 0; phase < 8; phase++) {
+    bool delayed_type8_this_phase = false;
     int iteration = 0;
     while (iteration < 200) {
       iteration++;
@@ -5085,6 +5488,24 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
 
       const int correction_type = lgarto_correction_type(num_layers, cum_layer_thickness_cm, head);
       if (correction_type != 0) {
+        if (correction_type == 8 && !delayed_surface_creation_gw_conversion &&
+            lgar_should_delay_surface_creation_gw_conversion(*head)) {
+          delayed_surface_creation_gw_conversion = true;
+          delayed_type8_this_phase = true;
+          if (verbosity.compare("high") == 0) {
+            struct wetting_front *repair_target = lgar_find_surface_creation_repair_target(*head);
+            if (repair_target != NULL && repair_target->next != NULL) {
+              printf("surface creation delaying correction type 8 for front %d in layer %d "
+                     "until after surface repair (theta %.15f, psi %.15f; GW below front %d "
+                     "theta %.15f, psi %.15f).\n",
+                     repair_target->front_num, repair_target->layer_num, repair_target->theta,
+                     repair_target->psi_cm, repair_target->next->front_num, repair_target->next->theta,
+                     repair_target->next->psi_cm);
+            }
+          }
+          break;
+        }
+
         lgar_apply_creation_general_correction(correction_type, num_layers, &target_mass, column_depth,
                                                cum_layer_thickness_cm, soil_type, frozen_factor, head,
                                                soil_properties);
@@ -5298,7 +5719,8 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
              remaining_mass_error_after_depth, phase + 1);
     }
 
-    if (std::fabs(remaining_mass_error_after_depth) <= MBAL_ITERATIVE_TOLERANCE && !adjusted_depth) {
+    if (std::fabs(remaining_mass_error_after_depth) <= MBAL_ITERATIVE_TOLERANCE &&
+        !adjusted_depth && !delayed_type8_this_phase) {
       break;
     }
   }
@@ -5469,7 +5891,8 @@ extern double lgar_calc_dry_depth(bool TO_enabled, bool use_closed_form_G, int n
   dry_depth = fmin(cum_layer_thickness_cm[layer_num], dry_depth);
 
   if (TO_enabled){
-    dry_depth = dry_depth * 0.2;
+    dry_depth = dry_depth * 0.99; //0.2
+    // dry_depth = dry_depth - CREATION_COLOCATED_TOLERANCE_CM;
   }
   
   return dry_depth;
@@ -6335,40 +6758,23 @@ extern double lgarto_TO_WFs_merge_via_theta(double target_mass, double column_de
 	      }
 	    }
 	        else {
-	          if (previous != NULL && previous->to_bottom && next->to_bottom == FALSE) {
-	            while (current != NULL && current->next != NULL && current->is_WF_GW &&
-	                   current->next->is_WF_GW && current->layer_num == current->next->layer_num &&
-	                   current->theta > current->next->theta) {
-	              listDeleteFront(current->next->front_num, head, soil_type, soil_properties);
+	          const double deleted_psi_cm = current->psi_cm;
+	          const bool upstream_to_bottom_chain = (previous != NULL && previous->to_bottom);
+	          current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
+	          if (current != NULL) {
+	            if (upstream_to_bottom_chain) {
+	              lgar_restore_upstream_to_bottom_chain_psi(current, deleted_psi_cm, soil_type,
+	                                                       soil_properties, *head);
 	            }
-	            lgar_theta_mass_balance_correction(current->front_num, target_mass, head,
+	            lgar_theta_mass_balance_correction(false, current->front_num, target_mass, head,
 	                                              cum_layer_thickness_cm, soil_type, soil_properties);
 	            if (std::fabs(target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head)) >
 	                MBAL_ITERATIVE_TOLERANCE) {
 	              (void) lgar_restore_theta_merge_mass_via_depth(target_mass, column_depth,
 	                                                            cum_layer_thickness_cm, head, current);
 	            }
-	            mass_diff = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 	          }
-	          else {
-	            const double deleted_psi_cm = current->psi_cm;
-	            const bool upstream_to_bottom_chain = (previous != NULL && previous->to_bottom);
-	            current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
-	            if (current != NULL) {
-	              if (upstream_to_bottom_chain) {
-	                lgar_restore_upstream_to_bottom_chain_psi(current, deleted_psi_cm, soil_type,
-	                                                         soil_properties, *head);
-	              }
-	              lgar_theta_mass_balance_correction(current->front_num, target_mass, head,
-	                                                cum_layer_thickness_cm, soil_type, soil_properties);
-	              if (std::fabs(target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head)) >
-	                  MBAL_ITERATIVE_TOLERANCE) {
-	                (void) lgar_restore_theta_merge_mass_via_depth(target_mass, column_depth,
-	                                                              cum_layer_thickness_cm, head, current);
-	              }
-	            }
-	            mass_diff = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-	          }
+	          mass_diff = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 	        }
 	      }
 	    }
@@ -6446,6 +6852,10 @@ extern int lgarto_correction_type(int num_layers, double* cum_layer_thickness_cm
     struct wetting_front *previous = listFindFront(wf - 1, *head, NULL);
 
     if (next != NULL) {
+      if (lgarto_is_last_layer_GW_overshoot_pair(current, num_layers)) {
+        correction_type = 9;
+        break;
+      }
       if ((current->depth_cm > next->depth_cm) && (current->is_WF_GW == FALSE) &&
           (next->is_WF_GW == TRUE) && (next->to_bottom == FALSE)) {
         correction_type = 1;
@@ -6517,6 +6927,13 @@ extern int lgarto_correction_type(int num_layers, double* cum_layer_thickness_cm
     if (next != NULL) {
       next_to_next = current->next->next;
     }
+  }
+
+  if (correction_type == 9) {
+    if (verbosity.compare("high") == 0) {
+      printf("computed correction type: %d \n", correction_type);
+    }
+    return correction_type;
   }
 
   if (TO_layer_cross) {
@@ -6780,7 +7197,7 @@ extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, 
    lgar_theta_mass_balance because it does not need information about old WFs or external fluxes
    and is called far less often.*/
 // ############################################################################################
-extern void lgar_theta_mass_balance_correction(int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties){
+extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties){
   struct wetting_front *current;
   current = listFindFront(front_num, *head, NULL);
 
@@ -6876,7 +7293,14 @@ extern void lgar_theta_mass_balance_correction(int front_num, double prior_mass,
 
     struct wetting_front *next = current->next;
     struct wetting_front *before_next = current;
-    if (next){ // current was previously selected as the top most WF in the region that we want to iteratively adjust. The lowest will be either the lowest WF, or the first WF below current that is not to_bottom.
+    bool skip_bottom_chain_below = false;
+    if (next){
+      skip_bottom_chain_below = use_dry_over_wet && next->to_bottom && !current->to_bottom;
+    }
+    
+    if (next && !skip_bottom_chain_below){ // current was previously selected as the top most WF in the region that we want to iteratively adjust. The lowest will be either the lowest WF, or the first WF below current that is not to_bottom.
+      // use_dry_over_wet included because this function is generally used to correct "chains" of WFs that should have the same psi value across layers, including to_bottom WFs below the one that is being corrected. 
+      // In the case of fixing dry over wet WFs this is only desired if the WF being corrected is itself to_bottom.
       double theta_e;
       double theta_r;
       double vg_a;
