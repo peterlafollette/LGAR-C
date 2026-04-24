@@ -883,6 +883,35 @@ static double cap_to_aet_extraction_to_local_interval_cm(const wetting_front *fr
   return fmax(0.0, fmin(requested_aet_cm, max_extractable_aet_cm));
 }
 
+static bool lgarto_cross_internal_to_boundary_after_aet_if_needed(int num_layers,
+                                                                 double *cum_layer_thickness_cm,
+                                                                 int *soil_type,
+                                                                 double *frozen_factor,
+                                                                 soil_properties_ *soil_properties,
+                                                                 wetting_front **head,
+                                                                 wetting_front *front)
+{
+  if (front == NULL || front->next == NULL || front->to_bottom ||
+      front->is_WF_GW == FALSE || front->next->is_WF_GW == FALSE ||
+      front->next->to_bottom == FALSE || front->layer_num >= num_layers) {
+    return false;
+  }
+
+  if (front->depth_cm <= cum_layer_thickness_cm[front->layer_num]) {
+    return false;
+  }
+
+  int front_num_with_negative_depth = -1;
+  const bool crossed =
+    lgar_TO_wetting_fronts_cross_layer_boundary(&front_num_with_negative_depth, num_layers,
+                                                cum_layer_thickness_cm, soil_type, frozen_factor,
+                                                head, soil_properties);
+  if (crossed) {
+    lgar_global_psi_update(soil_type, soil_properties, head);
+  }
+  return crossed;
+}
+
 static wetting_front *find_surface_supported_to_reference_front(wetting_front *head)
 {
   wetting_front *first_groundwater_front = NULL;
@@ -1329,11 +1358,13 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       continue;
     }
 
-    const bool limit_this_to_aet_extraction_to_local_interval =
+    const bool surface_supported_to_bottom_front =
       (surface_supported_interval_limited_front != NULL &&
        current == surface_supported_interval_limited_front &&
        current->next != NULL &&
        current->next->to_bottom == TRUE);
+    const bool limit_this_to_aet_extraction_to_local_interval =
+      surface_supported_to_bottom_front && current->layer_num >= num_layers;
     const double capped_AET_value =
       limit_this_to_aet_extraction_to_local_interval ?
       cap_to_aet_extraction_to_local_interval_cm(current, temp_AET_value) :
@@ -1351,9 +1382,22 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
              current->front_num, temp_AET_value, capped_AET_value);
     }
 
+    const double mass_before_to_aet_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
     unmet_interval_limited_to_aet_cm += fmax(0.0, temp_AET_value - capped_AET_value);
     current->depth_cm += capped_AET_value / delta_theta;
-    cumulative_ET_from_TO_WFs_cm += capped_AET_value;
+
+    const bool crossed_internal_boundary =
+      lgarto_cross_internal_to_boundary_after_aet_if_needed(num_layers, cum_layer_thickness_cm,
+                                                            soil_type, frozen_factor,
+                                                            soil_properties, head, current);
+    if (crossed_internal_boundary) {
+      const double actual_to_aet_extracted_cm =
+        fmax(0.0, mass_before_to_aet_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+      cumulative_ET_from_TO_WFs_cm += actual_to_aet_extracted_cm;
+    }
+    else {
+      cumulative_ET_from_TO_WFs_cm += capped_AET_value;
+    }
   }
 
   if (surface_front_count > 0) {
