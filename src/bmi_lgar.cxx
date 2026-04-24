@@ -167,6 +167,8 @@ Update()
     state->lgar_mass_balance.volrunoff_cm  += state->lgar_bmi_input_params->precipitation_mm_per_h * mm_to_cm;
     state->lgar_mass_balance.volQ_cm       += state->lgar_bmi_input_params->precipitation_mm_per_h * mm_to_cm;
     state->lgar_mass_balance.volQ_CR_cm     = 0.0;
+    state->lgar_mass_balance.volpref_flow_to_CR_cm = 0.0;
+    state->lgar_mass_balance.vollgarto_domain_to_CR_cm = 0.0;
     state->lgar_mass_balance.volPET_cm      = 0.0;
     state->lgar_mass_balance.volrunoff_giuh_cm  = 0.0;
     state->lgar_mass_balance.volchange_calib_cm = 0.0;
@@ -182,6 +184,8 @@ Update()
     bmi_unit_conv.volrunoff_timestep_m  = state->lgar_bmi_input_params->precipitation_mm_per_h * mm_to_m;
     bmi_unit_conv.volQ_timestep_m       = state->lgar_bmi_input_params->precipitation_mm_per_h * mm_to_m;
     bmi_unit_conv.volQ_CR_timestep_m    = 0.0;
+    bmi_unit_conv.volpref_flow_to_CR_timestep_m = 0.0;
+    bmi_unit_conv.vollgarto_domain_to_CR_timestep_m = 0.0;
     bmi_unit_conv.volPET_timestep_m     = 0.0;
     bmi_unit_conv.volrunoff_giuh_timestep_m = 0.0;
 
@@ -218,6 +222,8 @@ Update()
   double volrunoff_giuh_timestep_cm = 0.0;
   double volQ_timestep_cm           = 0.0;
   double volQ_CR_timestep_cm        = 0.0;
+  double volpref_flow_to_CR_timestep_cm = 0.0;
+  double vollgarto_domain_to_CR_timestep_cm = 0.0;
   
   // local variables for a subtimestep (i.e., timestep of the model)
   double precip_subtimestep_cm;
@@ -424,6 +430,8 @@ Update()
     double creation_excess_runoff_subtimestep_cm = 0.0;
     double free_drainage_subtimestep_cm = 0.0;
     double lower_boundary_flux_for_CR = 0.0;
+    volCRstart_subtimestep_cm =
+      state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
 
     PET_subtimestep_cm_per_h = state->lgar_bmi_input_params->PET_mm_per_h * mm_to_cm;
 
@@ -791,7 +799,8 @@ Update()
         state->lgar_bmi_params.lower_bdy_flux_to_CR,
         lower_boundary_flux_subtimestep_cm,
         &volrech_subtimestep_cm,
-        &lower_boundary_flux_for_CR);
+        &lower_boundary_flux_for_CR,
+        &state->lgar_mass_balance.CR_fast_storage_cm);
 
       volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
       if (creation_excess_runoff_subtimestep_cm > 0.0) {
@@ -819,7 +828,8 @@ Update()
         state->lgar_bmi_params.lower_bdy_flux_to_CR,
         lower_boundary_flux_for_cache_subtimestep_cm,
         &volrech_subtimestep_cm,
-        &lower_boundary_flux_for_CR);
+        &lower_boundary_flux_for_CR,
+        &state->lgar_mass_balance.CR_fast_storage_cm);
       state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += state->lgar_mass_balance.previous_lower_boundary_flux_cm;
     }
 
@@ -831,11 +841,16 @@ Update()
       printf("volCRstart_subtimestep_cm before: %lf \n", volCRstart_subtimestep_cm);
     }
 
-    volCRstart_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
-    double volin_CR_subtimestep_cm = (precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR)*subtimestep_h + lower_boundary_flux_for_CR;
+    double volpref_flow_to_CR_subtimestep_cm =
+      (precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR) * subtimestep_h;
+    double vollgarto_domain_to_CR_subtimestep_cm = lower_boundary_flux_for_CR;
+    double volin_CR_subtimestep_cm =
+      volpref_flow_to_CR_subtimestep_cm + vollgarto_domain_to_CR_subtimestep_cm;
     double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow, frac_slow, precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + lower_boundary_flux_for_CR/subtimestep_h, &state->lgar_mass_balance.CR_fast_storage_cm, &state->lgar_mass_balance.CR_slow_storage_cm);
     state->lgar_mass_balance.volrunoff_CR_cm += volQ_CR_subtimestep_cm;
     volQ_CR_timestep_cm += volQ_CR_subtimestep_cm;
+    volpref_flow_to_CR_timestep_cm += volpref_flow_to_CR_subtimestep_cm;
+    vollgarto_domain_to_CR_timestep_cm += vollgarto_domain_to_CR_subtimestep_cm;
     volCRend_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
     volCRend_timestep_cm = volCRend_subtimestep_cm;
 
@@ -1002,6 +1017,8 @@ Update()
   state->lgar_mass_balance.volrunoff_timestep_cm  = volrunoff_timestep_cm;
   state->lgar_mass_balance.volQ_timestep_cm       = volQ_timestep_cm;
   state->lgar_mass_balance.volQ_CR_timestep_cm    = volQ_CR_timestep_cm;
+  state->lgar_mass_balance.volpref_flow_to_CR_timestep_cm = volpref_flow_to_CR_timestep_cm;
+  state->lgar_mass_balance.vollgarto_domain_to_CR_timestep_cm = vollgarto_domain_to_CR_timestep_cm;
   state->lgar_mass_balance.volPET_timestep_cm     = PET_timestep_cm;
   state->lgar_mass_balance.volrunoff_giuh_timestep_cm = volrunoff_giuh_timestep_cm;
 
@@ -1023,6 +1040,8 @@ Update()
   state->lgar_mass_balance.volrunoff_cm  += volrunoff_timestep_cm;
   state->lgar_mass_balance.volQ_cm       += volQ_timestep_cm;
   state->lgar_mass_balance.volQ_CR_cm    += volQ_CR_timestep_cm;
+  state->lgar_mass_balance.volpref_flow_to_CR_cm += volpref_flow_to_CR_timestep_cm;
+  state->lgar_mass_balance.vollgarto_domain_to_CR_cm += vollgarto_domain_to_CR_timestep_cm;
   state->lgar_mass_balance.volPET_cm     += PET_timestep_cm;
   state->lgar_mass_balance.volrunoff_giuh_cm  += volrunoff_giuh_timestep_cm;
   state->lgar_mass_balance.volchange_calib_cm += volchange_calib_cm ;
@@ -1038,6 +1057,8 @@ Update()
   bmi_unit_conv.volrunoff_timestep_m  = volrunoff_timestep_cm * state->units.cm_to_m;
   bmi_unit_conv.volQ_timestep_m       = volQ_timestep_cm * state->units.cm_to_m;
   bmi_unit_conv.volQ_CR_timestep_m    = volQ_CR_timestep_cm * state->units.cm_to_m;
+  bmi_unit_conv.volpref_flow_to_CR_timestep_m = volpref_flow_to_CR_timestep_cm * state->units.cm_to_m;
+  bmi_unit_conv.vollgarto_domain_to_CR_timestep_m = vollgarto_domain_to_CR_timestep_cm * state->units.cm_to_m;
   bmi_unit_conv.volPET_timestep_m     = PET_timestep_cm * state->units.cm_to_m;
   bmi_unit_conv.volrunoff_giuh_timestep_m = volrunoff_giuh_timestep_cm * state->units.cm_to_m;
   
@@ -1278,7 +1299,9 @@ GetVarGrid(std::string name)
 	   || name.compare("a_slow") == 0 || name.compare("b_slow") == 0 || name.compare("frac_slow") == 0 || name.compare("soil_storage") == 0 || name.compare("field_capacity") == 0 || name.compare("ponded_depth_max") == 0)// double
     return 1;
   else if (name.compare("total_discharge") == 0 || name.compare("infiltration") == 0
-	   || name.compare("percolation") == 0  || name.compare("conceptual_reservoir_to_stream_discharge") == 0) // double
+	   || name.compare("percolation") == 0  || name.compare("conceptual_reservoir_to_stream_discharge") == 0
+	   || name.compare("preferential_flow_to_conceptual_reservoir") == 0
+	   || name.compare("lgarto_domain_to_conceptual_reservoir") == 0) // double
     return 1;
   else if (name.compare("mass_balance") == 0)
     return 1;
@@ -1350,7 +1373,9 @@ GetVarUnits(std::string name)
   else if (name.compare("total_discharge") == 0 || name.compare("infiltration") == 0
 	   || name.compare("percolation") == 0) // double
     return "m";
-  else if (name.compare("mass_balance") == 0 || name.compare("conceptual_reservoir_to_stream_discharge") == 0)
+  else if (name.compare("mass_balance") == 0 || name.compare("conceptual_reservoir_to_stream_discharge") == 0
+	   || name.compare("preferential_flow_to_conceptual_reservoir") == 0
+	   || name.compare("lgarto_domain_to_conceptual_reservoir") == 0)
     return "m";
   else if (name.compare("soil_moisture_wetting_fronts") == 0) // array of doubles
     return "none";
@@ -1387,7 +1412,9 @@ GetVarLocation(std::string name)
 	   || name.compare("a_slow") == 0 || name.compare("b_slow") == 0 || name.compare("frac_slow") == 0 || name.compare("soil_storage") == 0) // double
     return "node";
    else if (name.compare("total_discharge") == 0 || name.compare("infiltration") == 0
-	    || name.compare("percolation") == 0 || name.compare("conceptual_reservoir_to_stream_discharge") == 0) // double
+	    || name.compare("percolation") == 0 || name.compare("conceptual_reservoir_to_stream_discharge") == 0
+	    || name.compare("preferential_flow_to_conceptual_reservoir") == 0
+	    || name.compare("lgarto_domain_to_conceptual_reservoir") == 0) // double
     return "node";
   else if (name.compare("soil_moisture_wetting_fronts") == 0) // array of doubles
     return "node";
@@ -1499,6 +1526,10 @@ GetValuePtr (std::string name)
     return (void*)(&bmi_unit_conv.volrech_timestep_m);
   else if (name.compare("conceptual_reservoir_to_stream_discharge") == 0)
     return (void*)(&bmi_unit_conv.volQ_CR_timestep_m);
+  else if (name.compare("preferential_flow_to_conceptual_reservoir") == 0)
+    return (void*)(&bmi_unit_conv.volpref_flow_to_CR_timestep_m);
+  else if (name.compare("lgarto_domain_to_conceptual_reservoir") == 0)
+    return (void*)(&bmi_unit_conv.vollgarto_domain_to_CR_timestep_m);
   else if (name.compare("mass_balance") == 0)
     return (void*)(&bmi_unit_conv.mass_balance_m);
   else if (name.compare("soil_depth_layers") == 0)

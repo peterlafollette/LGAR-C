@@ -55,7 +55,7 @@ int main(int argc, char *argv[])
   std::string var_name_wf     = "soil_moisture_wetting_fronts";
   std::string var_name_thickness_wf = "soil_depth_wetting_fronts";
 
-  int num_output_var = 11;
+  int num_output_var = 13;
   std::vector<std::string> output_var_names(num_output_var);
   std::vector<double> output_var_data(num_output_var);
 
@@ -69,7 +69,9 @@ int main(int argc, char *argv[])
   output_var_names[7]  = "infiltration";
   output_var_names[8]  = "percolation";
   output_var_names[9]  = "conceptual_reservoir_to_stream_discharge";
-  output_var_names[10] = "mass_balance";
+  output_var_names[10] = "preferential_flow_to_conceptual_reservoir";
+  output_var_names[11] = "lgarto_domain_to_conceptual_reservoir";
+  output_var_names[12] = "mass_balance";
 
 
   // total number of timesteps

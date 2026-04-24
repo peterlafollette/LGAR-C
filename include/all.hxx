@@ -192,6 +192,8 @@ struct lgar_mass_balance_variables
   double volrunoff_giuh_timestep_cm; // volume of giuh runoff at each timestep
   double volQ_timestep_cm;           // total outgoing water (surface runoff + water from conceptual reservoirs, both of which go through GIUH)
   double volQ_CR_timestep_cm;        // outgoing water just from conceptual reservoirs
+  double volpref_flow_to_CR_timestep_cm;    // preferential-flow input routed to conceptual reservoir(s) during the timestep
+  double vollgarto_domain_to_CR_timestep_cm; // positive lower-boundary/LGARTO-domain input routed to conceptual reservoir(s) during the timestep
   
   // for global mass balance (compute cumulative mass balance)
   double volstart_cm;         // initial volume of water in the soil (at timestep 0)
@@ -220,6 +222,8 @@ struct lgar_mass_balance_variables
   double volrunoff_giuh_cm;   // volume of giuh runoff
   double volQ_cm;             // total outgoing water
   double volQ_CR_cm;          // water outgoing just from conceptual reservoirs
+  double volpref_flow_to_CR_cm;     // cumulative preferential-flow input routed to conceptual reservoir(s)
+  double vollgarto_domain_to_CR_cm; // cumulative positive lower-boundary/LGARTO-domain input routed to conceptual reservoir(s)
   double volchange_calib_cm;  // change in the amount of water due to calibratable parameters
   double local_mass_balance;  // local (per timestep) mass balance error
 };
@@ -596,6 +600,7 @@ extern void lgar_partition_lower_boundary_flux_for_CR(
     bool route_positive_lower_boundary_flux_to_CR,
     double lower_boundary_flux_cm,
     double *percolation_cm,
-    double *CR_input_cm);
+    double *CR_input_cm,
+    double *CR_fast_storage_cm);
 
 #endif  // _ALL_HXX

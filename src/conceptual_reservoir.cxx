@@ -48,16 +48,39 @@ extern void lgar_partition_lower_boundary_flux_for_CR(
     bool route_positive_lower_boundary_flux_to_CR,
     double lower_boundary_flux_cm,
     double *percolation_cm,
-    double *CR_input_cm)
+    double *CR_input_cm,
+    double *CR_fast_storage_cm)
 {
     if (percolation_cm == NULL || CR_input_cm == NULL) {
         return;
     }
 
-    if (route_positive_lower_boundary_flux_to_CR && lower_boundary_flux_cm > 0.0) {
-        *CR_input_cm += lower_boundary_flux_cm;
-    } else {
+    if (!route_positive_lower_boundary_flux_to_CR) {
         *percolation_cm += lower_boundary_flux_cm;
+        return;
+    }
+
+    if (lower_boundary_flux_cm > 0.0) {
+        *CR_input_cm += lower_boundary_flux_cm;
+        return;
+    }
+
+    if (lower_boundary_flux_cm < 0.0) {
+        double negative_recharge_demand_cm = -lower_boundary_flux_cm;
+        if (CR_fast_storage_cm != NULL && *CR_fast_storage_cm > 0.0) {
+            // For now, negative recharge only extracts from the single fast reservoir.
+            const double reservoir_extraction_cm =
+                fmin(*CR_fast_storage_cm, negative_recharge_demand_cm);
+            *CR_fast_storage_cm -= reservoir_extraction_cm;
+            negative_recharge_demand_cm -= reservoir_extraction_cm;
+            if (*CR_fast_storage_cm < 1.0e-12) {
+                *CR_fast_storage_cm = 0.0;
+            }
+        }
+
+        if (negative_recharge_demand_cm > 0.0) {
+            *percolation_cm -= negative_recharge_demand_cm;
+        }
     }
 }
 

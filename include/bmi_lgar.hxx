@@ -51,7 +51,9 @@ public:
     this->output_var_names[11] = "infiltration";
     this->output_var_names[12] = "percolation";
     this->output_var_names[13] = "conceptual_reservoir_to_stream_discharge";
-    this->output_var_names[14] = "mass_balance";
+    this->output_var_names[14] = "preferential_flow_to_conceptual_reservoir";
+    this->output_var_names[15] = "lgarto_domain_to_conceptual_reservoir";
+    this->output_var_names[16] = "mass_balance";
     
     /*
     this->output_var_names[13] = "cum_precipitation";
@@ -154,7 +156,7 @@ private:
   void realloc_soil();
   struct model_state* state;
   static const int input_var_name_count  = 3;
-  static const int output_var_name_count = 15;
+  static const int output_var_name_count = 17;
   static const int calib_var_name_count  = 12;
   
   std::string input_var_names[input_var_name_count];
@@ -178,6 +180,8 @@ private:
     double volrunoff_giuh_timestep_m;
     double volQ_timestep_m;
     double volQ_CR_timestep_m;
+    double volpref_flow_to_CR_timestep_m;
+    double vollgarto_domain_to_CR_timestep_m;
     double volPET_timestep_m;
     double mass_balance_m;
   };

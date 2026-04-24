@@ -305,6 +305,8 @@ extern void lgar_initialize(string config_file, struct model_state *state)
   state->lgar_mass_balance.volrunoff_giuh_cm = 0.0;
   state->lgar_mass_balance.volQ_cm           = 0.0;
   state->lgar_mass_balance.volQ_CR_cm        = 0.0;
+  state->lgar_mass_balance.volpref_flow_to_CR_cm = 0.0;
+  state->lgar_mass_balance.vollgarto_domain_to_CR_cm = 0.0;
   state->lgar_mass_balance.volPET_cm         = 0.0;
   state->lgar_mass_balance.volon_cm          = 0.0;
   state->lgar_mass_balance.volchange_calib_cm = 0.0;
@@ -314,6 +316,8 @@ extern void lgar_initialize(string config_file, struct model_state *state)
     state->lgar_mass_balance.CR_slow_storage_cm = 0.0;
     state->lgar_mass_balance.volCRend_cm = 0.0;
     state->lgar_mass_balance.volCRend_timestep_cm = 0.0;
+    state->lgar_mass_balance.volpref_flow_to_CR_timestep_cm = 0.0;
+    state->lgar_mass_balance.vollgarto_domain_to_CR_timestep_cm = 0.0;
     state->lgar_mass_balance.volon_timestep_cm = 0.0;
     state->lgar_bmi_params.precip_previous_timestep_cm = 0.0;
     state->lgar_bmi_params.runoff_in_prev_step = false;
