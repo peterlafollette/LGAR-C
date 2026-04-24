@@ -44,4 +44,21 @@ extern double calc_CR_Q(
     return Q_fast + Q_slow;
 }
 
+extern void lgar_partition_lower_boundary_flux_for_CR(
+    bool route_positive_lower_boundary_flux_to_CR,
+    double lower_boundary_flux_cm,
+    double *percolation_cm,
+    double *CR_input_cm)
+{
+    if (percolation_cm == NULL || CR_input_cm == NULL) {
+        return;
+    }
+
+    if (route_positive_lower_boundary_flux_to_CR && lower_boundary_flux_cm > 0.0) {
+        *CR_input_cm += lower_boundary_flux_cm;
+    } else {
+        *percolation_cm += lower_boundary_flux_cm;
+    }
+}
+
 #endif

@@ -141,7 +141,7 @@ struct lgar_bmi_parameters
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution.
   bool   TO_enabled = false;             // if true, enable existence of TO WFs (that are in confact with a shallow water table), if false, no TO WFs are possible and the lower BC will be no flow or free drainage
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
-  bool   free_drainage_to_CR   = false;  // This will specify whether free drainage is sent to the nonlinear conceptual reservoir (true) or lost to deep GW (false). Defaults to false.
+  bool   lower_bdy_flux_to_CR  = false;  // Send positive net lower-boundary drainage/exchange to the nonlinear conceptual reservoir. Defaults to false.
   double mbal_tol;                       // if a substep's mass balance error is larger than this number, the model will abort. By default it is set to a large value (10 cm).
   double ponded_depth_cm;                // amount of water on the surface unavailable for surface runoff
   double ponded_depth_max_cm;            // maximum amount of water on the surface unavailable for surface runoff
@@ -211,10 +211,10 @@ struct lgar_mass_balance_variables
 
   double previous_AET = 0.0;  // used to determine if fluxes can be cached rather than computed
   double previous_PET = 0.0;  // used to determine if fluxes can be cached rather than computed
-  double previous_recharge = 0.0;  // used to determine if fluxes can be cached rather than computed
+  double previous_lower_boundary_flux_cm = 0.0;  // used to determine if fluxes can be cached rather than computed
   bool cache_fluxes = FALSE;
-  double accumulated_PET = 0.0;
-  double accumulated_free_drainage = 0.0;
+  double accumulated_PET_cm = 0.0;
+  double accumulated_lower_boundary_flux_cm = 0.0;
 
   double volrech_cm;          // volume of water leaving soil through the bottom of the domain (ground water recharge)
   double volrunoff_giuh_cm;   // volume of giuh runoff
@@ -365,7 +365,7 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 
 // the subroutine moves wetting fronts, merges wetting fronts, and does the mass balance correction if needed
 extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_subtimestep_cm, double *ponded_depth_cm, int wf_free_drainage_demand,
-				     double old_mass, double mass_correction_for_cached_free_drainage_fluxes, int number_of_layers, double *actual_ET_demand,
+				     double old_mass, double cached_lower_boundary_flux_correction_cm, int number_of_layers, double *actual_ET_demand,
 				     double *cum_layer_thickness_cm, int *soil_type_by_layer, double *frozen_factor,
 				     struct wetting_front** head, struct wetting_front* state_previous, struct soil_properties_ *soil_properties,
 				     const double *surf_AET_vec = nullptr,
@@ -590,5 +590,12 @@ extern double calc_CR_Q(
     double precip_for_CR_subtimestep_cm_per_h,
     double *CR_fast_storage_cm,
     double *CR_slow_storage_cm);
+
+// partitions net lower-boundary vadose-zone exchange between external percolation and the conceptual reservoir
+extern void lgar_partition_lower_boundary_flux_for_CR(
+    bool route_positive_lower_boundary_flux_to_CR,
+    double lower_boundary_flux_cm,
+    double *percolation_cm,
+    double *CR_input_cm);
 
 #endif  // _ALL_HXX

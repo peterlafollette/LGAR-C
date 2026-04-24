@@ -40,7 +40,7 @@ string verbosity="none";
 
 // While the vadose zone lower boundary flux is greater than this, flux caching will not happen
 #ifndef BOTTOM_BDY_FLUX_THRESHOLD_CM
-#define BOTTOM_BDY_FLUX_THRESHOLD_CM ((double)1.0e-4)
+#define BOTTOM_BDY_FLUX_THRESHOLD_CM ((double)1.0e-2)
 #endif
 
 // While the top most wetting front has a dzdt value greater than this, flux caching will not happen
@@ -53,9 +53,29 @@ string verbosity="none";
 #define NUM_TIMESTEPS_BEFORE_RESET_CACHE 24
 #endif
 
+// Fraction of the local mass-balance tolerance that cached lower-boundary
+// correction is allowed to accumulate before forcing a recomputed step.
+#ifndef CACHE_LOWER_BOUNDARY_MBAL_FRACTION
+#define CACHE_LOWER_BOUNDARY_MBAL_FRACTION ((double)0.5)
+#endif
+
 // small epsillon that is used to determine if the difference between two quantities is 0 while avoiding machine precision errors
 #define SMALL_EPS 1.E-12
 
+static double lgar_max_abs_mobile_dzdt_for_flux_cache(const wetting_front *head)
+{
+  double max_abs_dzdt = 0.0;
+
+  for (const wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->to_bottom) {
+      continue;
+    }
+
+    max_abs_dzdt = fmax(max_abs_dzdt, fabs(current->dzdt_cm_per_h));
+  }
+
+  return max_abs_dzdt;
+}
 
 /**
  * @brief Delete dynamic arrays allocated in Initialize() and held by this object
@@ -212,6 +232,7 @@ Update()
   double volon_subtimestep_cm;
   double volrunoff_subtimestep_cm;
   double volrech_subtimestep_cm;
+  double lower_boundary_flux_for_cache_subtimestep_cm = 0.0;
   double precip_previous_subtimestep_cm;
   double volCRstart_subtimestep_cm;
   double volCRend_subtimestep_cm = volCRend_timestep_cm;
@@ -262,26 +283,31 @@ Update()
   bool caching_at_start = state->lgar_mass_balance.cache_fluxes;
   bool switch_caching = FALSE;
 
-  double wf_free_drain_dzdt = 0.0;
-
-  if (!caching_at_start){
-    struct wetting_front *wf_free_drainage_for_cache = listFindFront(wetting_front_free_drainage(state->head), state->head, NULL);
-    wf_free_drain_dzdt = wf_free_drainage_for_cache->dzdt_cm_per_h;
-  }
+  const double max_abs_mobile_dzdt_for_cache =
+    lgar_max_abs_mobile_dzdt_for_flux_cache(state->head);
+  const double cached_lower_boundary_flux_budget_cm =
+    fmax(SMALL_EPS, CACHE_LOWER_BOUNDARY_MBAL_FRACTION * mbal_tol);
+  const bool cached_lower_boundary_flux_budget_exceeded =
+    (fabs(state->lgar_mass_balance.accumulated_lower_boundary_flux_cm) +
+     fabs(state->lgar_mass_balance.previous_lower_boundary_flux_cm)) >=
+    cached_lower_boundary_flux_budget_cm;
 
   if (state->lgar_bmi_params.allow_flux_caching){
     //The idea here is that, during dry periods, AET will become a small fraction of PET and wetting fronts will be very slow moving. In these cases, it is not necessary to compute fluxes for every time step.
     //To save on runtime, and if allow_flux_caching is set to true in the config file, we simply cache computed fluxes to be used for subsequent time steps rather than recomputing them.
     //The current implementation is to not move the wetting fronts under these conditions, but then move them more rapidly once it is time to calculate fluxes again. Also, during these periods, PET will be 0 but made to be larger to conserve mass when it is time to recalculate fluxes.
-    //Recharge is copied from the last time step. If free drainage is enabled, this will technically result in a small mass balance error. 
+    //The signed lower-boundary flux is copied from the last timestep, then applied as a cached correction when dynamics are recomputed.
     //There is very little change to the simulation when this is enabled.
     //Note that for NextGen models, it is ultimately desirable that there is technically output for every hour, so simply relaxing the adaptive time step to be coarser than 1 hour isn't the best solution
     if (subtimestep_h == state->lgar_bmi_params.forcing_resolution_h){
       if ( (state->lgar_bmi_input_params->precipitation_mm_per_h < PRECIP_THRESHOLD_MM_PER_H) && ( (state->lgar_mass_balance.previous_AET / (state->lgar_mass_balance.previous_PET + PET_EPSILON )) < AET_PET_RATIO_THRESHOLD) && (state->lgar_bmi_params.cache_count!=NUM_TIMESTEPS_BEFORE_RESET_CACHE) && 
-           (volon_timestep_cm<VOLON_TIMESTEP_THRESHOLD_CM) && (state->lgar_mass_balance.previous_recharge<BOTTOM_BDY_FLUX_THRESHOLD_CM) ){
+           (volon_timestep_cm<VOLON_TIMESTEP_THRESHOLD_CM) && (fabs(state->lgar_mass_balance.previous_lower_boundary_flux_cm)<BOTTOM_BDY_FLUX_THRESHOLD_CM) ){
         state->lgar_mass_balance.cache_fluxes = TRUE;
       }
-      if ( wf_free_drain_dzdt>THRESHOLD_DZDT_CM_PER_H ){
+      if (max_abs_mobile_dzdt_for_cache > THRESHOLD_DZDT_CM_PER_H ){
+        state->lgar_mass_balance.cache_fluxes = FALSE;
+      }
+      if (cached_lower_boundary_flux_budget_exceeded){
         state->lgar_mass_balance.cache_fluxes = FALSE;
       }
       if (volon_timestep_cm>=VOLON_TIMESTEP_THRESHOLD_CM){
@@ -296,10 +322,9 @@ Update()
     }
   }
 
-  if (state->lgar_bmi_params.timesteps==1){ //might no longer be necessary now that dz/dt values are loaded during init, but probably a good idea
+  if (state->lgar_bmi_params.timesteps < 1){ // decision happens before the current timestep counter is incremented
     state->lgar_mass_balance.cache_fluxes = FALSE;
   }
-
   if (caching_at_start && !state->lgar_mass_balance.cache_fluxes){
     switch_caching = TRUE;//if you switch from cached to not, you need to add the "missing" PET back into the mass balance and AET calculation 
   }
@@ -393,11 +418,12 @@ Update()
     volin_subtimestep_cm          = 0.0;
     volrunoff_subtimestep_cm      = 0.0;
     volrech_subtimestep_cm        = 0.0;
+    lower_boundary_flux_for_cache_subtimestep_cm = 0.0;
     double temp_rch               = 0.0; //handles case when a fraction of a wetting front technically crosses the lower boundary of the vadose zone
     double creation_excess_gw_flux_subtimestep_cm = 0.0;
     double creation_excess_runoff_subtimestep_cm = 0.0;
     double free_drainage_subtimestep_cm = 0.0;
-    double free_drainage_for_CR = 0.0;
+    double lower_boundary_flux_for_CR = 0.0;
 
     PET_subtimestep_cm_per_h = state->lgar_bmi_input_params->PET_mm_per_h * mm_to_cm;
 
@@ -426,13 +452,13 @@ Update()
       double min_water_possible_for_FD_WF = calc_min_water_possible_for_free_drainage_wetting_front(wf_free_drainage_demand,  &state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties);
       double storage_in_FD_WF = calc_storage_in_free_drainage_wetting_front(wf_free_drainage_demand, &state->head);
 
-      double mass_correction_for_cached_free_drainage_fluxes = 0.0;
+      double cached_lower_boundary_flux_correction_cm = 0.0;
 
       if (switch_caching){
-        PET_subtimestep_cm_per_h += state->lgar_mass_balance.accumulated_PET;
-        state->lgar_mass_balance.accumulated_PET = 0.0;
-        mass_correction_for_cached_free_drainage_fluxes += state->lgar_mass_balance.accumulated_free_drainage;
-        state->lgar_mass_balance.accumulated_free_drainage = 0.0;
+        PET_subtimestep_cm_per_h += state->lgar_mass_balance.accumulated_PET_cm / subtimestep_h;
+        state->lgar_mass_balance.accumulated_PET_cm = 0.0;
+        cached_lower_boundary_flux_correction_cm += state->lgar_mass_balance.accumulated_lower_boundary_flux_cm;
+        state->lgar_mass_balance.accumulated_lower_boundary_flux_cm = 0.0;
         if (verbosity.compare("high") == 0) {
           printf("flux caching increments PET \n");
           printf("PET_subtimestep_cm_per_h: %lf \n", PET_subtimestep_cm_per_h);
@@ -507,15 +533,15 @@ Update()
         }
 
         int iter_mass_check_AET_and_FD = 0;
-        while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_storage) || ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_water_possible_for_FD_WF) ){ 
+        while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - cached_lower_boundary_flux_correction_cm) < min_storage) || ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - cached_lower_boundary_flux_correction_cm) < min_water_possible_for_FD_WF) ){
           // both should also be checked at the same because while individually these might not make an impossible storage, together they might
           AET_subtimestep_cm *= 0.5;
           free_drainage_subtimestep_cm *= 0.5;
-          mass_correction_for_cached_free_drainage_fluxes *=0.5;
+          cached_lower_boundary_flux_correction_cm *=0.5;
           if (iter_mass_check_AET_and_FD > 5){
             AET_subtimestep_cm = 0.0;
             free_drainage_subtimestep_cm = 0.0;
-            mass_correction_for_cached_free_drainage_fluxes = 0.0;
+            cached_lower_boundary_flux_correction_cm = 0.0;
             break;
           }
           iter_mass_check_AET_and_FD ++;
@@ -595,7 +621,7 @@ Update()
 
         // move the wetting fronts without adding any water; this is done to close the mass balance
         // and also to merge / cross if necessary 
-        temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
+        temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
               &state->head, state->state_previous, state->soil_properties,
@@ -708,7 +734,7 @@ Update()
         double volin_subtimestep_cm_temp = volin_subtimestep_cm;  /* passing this for mass balance only, the method modifies it
                     and returns percolated value, so we need to keep its original
                     value stored to copy it back*/
-        temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
+        temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
               &state->head, state->state_previous, state->soil_properties,
@@ -757,16 +783,16 @@ Update()
         state->lgar_bmi_params.cache_count = 1;
       }
 
-      volrech_subtimestep_cm = temp_rch;
-      if (!state->lgar_bmi_params.free_drainage_to_CR){
-        volrech_subtimestep_cm += free_drainage_subtimestep_cm;
-      }
-      else {
-        free_drainage_for_CR += free_drainage_subtimestep_cm + volrech_subtimestep_cm;
-        volrech_subtimestep_cm = 0.0;
-      }
+      const double lower_boundary_flux_subtimestep_cm =
+        temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
+      lower_boundary_flux_for_cache_subtimestep_cm = lower_boundary_flux_subtimestep_cm;
+      volrech_subtimestep_cm = 0.0;
+      lgar_partition_lower_boundary_flux_for_CR(
+        state->lgar_bmi_params.lower_bdy_flux_to_CR,
+        lower_boundary_flux_subtimestep_cm,
+        &volrech_subtimestep_cm,
+        &lower_boundary_flux_for_CR);
 
-      volrech_subtimestep_cm += creation_excess_gw_flux_subtimestep_cm;
       volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
       if (creation_excess_runoff_subtimestep_cm > 0.0) {
         const double accepted_creation_infiltration_cm =
@@ -784,16 +810,17 @@ Update()
 
     else {//in this case, we just use cached fluxes in order to save time. No direct computation of fluxes are necessary, and the ones from the last time step are used.
       //also in this case, there will be no runoff due to precipitation partitioning because there is no precipitation 
+      volon_subtimestep_cm = volon_timestep_cm;
       PET_timestep_cm += fmax(PET_subtimestep_cm,0.0); // ensures non-negative PET
-      state->lgar_mass_balance.accumulated_PET += PET_timestep_cm;
+      state->lgar_mass_balance.accumulated_PET_cm += PET_subtimestep_cm;
 
-      if (!state->lgar_bmi_params.free_drainage_to_CR){
-        volrech_subtimestep_cm += state->lgar_mass_balance.previous_recharge;
-      }
-      else {
-        free_drainage_for_CR += state->lgar_mass_balance.previous_recharge;
-      }
-      state->lgar_mass_balance.accumulated_free_drainage += state->lgar_mass_balance.previous_recharge;
+      lower_boundary_flux_for_cache_subtimestep_cm = state->lgar_mass_balance.previous_lower_boundary_flux_cm;
+      lgar_partition_lower_boundary_flux_for_CR(
+        state->lgar_bmi_params.lower_bdy_flux_to_CR,
+        lower_boundary_flux_for_cache_subtimestep_cm,
+        &volrech_subtimestep_cm,
+        &lower_boundary_flux_for_CR);
+      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += state->lgar_mass_balance.previous_lower_boundary_flux_cm;
     }
 
     volend_subtimestep_cm = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
@@ -805,8 +832,8 @@ Update()
     }
 
     volCRstart_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
-    double volin_CR_subtimestep_cm = (precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR)*subtimestep_h + free_drainage_for_CR;
-    double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow, frac_slow, precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + free_drainage_for_CR/subtimestep_h, &state->lgar_mass_balance.CR_fast_storage_cm, &state->lgar_mass_balance.CR_slow_storage_cm);
+    double volin_CR_subtimestep_cm = (precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR)*subtimestep_h + lower_boundary_flux_for_CR;
+    double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow, frac_slow, precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + lower_boundary_flux_for_CR/subtimestep_h, &state->lgar_mass_balance.CR_fast_storage_cm, &state->lgar_mass_balance.CR_slow_storage_cm);
     state->lgar_mass_balance.volrunoff_CR_cm += volQ_CR_subtimestep_cm;
     volQ_CR_timestep_cm += volQ_CR_subtimestep_cm;
     volCRend_subtimestep_cm = state->lgar_mass_balance.CR_fast_storage_cm + state->lgar_mass_balance.CR_slow_storage_cm;
@@ -858,7 +885,7 @@ Update()
     }
     
     if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0 || unexpected_local_error) {
-      if (!state->lgar_bmi_params.frac_to_CR){
+      if (!state->lgar_bmi_params.frac_to_CR && !state->lgar_bmi_params.lower_bdy_flux_to_CR){
         printf("\nLocal mass balance at this timestep... \n\
         Error         = %14.10f \n\
         Initial water = %14.10f \n\
@@ -982,7 +1009,7 @@ Update()
   state->lgar_mass_balance.previous_AET         = AET_subtimestep_cm;
   state->lgar_mass_balance.previous_PET         = PET_subtimestep_cm;
   if (!state->lgar_mass_balance.cache_fluxes){
-    state->lgar_mass_balance.previous_recharge    = volrech_subtimestep_cm;
+    state->lgar_mass_balance.previous_lower_boundary_flux_cm = lower_boundary_flux_for_cache_subtimestep_cm;
   }
 
   // add to mass balance accumulated variables
@@ -1203,6 +1230,11 @@ void BmiLGAR::
 Finalize()
 {
   global_mass_balance();
+  if (state->lgar_bmi_params.TO_enabled && state->lgar_bmi_params.allow_flux_caching) {
+    printf("Warning: TO mode ran with allow_flux_caching=true. "
+           "LGARTO flux caching is experimental; check global mass balance and hydrograph outputs.\n");
+    fflush(stdout);
+  }
   listDelete(state->head);
   listDelete(state->state_previous);
 
