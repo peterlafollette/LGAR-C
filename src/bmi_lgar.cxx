@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include "../bmi/bmi.hxx"
 #include "../include/bmi_lgar.hxx"
@@ -62,6 +63,26 @@ string verbosity="none";
 // small epsillon that is used to determine if the difference between two quantities is 0 while avoiding machine precision errors
 #define SMALL_EPS 1.E-12
 
+#ifndef LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP
+#define LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP ((double)1.0)
+#endif
+
+#ifndef LGARTO_SATURATED_CREATION_PSI_TOL_CM
+#define LGARTO_SATURATED_CREATION_PSI_TOL_CM ((double)1.0e-6)
+#endif
+
+#ifndef LGARTO_SATURATED_CREATION_THETA_TOL
+#define LGARTO_SATURATED_CREATION_THETA_TOL ((double)1.0e-8)
+#endif
+
+#ifndef LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM
+#define LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM ((double)1.0e-9)
+#endif
+
+#ifndef LGARTO_EVENT_SPLIT_MAX_PER_FORCING
+#define LGARTO_EVENT_SPLIT_MAX_PER_FORCING 1000
+#endif
+
 static double lgar_max_abs_mobile_dzdt_for_flux_cache(const wetting_front *head)
 {
   double max_abs_dzdt = 0.0;
@@ -75,6 +96,373 @@ static double lgar_max_abs_mobile_dzdt_for_flux_cache(const wetting_front *head)
   }
 
   return max_abs_dzdt;
+}
+
+static double lgarto_remaining_lower_boundary_capacity_cm(double subtimestep_h,
+                                                          int num_layers,
+                                                          const double *cum_layer_thickness_cm,
+                                                          const wetting_front *head,
+                                                          double already_booked_flux_cm)
+{
+  if (subtimestep_h <= 0.0 || num_layers <= 0 || cum_layer_thickness_cm == NULL) {
+    return 0.0;
+  }
+
+  const double domain_depth_cm = cum_layer_thickness_cm[num_layers];
+  const double depth_tol_cm = fmax(1.0e-8, 1.0e-10 * fmax(1.0, domain_depth_cm));
+  const wetting_front *bottom_front = NULL;
+  for (const wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->to_bottom && current->layer_num == num_layers &&
+        std::fabs(current->depth_cm - domain_depth_cm) <= depth_tol_cm) {
+      bottom_front = current;
+    }
+  }
+
+  if (bottom_front == NULL ||
+      !std::isfinite(bottom_front->K_cm_per_h) ||
+      bottom_front->K_cm_per_h <= 0.0) {
+    return 0.0;
+  }
+
+  const double hydraulic_capacity_cm = bottom_front->K_cm_per_h * subtimestep_h;
+  return fmax(0.0, hydraulic_capacity_cm - fmax(0.0, already_booked_flux_cm));
+}
+
+static double lgarto_saturated_creation_lower_boundary_capacity_cm(double subtimestep_h,
+                                                                   int num_layers,
+                                                                   const double *cum_layer_thickness_cm,
+                                                                   int *soil_type,
+                                                                   double *frozen_factor,
+                                                                   const wetting_front *head,
+                                                                   struct soil_properties_ *soil_properties,
+                                                                   double already_booked_flux_cm)
+{
+  if (subtimestep_h <= 0.0 || num_layers <= 0 || cum_layer_thickness_cm == NULL ||
+      soil_type == NULL || frozen_factor == NULL || head == NULL || soil_properties == NULL ||
+      LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP <= 0.0) {
+    return 0.0;
+  }
+
+  const double domain_depth_cm = cum_layer_thickness_cm[num_layers];
+  if (domain_depth_cm <= 0.0) {
+    return 0.0;
+  }
+
+  const double depth_tol_cm = fmax(1.0e-8, 1.0e-10 * fmax(1.0, domain_depth_cm));
+  std::vector<int> saturated_to_bottom_layers(num_layers + 1, 0);
+
+  for (const wetting_front *current = head; current != NULL; current = current->next) {
+    if (!current->to_bottom) {
+      continue;
+    }
+
+    const int layer_num = current->layer_num;
+    if (layer_num < 1 || layer_num > num_layers) {
+      return 0.0;
+    }
+
+    const double expected_depth_cm = cum_layer_thickness_cm[layer_num];
+    if (std::fabs(current->depth_cm - expected_depth_cm) > depth_tol_cm) {
+      return 0.0;
+    }
+
+    const int soil_num = soil_type[layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const bool near_theta_e = current->theta >= theta_e - LGARTO_SATURATED_CREATION_THETA_TOL;
+    const bool near_zero_psi =
+      std::isfinite(current->psi_cm) &&
+      current->psi_cm <= LGARTO_SATURATED_CREATION_PSI_TOL_CM;
+    if (!(near_theta_e || near_zero_psi)) {
+      return 0.0;
+    }
+
+    saturated_to_bottom_layers[layer_num] = 1;
+  }
+
+  for (int layer_num = 1; layer_num <= num_layers; layer_num++) {
+    if (!saturated_to_bottom_layers[layer_num]) {
+      return 0.0;
+    }
+  }
+
+  double saturated_resistance_h = 0.0;
+  for (int layer_num = 1; layer_num <= num_layers; layer_num++) {
+    const double layer_top_cm = cum_layer_thickness_cm[layer_num - 1];
+    const double layer_bottom_cm = cum_layer_thickness_cm[layer_num];
+    const double layer_thickness_cm = layer_bottom_cm - layer_top_cm;
+    const int soil_num = soil_type[layer_num];
+    const double Ksat_cm_per_h =
+      soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[layer_num];
+
+    if (layer_thickness_cm <= 0.0 ||
+        !std::isfinite(Ksat_cm_per_h) ||
+        Ksat_cm_per_h <= 0.0) {
+      return 0.0;
+    }
+
+    saturated_resistance_h += layer_thickness_cm / Ksat_cm_per_h;
+  }
+
+  if (saturated_resistance_h <= 0.0 || !std::isfinite(saturated_resistance_h)) {
+    return 0.0;
+  }
+
+  /* Surface-creation repair can leave excess water only because the
+     boundary-pinned TO scaffold is effectively saturated. In that narrow
+     regime, treat the lower boundary as a saturated layered column and allow
+     a bounded positive-pressure gradient to augment unit-gradient drainage.
+     The returned value is remaining capacity after fluxes already booked in
+     this substep, so this does not stack a second drainage term on top of the
+     natural TO/GW flux bookkeeping. */
+  const double effective_Ksat_cm_per_h = domain_depth_cm / saturated_resistance_h;
+  const double saturated_column_flux_capacity_cm =
+    effective_Ksat_cm_per_h *
+    (1.0 + LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP) *
+    subtimestep_h;
+
+  return fmax(0.0, saturated_column_flux_capacity_cm -
+                   fmax(0.0, already_booked_flux_cm));
+}
+
+static bool lgarto_has_TO_fronts(const wetting_front *head)
+{
+  for (const wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->is_WF_GW) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+struct lgarto_infiltration_limit_trace_row
+{
+  int timestep;
+  double time_h;
+  int cycle;
+  int subcycles;
+  double subtimestep_h;
+  const char *branch;
+  int cache_fluxes;
+  int create_surficial_front;
+  int top_wf_saturated;
+  int fronts_start;
+  int surface_fronts_start;
+  int fronts_end;
+  int surface_fronts_end;
+  double precip_cm;
+  double PET_cm;
+  double ponded_start_cm;
+  double ponded_end_cm;
+  double volin_cm;
+  double runoff_before_creation_excess_cm;
+  double creation_excess_runoff_cm;
+  double runoff_after_creation_excess_cm;
+  double creation_excess_gw_flux_cm;
+  double surface_creation_gw_capacity_cm;
+  double surface_creation_post_creation_TO_release_cm;
+  double temp_rch_cm;
+  double free_drainage_cm;
+  double projected_TO_storage_release_cm;
+  double insertion_storage_release_cm;
+  double insert_raw_fp_cm_per_h;
+  double insert_storage_limit_fp_cm_per_h;
+  double insert_capped_fp_cm_per_h;
+  int insert_storage_cap_active;
+  double lower_boundary_flux_cm;
+};
+
+static FILE *lgarto_infiltration_limit_trace_file()
+{
+  const char *path = getenv("LGARTO_INF_LIMIT_TRACE");
+  if (path == NULL || path[0] == '\0') {
+    return NULL;
+  }
+
+  static FILE *trace_file = NULL;
+  static bool failed_open = false;
+  if (trace_file != NULL || failed_open) {
+    return trace_file;
+  }
+
+  trace_file = fopen(path, "w");
+  if (trace_file == NULL) {
+    failed_open = true;
+    fprintf(stderr, "Warning: could not open LGARTO_INF_LIMIT_TRACE file '%s'.\n", path);
+    return NULL;
+  }
+
+  fprintf(trace_file,
+          "timestep,time_h,cycle,subcycles,subtimestep_h,branch,cache_fluxes,"
+          "create_surficial_front,top_wf_saturated,fronts_start,surface_fronts_start,"
+          "fronts_end,surface_fronts_end,precip_cm,PET_cm,ponded_start_cm,ponded_end_cm,"
+          "volin_cm,runoff_before_creation_excess_cm,creation_excess_runoff_cm,"
+          "runoff_after_creation_excess_cm,creation_excess_gw_flux_cm,"
+          "surface_creation_gw_capacity_cm,surface_creation_post_creation_TO_release_cm,temp_rch_cm,"
+          "free_drainage_cm,projected_TO_storage_release_cm,insertion_storage_release_cm,"
+          "insert_raw_fp_cm_per_h,insert_storage_limit_fp_cm_per_h,insert_capped_fp_cm_per_h,"
+          "insert_storage_cap_active,lower_boundary_flux_cm\n");
+  fflush(trace_file);
+
+  return trace_file;
+}
+
+static void lgarto_write_infiltration_limit_trace(
+  const lgarto_infiltration_limit_trace_row &row)
+{
+  FILE *trace_file = lgarto_infiltration_limit_trace_file();
+  if (trace_file == NULL) {
+    return;
+  }
+
+  fprintf(trace_file,
+          "%d,%.17g,%d,%d,%.17g,%s,%d,%d,%d,%d,%d,%d,%d,"
+          "%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,"
+          "%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d,%.17g\n",
+          row.timestep,
+          row.time_h,
+          row.cycle,
+          row.subcycles,
+          row.subtimestep_h,
+          row.branch,
+          row.cache_fluxes,
+          row.create_surficial_front,
+          row.top_wf_saturated,
+          row.fronts_start,
+          row.surface_fronts_start,
+          row.fronts_end,
+          row.surface_fronts_end,
+          row.precip_cm,
+          row.PET_cm,
+          row.ponded_start_cm,
+          row.ponded_end_cm,
+          row.volin_cm,
+          row.runoff_before_creation_excess_cm,
+          row.creation_excess_runoff_cm,
+          row.runoff_after_creation_excess_cm,
+          row.creation_excess_gw_flux_cm,
+          row.surface_creation_gw_capacity_cm,
+          row.surface_creation_post_creation_TO_release_cm,
+          row.temp_rch_cm,
+          row.free_drainage_cm,
+          row.projected_TO_storage_release_cm,
+          row.insertion_storage_release_cm,
+          row.insert_raw_fp_cm_per_h,
+          row.insert_storage_limit_fp_cm_per_h,
+          row.insert_capped_fp_cm_per_h,
+          row.insert_storage_cap_active,
+          row.lower_boundary_flux_cm);
+  fflush(trace_file);
+}
+
+static double lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
+  double proposed_subtimestep_h,
+  int num_layers,
+  const double *cum_layer_thickness_cm,
+  const int *soil_type,
+  const wetting_front *head,
+  const soil_properties_ *soil_properties)
+{
+  if (proposed_subtimestep_h <= 0.0 || head == NULL || num_layers < 2 ||
+      !lgarto_has_TO_fronts(head)) {
+    return proposed_subtimestep_h;
+  }
+
+  const double column_depth_cm = cum_layer_thickness_cm[num_layers];
+  const double max_reasonable_remap_depth_cm = 1.10 * column_depth_cm;
+  double limited_subtimestep_h = proposed_subtimestep_h;
+
+  for (const wetting_front *current = head; current != NULL; current = current->next) {
+    const wetting_front *next = current->next;
+    if (next == NULL || next->next == NULL) {
+      continue;
+    }
+
+    const int layer_num = current->layer_num;
+    if (current->is_WF_GW || current->to_bottom || current->dzdt_cm_per_h <= 0.0 ||
+        layer_num < 1 || layer_num >= num_layers) {
+      continue;
+    }
+
+    const double boundary_depth_cm = cum_layer_thickness_cm[layer_num];
+    const double projected_depth_cm =
+      current->depth_cm + current->dzdt_cm_per_h * proposed_subtimestep_h;
+    if (current->depth_cm >= boundary_depth_cm || projected_depth_cm <= boundary_depth_cm ||
+        !next->to_bottom || next->depth_cm != boundary_depth_cm) {
+      continue;
+    }
+
+    const int soil_num = soil_type[layer_num];
+    const int soil_num_next = soil_type[layer_num + 1];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+
+    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+    const double psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+    const double theta_new =
+      calc_theta_from_h(psi_cm,
+                        soil_properties[soil_num_next].vg_alpha_per_cm,
+                        soil_properties[soil_num_next].vg_m,
+                        soil_properties[soil_num_next].vg_n,
+                        soil_properties[soil_num_next].theta_e,
+                        soil_properties[soil_num_next].theta_r);
+
+    const double denominator = theta_new - next->next->theta;
+    double depth_new_cm = HUGE_VAL;
+    if (denominator != 0.0) {
+      const double current_theta = fmin(theta_e, current->theta);
+      const double overshot_depth_cm = projected_depth_cm - boundary_depth_cm;
+      const double mbal_Z_correction_cm =
+        overshot_depth_cm * (current_theta - next->theta) / denominator;
+      depth_new_cm = boundary_depth_cm + mbal_Z_correction_cm;
+    }
+
+    const bool risky_remap =
+      !std::isfinite(depth_new_cm) ||
+      depth_new_cm < 0.0 ||
+      depth_new_cm > max_reasonable_remap_depth_cm;
+    if (!risky_remap) {
+      continue;
+    }
+
+    const double event_subtimestep_h =
+      (boundary_depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM - current->depth_cm) /
+      current->dzdt_cm_per_h;
+    if (event_subtimestep_h <= 0.0 || event_subtimestep_h >= limited_subtimestep_h) {
+      continue;
+    }
+
+    limited_subtimestep_h = event_subtimestep_h;
+
+    if (verbosity.compare("high") == 0) {
+      char remap_depth_text[64];
+      if (std::isfinite(depth_new_cm)) {
+        snprintf(remap_depth_text, sizeof(remap_depth_text), "%.17lf", depth_new_cm);
+      }
+      else {
+        snprintf(remap_depth_text, sizeof(remap_depth_text), "undefined");
+      }
+
+      printf("Adaptive LGARTO event split before risky surface layer-boundary remap: "
+             "front=%d layer=%d old_dt_h=%.17lf new_dt_h=%.17lf "
+             "depth_cm=%.17lf projected_depth_cm=%.17lf boundary_cm=%.17lf "
+             "projected_remap_depth_cm=%s max_reasonable_remap_depth_cm=%.17lf\n",
+             current->front_num,
+             layer_num,
+             proposed_subtimestep_h,
+             limited_subtimestep_h,
+             current->depth_cm,
+             projected_depth_cm,
+             boundary_depth_cm,
+             remap_depth_text,
+             max_reasonable_remap_depth_cm);
+    }
+  }
+
+  return limited_subtimestep_h;
 }
 
 /**
@@ -339,7 +727,8 @@ Update()
     state->lgar_bmi_params.cache_count ++;
   }
 
-  state->lgar_bmi_params.forcing_interval = int(state->lgar_bmi_params.forcing_resolution_h/state->lgar_bmi_params.timestep_h+1.0e-08); // add 1.0e-08 to prevent truncation error
+  const double base_subtimestep_h = state->lgar_bmi_params.timestep_h;
+  state->lgar_bmi_params.forcing_interval = int(state->lgar_bmi_params.forcing_resolution_h/base_subtimestep_h+1.0e-08); // add 1.0e-08 to prevent truncation error
   subcycles = state->lgar_bmi_params.forcing_interval;
 
   if (verbosity.compare("high") == 0) {
@@ -377,8 +766,61 @@ Update()
     std::cerr<<"PET [cm/h] (timestep), after PET is subtracted from precip = "<<state->lgar_bmi_input_params->PET_mm_per_h * mm_to_cm <<"\n"; 
   }
   
-  // subcycling loop (loop over model's timestep)
-  for (int cycle=1; cycle <= subcycles; cycle++) {
+  // subcycling loop (loop over model's timestep). LGARTO can add dynamic event
+  // splits inside this interval when a surface front would create an absurd
+  // layer-boundary remap.
+  double remaining_forcing_h = subcycles * base_subtimestep_h;
+  int cycle = 0;
+  int lgarto_event_splits_this_forcing = 0;
+  while (remaining_forcing_h > SMALL_EPS) {
+    cycle++;
+    subtimestep_h = fmin(base_subtimestep_h, remaining_forcing_h);
+    if (state->lgar_bmi_params.TO_enabled && !state->lgar_mass_balance.cache_fluxes) {
+      const double event_limited_subtimestep_h =
+        lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
+          subtimestep_h,
+          state->lgar_bmi_params.num_layers,
+          state->lgar_bmi_params.cum_layer_thickness_cm,
+          state->lgar_bmi_params.layer_soil_type,
+          state->head,
+          state->soil_properties);
+
+      if (event_limited_subtimestep_h + SMALL_EPS < subtimestep_h) {
+        lgarto_event_splits_this_forcing++;
+        if (lgarto_event_splits_this_forcing > LGARTO_EVENT_SPLIT_MAX_PER_FORCING) {
+          fprintf(stderr,
+                  "Error: adaptive LGARTO event splitting exceeded split cap.\n"
+                  "  splits=%d max_splits=%d base_subtimestep_h=%.17lf "
+                  "remaining_forcing_h=%.17lf requested_subtimestep_h=%.17lf "
+                  "event_limited_subtimestep_h=%.17lf\n"
+                  "  Wetting front list follows:\n",
+                  lgarto_event_splits_this_forcing,
+                  LGARTO_EVENT_SPLIT_MAX_PER_FORCING,
+                  base_subtimestep_h,
+                  remaining_forcing_h,
+                  subtimestep_h,
+                  event_limited_subtimestep_h);
+          fflush(stderr);
+          listPrint(state->head);
+          fflush(stdout);
+          abort();
+        }
+
+        subtimestep_h = event_limited_subtimestep_h;
+      }
+    }
+
+    if (subtimestep_h <= 0.0) {
+      fprintf(stderr,
+              "Error: non-positive subtimestep selected in BMI update.\n"
+              "  subtimestep_h=%.17lf remaining_forcing_h=%.17lf base_subtimestep_h=%.17lf\n",
+              subtimestep_h,
+              remaining_forcing_h,
+              base_subtimestep_h);
+      abort();
+    }
+
+    state->lgar_bmi_params.timestep_h = subtimestep_h;
 
     bool top_near_sat = false;
     this->state->lgar_bmi_params.time_s    += subtimestep_h * state->units.hr_to_sec;
@@ -389,7 +831,11 @@ Update()
     
     if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0) {
       std::cerr<<"BMI Update |---------------------------------------------------------------|\n";
-      std::cerr<<"BMI Update |Timesteps = "<< state->lgar_bmi_params.timesteps<<", Time [h] = "<<this->state->lgar_bmi_params.time_s / 3600.<<", Subcycle = "<< cycle <<" of "<<subcycles<<std::endl;
+      std::cerr<<"BMI Update |Timesteps = "<< state->lgar_bmi_params.timesteps<<", Time [h] = "<<this->state->lgar_bmi_params.time_s / 3600.<<", Subcycle = "<< cycle <<" of "<<subcycles;
+      if (cycle > subcycles) {
+        std::cerr<<" (adaptive LGARTO event split)";
+      }
+      std::cerr<<std::endl;
     }
 
     if( state->state_previous != NULL ){
@@ -437,14 +883,17 @@ Update()
 
     ponded_depth_subtimestep_cm = precip_subtimestep_cm_per_h * subtimestep_h; // the amount of water on the surface before any infiltration and runoff
 
-    ponded_depth_subtimestep_cm += volon_timestep_cm; // add volume of water on the surface (from the last timestep) to ponded depth as well
+	    ponded_depth_subtimestep_cm += volon_timestep_cm; // add volume of water on the surface (from the last timestep) to ponded depth as well
 
-    precip_subtimestep_cm = precip_subtimestep_cm_per_h * subtimestep_h; // rate x dt = amount (portion of the water on the suface for model's timestep [cm])
-    PET_subtimestep_cm = PET_subtimestep_cm_per_h * subtimestep_h;      // potential ET for this subtimestep [cm]
+	    precip_subtimestep_cm = precip_subtimestep_cm_per_h * subtimestep_h; // rate x dt = amount (portion of the water on the suface for model's timestep [cm])
+	    PET_subtimestep_cm = PET_subtimestep_cm_per_h * subtimestep_h;      // potential ET for this subtimestep [cm]
 
-    volstart_subtimestep_cm = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
+	    volstart_subtimestep_cm = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
+	    const double trace_ponded_start_cm = ponded_depth_subtimestep_cm;
+	    const int trace_fronts_start = listLength(state->head);
+	    const int trace_surface_fronts_start = listLength_surface(state->head);
 
-    if (!state->lgar_mass_balance.cache_fluxes){
+	    if (!state->lgar_mass_balance.cache_fluxes){
 
       //this code makes sure that AET or free drainage will not be extracted in a way that would result in an impossible storage
       double min_storage = 0.0;
@@ -509,8 +958,18 @@ Update()
       num_layers = state->lgar_bmi_params.num_layers;
       double delta_theta;   // the width of a front, such that its volume=depth*delta_theta
       double dry_depth;
-      double surf_frac_rz = 0.0;
-      std::vector<double> surf_AET_vec(listLength(state->head) + 1, 0.0);
+	      double surf_frac_rz = 0.0;
+	      std::vector<double> surf_AET_vec(listLength(state->head) + 1, 0.0);
+	      const char *trace_branch = "dynamic_no_insert";
+	      bool trace_create_surficial_front = false;
+	      bool trace_is_top_wf_saturated = false;
+	      double trace_projected_TO_storage_release_cm = 0.0;
+	      double trace_insertion_storage_release_cm = 0.0;
+		      double trace_surface_creation_gw_capacity_cm = 0.0;
+		      double trace_surface_creation_post_creation_TO_release_cm = 0.0;
+		      double trace_insert_raw_fp_cm_per_h = NAN;
+	      double trace_insert_storage_limit_fp_cm_per_h = NAN;
+	      double trace_insert_capped_fp_cm_per_h = NAN;
 
       // Calculate AET from PET if PET is non-zero
       if (PET_subtimestep_cm_per_h > 0.0) {
@@ -612,8 +1071,10 @@ Update()
 	          (state->head->theta < (theta_e - SMALL_EPS))) {
 	        create_surficial_front = true;
 	      }
+	      trace_create_surficial_front = create_surficial_front;
+	      trace_is_top_wf_saturated = is_top_wf_saturated;
 
-      if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0) {
+	      if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0) {
         std::string flag        = (create_surficial_front && !is_top_wf_saturated) == true ? "Yes" : "No";
         std::string flag_top_wf = is_top_wf_saturated == true ? "Yes" : "No";
         std::cerr<<"Is top wetting front saturated? "<< flag_top_wf  << "\n";
@@ -623,30 +1084,50 @@ Update()
       /*----------------------------------------------------------------------*/
       /* create a new wetting front if the following is true. Meaning there is no
         wetting front in the top layer to accept the water, must create one. */
-      if(create_surficial_front) {
+	      if(create_surficial_front) {
+	        trace_branch = "create_surficial_front";
 
-        double temp_pd = 0.0; // necessary to assign zero precip due to the creation of new wetting front; AET will still be taken out of the layers
+	        double temp_pd = 0.0; // necessary to assign zero precip due to the creation of new wetting front; AET will still be taken out of the layers
 
         // move the wetting fronts without adding any water; this is done to close the mass balance
         // and also to merge / cross if necessary 
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
-              &state->head, state->state_previous, state->soil_properties,
-              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
-              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
-              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz);
+	              &state->head, state->state_previous, state->soil_properties,
+	              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+	              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+	              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
+	              state->lgar_bmi_params.mbal_tol);
 
-        // if (temp_pd != 0.0){ //if temp_pd != 0.0, that means that some water left the model through the lower model bdy. For LGARTO preparation, this has been refactored such that temp_rch handles this now.
-        //   // volrech_subtimestep_cm = temp_pd;
-        //   // volrech_timestep_cm += volrech_subtimestep_cm;
-        //   // temp_pd = 0.0;
-        // }
-        
-        // depth of the surficial front to be created
-        dry_depth = lgar_calc_dry_depth(state->lgar_bmi_params.TO_enabled, use_closed_form_G, nint, subtimestep_h, &delta_theta, state->lgar_bmi_params.layer_soil_type,
-                state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
-                state->head, state->soil_properties);
+	        // if (temp_pd != 0.0){ //if temp_pd != 0.0, that means that some water left the model through the lower model bdy. For LGARTO preparation, this has been refactored such that temp_rch handles this now.
+	        //   // volrech_subtimestep_cm = temp_pd;
+	        //   // volrech_timestep_cm += volrech_subtimestep_cm;
+	        //   // temp_pd = 0.0;
+	        // }
+
+	        if (state->lgar_bmi_params.TO_enabled) {
+	          const double already_booked_lower_boundary_cm =
+	            temp_rch + free_drainage_subtimestep_cm;
+	          trace_surface_creation_gw_capacity_cm =
+	            lgarto_remaining_lower_boundary_capacity_cm(
+	              subtimestep_h, num_layers, state->lgar_bmi_params.cum_layer_thickness_cm,
+	              state->head, already_booked_lower_boundary_cm);
+	          trace_surface_creation_gw_capacity_cm =
+	            fmax(trace_surface_creation_gw_capacity_cm,
+	                 lgarto_saturated_creation_lower_boundary_capacity_cm(
+	                   subtimestep_h, num_layers,
+	                   state->lgar_bmi_params.cum_layer_thickness_cm,
+	                   state->lgar_bmi_params.layer_soil_type,
+	                   state->lgar_bmi_params.frozen_factor,
+	                   state->head, state->soil_properties,
+	                   already_booked_lower_boundary_cm));
+	        }
+
+	        // depth of the surficial front to be created
+		        dry_depth = lgar_calc_dry_depth(state->lgar_bmi_params.TO_enabled, use_closed_form_G, nint, subtimestep_h, &delta_theta, state->lgar_bmi_params.layer_soil_type,
+	                state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
+	                state->head, state->soil_properties);
 
         if (verbosity.compare("high") == 0) {
           printf("State before moving creating new WF...\n");
@@ -671,10 +1152,11 @@ Update()
 
           double creation_excess_gw_flux_cm = 0.0;
           double creation_excess_runoff_cm = 0.0;
-	        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
-	            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
-	            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties,
-              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm);
+		        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
+		            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
+		            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties,
+	              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm,
+	              trace_surface_creation_gw_capacity_cm);
           creation_excess_gw_flux_subtimestep_cm += creation_excess_gw_flux_cm;
           creation_excess_runoff_subtimestep_cm += creation_excess_runoff_cm;
 
@@ -701,14 +1183,33 @@ Update()
       /* infiltrate water based on the infiltration capacity given no new wetting front
         is created and that there is water on the surface (or raining). */
 
-      if (ponded_depth_subtimestep_cm > 0 && !create_surficial_front) {
-        volrunoff_subtimestep_cm = lgar_insert_water(use_closed_form_G, nint, subtimestep_h, AET_subtimestep_cm, free_drainage_subtimestep_cm, &ponded_depth_subtimestep_cm,
-                &volin_subtimestep_cm, precip_subtimestep_cm_per_h,
-                wf_free_drainage_demand, num_layers,
-                ponded_depth_max_cm, state->lgar_bmi_params.layer_soil_type,
-                state->lgar_bmi_params.cum_layer_thickness_cm,
-                state->lgar_bmi_params.frozen_factor, state->head,
-                state->soil_properties); 
+	      if (ponded_depth_subtimestep_cm > 0 && !create_surficial_front) {
+	        trace_branch = "lgar_insert_water";
+	        double insertion_storage_release_subtimestep_cm = free_drainage_subtimestep_cm;
+	        if (state->lgar_bmi_params.TO_enabled) {
+          // LGAR includes same-substep free drainage when deciding whether storage is
+          // available for infiltration. LGARTO's TO drainage happens later in the
+          // substep, so add a read-only positive projection here to avoid routing
+          // water to runoff just before TO motion creates room.
+	          trace_projected_TO_storage_release_cm =
+	            lgarto_project_TO_motion_lower_boundary_flux_cm(subtimestep_h, num_layers,
+	                                                            state->lgar_bmi_params.cum_layer_thickness_cm,
+	                                                            state->lgar_bmi_params.layer_soil_type,
+	                                                            state->head, state->soil_properties);
+	          insertion_storage_release_subtimestep_cm += trace_projected_TO_storage_release_cm;
+	        }
+	        trace_insertion_storage_release_cm = insertion_storage_release_subtimestep_cm;
+
+	        volrunoff_subtimestep_cm = lgar_insert_water(use_closed_form_G, nint, subtimestep_h, AET_subtimestep_cm, insertion_storage_release_subtimestep_cm, &ponded_depth_subtimestep_cm,
+	                &volin_subtimestep_cm, precip_subtimestep_cm_per_h,
+	                wf_free_drainage_demand, num_layers,
+	                ponded_depth_max_cm, state->lgar_bmi_params.layer_soil_type,
+	                state->lgar_bmi_params.cum_layer_thickness_cm,
+	                state->lgar_bmi_params.frozen_factor, state->head,
+	                state->soil_properties,
+	                &trace_insert_raw_fp_cm_per_h,
+	                &trace_insert_storage_limit_fp_cm_per_h,
+		                &trace_insert_capped_fp_cm_per_h);
         // volin_timestep_cm += volin_subtimestep_cm;
         // volrunoff_timestep_cm += volrunoff_subtimestep_cm;
         
@@ -745,10 +1246,11 @@ Update()
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
-              &state->head, state->state_previous, state->soil_properties,
-              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
-              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
-              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz);
+	              &state->head, state->state_previous, state->soil_properties,
+	              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+	              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+	              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
+	              state->lgar_bmi_params.mbal_tol);
 
         // this is the volume of water leaving through the bottom
         volrech_subtimestep_cm = volin_subtimestep_cm;
@@ -757,9 +1259,13 @@ Update()
         volin_subtimestep_cm = volin_subtimestep_cm_temp;
       }
 
+      const double column_depth_cm =
+        state->lgar_bmi_params.cum_layer_thickness_cm[state->lgar_bmi_params.num_layers];
       lgar_clean_redundant_fronts(&state->head, state->lgar_bmi_params.layer_soil_type,
                                   state->soil_properties,
-                                  PET_subtimestep_cm_per_h > 0.0); // deletes redundant WFs; leading zero-depth TO/GW capping is limited to PET-active substeps
+                                  PET_subtimestep_cm_per_h > 0.0,
+                                  state->lgar_bmi_params.cum_layer_thickness_cm,
+                                  column_depth_cm); // deletes redundant WFs; leading zero-depth TO/GW capping is limited to PET-active substeps
 
       int correction_type_surf_after_cleanup =
         lgarto_correction_type_surf(num_layers, state->lgar_bmi_params.cum_layer_thickness_cm, &state->head);
@@ -791,31 +1297,122 @@ Update()
         state->lgar_bmi_params.cache_count = 1;
       }
 
-      const double lower_boundary_flux_subtimestep_cm =
-        temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
-      lower_boundary_flux_for_cache_subtimestep_cm = lower_boundary_flux_subtimestep_cm;
-      volrech_subtimestep_cm = 0.0;
+      if (state->lgar_bmi_params.TO_enabled &&
+          create_surficial_front &&
+          creation_excess_runoff_subtimestep_cm > SMALL_EPS) {
+        /* Experimental bookkeeping: after creating a saturated surface front,
+           dzdt has been recomputed for the updated TO/GW scaffold but that
+           scaffold will not physically move again in this creation substep.
+           Route only the read-only projected same-substep TO drainage from the
+           creation residual to lower-boundary flux, instead of treating all of
+           that residual as immediate surface runoff. */
+        trace_surface_creation_post_creation_TO_release_cm =
+          lgarto_project_TO_motion_lower_boundary_flux_cm(
+            subtimestep_h, num_layers,
+            state->lgar_bmi_params.cum_layer_thickness_cm,
+            state->lgar_bmi_params.layer_soil_type,
+            state->head, state->soil_properties);
+        const double creation_residual_to_lower_boundary_cm =
+          fmin(creation_excess_runoff_subtimestep_cm,
+               trace_surface_creation_post_creation_TO_release_cm);
+        if (creation_residual_to_lower_boundary_cm > SMALL_EPS) {
+          creation_excess_runoff_subtimestep_cm -= creation_residual_to_lower_boundary_cm;
+          creation_excess_gw_flux_subtimestep_cm += creation_residual_to_lower_boundary_cm;
+        }
+
+        const double already_booked_lower_boundary_cm =
+          temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
+        const double saturated_column_capacity_cm =
+          lgarto_saturated_creation_lower_boundary_capacity_cm(
+            subtimestep_h, num_layers,
+            state->lgar_bmi_params.cum_layer_thickness_cm,
+            state->lgar_bmi_params.layer_soil_type,
+            state->lgar_bmi_params.frozen_factor,
+            state->head, state->soil_properties,
+            already_booked_lower_boundary_cm);
+        const double saturated_column_flux_cm =
+          fmin(creation_excess_runoff_subtimestep_cm,
+               saturated_column_capacity_cm);
+        if (saturated_column_flux_cm > SMALL_EPS) {
+          creation_excess_runoff_subtimestep_cm -= saturated_column_flux_cm;
+          creation_excess_gw_flux_subtimestep_cm += saturated_column_flux_cm;
+          if (verbosity.compare("high") == 0) {
+            printf("surface creation saturated-column regime routed %.12e cm "
+                   "from runoff to lower-boundary flux "
+                   "(remaining capacity %.12e cm).\n",
+                   saturated_column_flux_cm,
+                   saturated_column_capacity_cm);
+          }
+        }
+      }
+
+	      const double lower_boundary_flux_subtimestep_cm =
+	        temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
+	      lower_boundary_flux_for_cache_subtimestep_cm = lower_boundary_flux_subtimestep_cm;
+	      volrech_subtimestep_cm = 0.0;
       lgar_partition_lower_boundary_flux_for_CR(
         state->lgar_bmi_params.lower_bdy_flux_to_CR,
         lower_boundary_flux_subtimestep_cm,
         &volrech_subtimestep_cm,
-        &lower_boundary_flux_for_CR,
-        &state->lgar_mass_balance.CR_fast_storage_cm);
+	        &lower_boundary_flux_for_CR,
+	        &state->lgar_mass_balance.CR_fast_storage_cm);
 
-      volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
-      if (creation_excess_runoff_subtimestep_cm > 0.0) {
-        const double accepted_creation_infiltration_cm =
-          volin_subtimestep_cm - creation_excess_runoff_subtimestep_cm;
+	      const double runoff_before_creation_excess_cm = volrunoff_subtimestep_cm;
+	      volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
+	      if (creation_excess_runoff_subtimestep_cm > 0.0) {
+	        const double accepted_creation_infiltration_cm =
+	          volin_subtimestep_cm - creation_excess_runoff_subtimestep_cm;
         if (verbosity.compare("high") == 0) {
           printf("creation-time runoff reclassification updated infiltration bookkeeping: "
                  "volin %.12e -> %.12e cm after subtracting runoff %.12e cm\n",
                  volin_subtimestep_cm, fmax(0.0, accepted_creation_infiltration_cm),
                  creation_excess_runoff_subtimestep_cm);
-        }
-        volin_subtimestep_cm = fmax(0.0, accepted_creation_infiltration_cm);
-      }
+	        }
+	        volin_subtimestep_cm = fmax(0.0, accepted_creation_infiltration_cm);
+	      }
 
-    }
+	      const bool insert_storage_cap_active =
+	        std::isfinite(trace_insert_raw_fp_cm_per_h) &&
+	        std::isfinite(trace_insert_capped_fp_cm_per_h) &&
+	        trace_insert_capped_fp_cm_per_h < trace_insert_raw_fp_cm_per_h - 1.0e-12;
+	      const lgarto_infiltration_limit_trace_row trace_row = {
+	        state->lgar_bmi_params.timesteps,
+	        this->state->lgar_bmi_params.time_s / 3600.0,
+	        cycle,
+	        subcycles,
+	        subtimestep_h,
+	        trace_branch,
+	        0,
+	        trace_create_surficial_front ? 1 : 0,
+	        trace_is_top_wf_saturated ? 1 : 0,
+	        trace_fronts_start,
+	        trace_surface_fronts_start,
+	        listLength(state->head),
+	        listLength_surface(state->head),
+	        precip_subtimestep_cm,
+	        PET_subtimestep_cm,
+		        trace_ponded_start_cm,
+		        ponded_depth_subtimestep_cm,
+		        volin_subtimestep_cm,
+	        runoff_before_creation_excess_cm,
+	        creation_excess_runoff_subtimestep_cm,
+		        volrunoff_subtimestep_cm,
+		        creation_excess_gw_flux_subtimestep_cm,
+		        trace_surface_creation_gw_capacity_cm,
+		        trace_surface_creation_post_creation_TO_release_cm,
+		        temp_rch,
+	        free_drainage_subtimestep_cm,
+	        trace_projected_TO_storage_release_cm,
+	        trace_insertion_storage_release_cm,
+	        trace_insert_raw_fp_cm_per_h,
+	        trace_insert_storage_limit_fp_cm_per_h,
+	        trace_insert_capped_fp_cm_per_h,
+	        insert_storage_cap_active ? 1 : 0,
+	        lower_boundary_flux_subtimestep_cm
+	      };
+	      lgarto_write_infiltration_limit_trace(trace_row);
+
+	    }
 
     else {//in this case, we just use cached fluxes in order to save time. No direct computation of fluxes are necessary, and the ones from the last time step are used.
       //also in this case, there will be no runoff due to precipitation partitioning because there is no precipitation 
@@ -830,8 +1427,45 @@ Update()
         &volrech_subtimestep_cm,
         &lower_boundary_flux_for_CR,
         &state->lgar_mass_balance.CR_fast_storage_cm);
-      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += state->lgar_mass_balance.previous_lower_boundary_flux_cm;
-    }
+	      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += state->lgar_mass_balance.previous_lower_boundary_flux_cm;
+
+	      const lgarto_infiltration_limit_trace_row trace_row = {
+	        state->lgar_bmi_params.timesteps,
+	        this->state->lgar_bmi_params.time_s / 3600.0,
+	        cycle,
+	        subcycles,
+	        subtimestep_h,
+	        "cached_fluxes",
+	        1,
+	        0,
+	        0,
+	        trace_fronts_start,
+	        trace_surface_fronts_start,
+	        listLength(state->head),
+	        listLength_surface(state->head),
+	        precip_subtimestep_cm,
+	        PET_subtimestep_cm,
+		        trace_ponded_start_cm,
+		        ponded_depth_subtimestep_cm,
+		        volin_subtimestep_cm,
+	        volrunoff_subtimestep_cm,
+	        0.0,
+		        volrunoff_subtimestep_cm,
+		        0.0,
+		        0.0,
+		        0.0,
+		        0.0,
+		        free_drainage_subtimestep_cm,
+	        0.0,
+	        0.0,
+	        NAN,
+	        NAN,
+	        NAN,
+	        0,
+	        lower_boundary_flux_for_cache_subtimestep_cm
+	      };
+	      lgarto_write_infiltration_limit_trace(trace_row);
+	    }
 
     volend_subtimestep_cm = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
     volend_timestep_cm = volend_subtimestep_cm;
@@ -874,7 +1508,6 @@ Update()
 
     double local_mb = volstart_subtimestep_cm + precip_subtimestep_cm + volon_timestep_cm - volrunoff_subtimestep_cm - volQ_CR_subtimestep_cm - volCRend_subtimestep_cm + volCRstart_subtimestep_cm 
                       - AET_subtimestep_cm - volon_subtimestep_cm - volrech_subtimestep_cm - volend_subtimestep_cm;
-
 
     /*----------------------------------------------------------------------*/
 
@@ -946,13 +1579,20 @@ Update()
 
     const double column_depth_cm =
       state->lgar_bmi_params.cum_layer_thickness_cm[state->lgar_bmi_params.num_layers];
-    assert (state->head->depth_cm >= -1.E-10); // check on negative layer depth --> move this to somewhere else AJ (later)
+    // lgarto_abort_if_deferred_gw_flux_mass_balance_correction_exceeded(state->head);
+    lgar_assert_wetting_fronts_nonnegative_depth(state->head);
     lgar_assert_wetting_fronts_within_vadose_zone(column_depth_cm, state->head);
     lgar_assert_to_psi_monotonic_with_depth(state->head);
+    lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(state->head);
     lgar_assert_boundary_psi_continuity(state->head);
     lgar_assert_to_bottom_scaffold(state->lgar_bmi_params.num_layers,
                                    state->lgar_bmi_params.cum_layer_thickness_cm,
                                    state->head);
+
+    remaining_forcing_h -= subtimestep_h;
+    if (remaining_forcing_h < SMALL_EPS) {
+      remaining_forcing_h = 0.0;
+    }
 
     bool lasam_standalone = true;
 #ifdef NGEN
@@ -964,6 +1604,10 @@ Update()
 
   } // end of subcycling
 
+  state->lgar_bmi_params.timestep_h = base_subtimestep_h;
+
+  lgar_assert_wetting_fronts_nonnegative_depth(state->head);
+  lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(state->head);
   lgar_assert_to_bottom_scaffold(state->lgar_bmi_params.num_layers,
                                  state->lgar_bmi_params.cum_layer_thickness_cm,
                                  state->head);

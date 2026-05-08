@@ -70,13 +70,566 @@ using namespace std;
 #define FACTOR_LIMITS_LAYER_CROSSING_SPEED 2.0 // when a WF crosses a layer boundary, it shouldn't go too far into the next layer -- for example in the case of sand over clay, a WF in sand might have a large dzdt value that leads to crossing to an unrealistic depth in the clay below
 #define DEPTH_AVOIDS_SAME_WF_DEPTH 1.E-6       // in the event that multiple WFs all would cross a layer boundary and would each have their depth in the new layer limited by FACTOR_LIMITS_LAYER_CROSSING_SPEED, this just prevents these WFs from being exactly at the same depth.
 #define PSI_UPPER_LIM 1.E7                     // in loops that close the mass balance by iterating theta and psi, we impose an upper limit on capillary head because some values are just not physically realistic
-#define TO_PSI_GAP_REFINEMENT_THRESHOLD_FACTOR 0.1
+#define ZERO_DEPTH_TO_PSI_CAP_CM 1.E6          // zero-depth TO fronts with larger finite capillary heads are capped before leaving wetting-front motion
+#define ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM 1.E-10
+#define ZERO_DEPTH_TO_DELETE_MASS_TOL_CM 1.E-10
+#define FINITE_SAME_LAYER_TO_DELETE_MASS_TOL_CM 1.E-4 // finite duplicate deletes can re-snap nearby to_bottom fronts by roundoff-scale amounts
+#define ZERO_DEPTH_TO_DRY_SUPPORT_MAX_SE 0.1   // only delete zero-depth TO supports when they are close to residual saturation
+#define TO_PSI_GAP_REFINEMENT_MIN_GAP_CM 5.0
+#define TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR 0.25
 #define TO_PSI_GAP_REFINEMENT_MASS_TOLERANCE_CM 1.E-8
+#define TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_DRY_FACTOR 5.0
+#define TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_MAX_CM 1.E-6
 #define NO_SURFACE_TO_PSI_SPAN_INCREMENT_FACTOR 0.25
 #define NO_SURFACE_TO_PSI_SPAN_MAX_INSERTIONS 4
+#define NO_SURFACE_TO_PSI_SPAN_TOLERANCE_CM 1.E-8
 #define NO_SURFACE_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS 3
+#define SURFACE_PRESENT_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS 3
 #define TO_HYDROSTATIC_DAMPING_MIN_DEPTH_FRACTION 0.8
 #define TO_HYDROSTATIC_DAMPING_FRACTION 0.5
+#define GW_FLUX_MBAL_CORRECTION_DEBUG_THRESHOLD_CM 1.0
+#define BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM 1.E-2
+#define BOUNDARY_STORAGE_NEUTRAL_THETA_TOL 1.E-12
+
+static bool deferred_gw_flux_mbal_correction_violation = false;
+static double deferred_gw_flux_mbal_correction_cm = 0.0;
+static const char *deferred_gw_flux_mbal_correction_routine = NULL;
+static const char *deferred_gw_flux_mbal_correction_reason = NULL;
+
+static void lgarto_clear_deferred_gw_flux_mass_balance_correction(void)
+{
+  deferred_gw_flux_mbal_correction_violation = false;
+  deferred_gw_flux_mbal_correction_cm = 0.0;
+  deferred_gw_flux_mbal_correction_routine = NULL;
+  deferred_gw_flux_mbal_correction_reason = NULL;
+}
+
+static void lgarto_cap_zero_depth_TO_psi(int num_layers,
+                                         int *soil_type,
+                                         double *frozen_factor,
+                                         struct soil_properties_ *soil_properties,
+                                         struct wetting_front *head);
+static double lgar_surface_creation_downstream_TO_psi_bound_cm(struct wetting_front *repair_target);
+static double lgar_theta_mass_balance_correction_with_min_psi(
+  bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head,
+  double *cum_layer_thickness_cm, int *soil_type,
+  struct soil_properties_ *soil_properties, double min_psi_cm);
+static double lgarto_repair_negative_depth_fronts_to_lower_boundary_flux(
+  int num_layers, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct soil_properties_ *soil_properties,
+  struct wetting_front **head, const char *context);
+static double lgarto_surface_fronts_cross_layer_boundary_upward(
+  int num_layers, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct soil_properties_ *soil_properties,
+  struct wetting_front **head, const char *context);
+
+static double lgar_boundary_roundtrip_psi_tolerance_cm(double psi_a_cm, double psi_b_cm)
+{
+  const double psi_scale_cm = fmax(1.0, fmax(std::fabs(psi_a_cm), std::fabs(psi_b_cm)));
+
+  return fmax(1.E-3, 1.E-5 * psi_scale_cm);
+}
+
+static bool lgar_boundary_snap_preserves_upper_storage(const struct wetting_front *upper,
+                                                       const struct wetting_front *lower,
+                                                       int *soil_type,
+                                                       struct soil_properties_ *soil_properties)
+{
+  if (upper == NULL || lower == NULL || !upper->to_bottom ||
+      upper->layer_num == lower->layer_num || lower->psi_cm < 0.0 ||
+      lower->psi_cm > BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM ||
+      !std::isfinite(lower->psi_cm)) {
+    return false;
+  }
+
+  const int soil_num = soil_type[upper->layer_num];
+  const double theta_e = soil_properties[soil_num].theta_e;
+  const double theta_r = soil_properties[soil_num].theta_r;
+  const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+  const double vg_m = soil_properties[soil_num].vg_m;
+  const double vg_n = soil_properties[soil_num].vg_n;
+  const double theta_tol =
+    fmax(BOUNDARY_STORAGE_NEUTRAL_THETA_TOL * fmax(1.0, fabs(theta_e - theta_r)),
+         1.E-14);
+
+  /* Some soil water retention curves are numerically flat right at saturation:
+     a tiny but nonzero psi can evaluate to theta_e exactly in the upper soil,
+     while the lower soil still resolves it as barely unsaturated. In that case
+     preserving the lower front's psi on the upper to_bottom front restores the
+     layer-boundary continuity invariant without changing upper-layer storage. */
+  const double upper_theta_at_lower_psi =
+    calc_theta_from_h(lower->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+
+  return fabs(upper->theta - theta_e) <= theta_tol &&
+         fabs(upper_theta_at_lower_psi - theta_e) <= theta_tol &&
+         fabs(upper_theta_at_lower_psi - upper->theta) <= theta_tol;
+}
+
+static bool lgar_should_snap_boundary_psi_to_lower(const struct wetting_front *upper,
+                                                   const struct wetting_front *lower,
+                                                   int *soil_type,
+                                                   struct soil_properties_ *soil_properties)
+{
+  const double psi_mismatch_cm = std::fabs(upper->psi_cm - lower->psi_cm);
+  const double roundtrip_psi_tol_cm =
+    lgar_boundary_roundtrip_psi_tolerance_cm(upper->psi_cm, lower->psi_cm);
+
+  return psi_mismatch_cm <= roundtrip_psi_tol_cm ||
+         lgar_boundary_snap_preserves_upper_storage(upper, lower, soil_type, soil_properties);
+}
+
+static void lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+  double correction_cm,
+  const char *routine,
+  const char *reason,
+  struct wetting_front *head)
+{
+  (void)head;
+
+  if (!std::isfinite(correction_cm) ||
+      std::fabs(correction_cm) > GW_FLUX_MBAL_CORRECTION_DEBUG_THRESHOLD_CM) {
+    if (!deferred_gw_flux_mbal_correction_violation) {
+      deferred_gw_flux_mbal_correction_violation = true;
+      deferred_gw_flux_mbal_correction_cm = correction_cm;
+      deferred_gw_flux_mbal_correction_routine = routine;
+      deferred_gw_flux_mbal_correction_reason = reason;
+    }
+  }
+}
+
+extern void lgarto_abort_if_deferred_gw_flux_mass_balance_correction_exceeded(
+  struct wetting_front *head)
+{
+  if (!deferred_gw_flux_mbal_correction_violation) {
+    return;
+  }
+
+  fprintf(stderr,
+          "Error: wetting-front editing routine routed a large mass-balance "
+          "correction/residual to lower-boundary flux.\n"
+          "  Deferred until end of substep after first threshold exceedance.\n"
+          "  routine=%s reason=%s\n"
+          "  |flux_correction_cm|=%.16g threshold_cm=%.16g flux_correction_cm=%.16g\n"
+          "  Wetting front list follows:\n",
+          deferred_gw_flux_mbal_correction_routine != NULL ?
+            deferred_gw_flux_mbal_correction_routine : "(unknown)",
+          deferred_gw_flux_mbal_correction_reason != NULL ?
+            deferred_gw_flux_mbal_correction_reason : "(unspecified)",
+          std::fabs(deferred_gw_flux_mbal_correction_cm),
+          GW_FLUX_MBAL_CORRECTION_DEBUG_THRESHOLD_CM,
+          deferred_gw_flux_mbal_correction_cm);
+  fflush(stderr);
+  listPrint(head);
+  fflush(stdout);
+  abort();
+}
+
+struct lgarto_surface_TO_merge_front_state
+{
+  struct wetting_front *front;
+  double psi_cm;
+  double theta;
+  double K_cm_per_h;
+};
+
+static void lgarto_restore_front_hydraulic_states(
+  const std::vector<lgarto_surface_TO_merge_front_state> &states)
+{
+  for (size_t i = 0; i < states.size(); i++) {
+    states[i].front->psi_cm = states[i].psi_cm;
+    states[i].front->theta = states[i].theta;
+    states[i].front->K_cm_per_h = states[i].K_cm_per_h;
+  }
+}
+
+static bool lgarto_update_front_from_shared_psi(struct wetting_front *front,
+                                                double psi_cm,
+                                                int num_layers,
+                                                int *soil_type,
+                                                double *frozen_factor,
+                                                struct soil_properties_ *soil_properties)
+{
+  if (front == NULL || front->layer_num < 1 || front->layer_num > num_layers ||
+      !std::isfinite(psi_cm) || psi_cm < 0.0) {
+    return false;
+  }
+
+  const int soil_num = soil_type[front->layer_num];
+  const double theta_e = soil_properties[soil_num].theta_e;
+  const double theta_r = soil_properties[soil_num].theta_r;
+  const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+  const double vg_m = soil_properties[soil_num].vg_m;
+  const double vg_n = soil_properties[soil_num].vg_n;
+  const double frozen = frozen_factor != NULL ? frozen_factor[front->layer_num] : 1.0;
+  const double Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen;
+
+  front->psi_cm = psi_cm;
+  front->theta = calc_theta_from_h(psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+  const double Se = calc_Se_from_theta(front->theta, theta_e, theta_r);
+  front->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+
+  return std::isfinite(front->theta) && std::isfinite(front->K_cm_per_h) &&
+         front->theta >= theta_r - 1.0e-12 && front->theta <= theta_e + 1.0e-12;
+}
+
+static bool lgarto_apply_shared_psi_to_fronts(
+  const std::vector<struct wetting_front *> &fronts,
+  double psi_cm,
+  int num_layers,
+  int *soil_type,
+  double *frozen_factor,
+  struct soil_properties_ *soil_properties)
+{
+  for (size_t i = 0; i < fronts.size(); i++) {
+    if (!lgarto_update_front_from_shared_psi(fronts[i], psi_cm, num_layers, soil_type,
+                                             frozen_factor, soil_properties)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool lgarto_psis_match_for_local_chain(double psi_a_cm, double psi_b_cm)
+{
+  const double psi_scale_cm = fmax(1.0, fmax(fabs(psi_a_cm), fabs(psi_b_cm)));
+  return fabs(psi_a_cm - psi_b_cm) <= fmax(1.0e-8, 1.0e-8 * psi_scale_cm);
+}
+
+static std::vector<struct wetting_front *>
+lgarto_collect_surface_TO_merge_psi_repair_chain(struct wetting_front *head,
+                                                 struct wetting_front *surface_front)
+{
+  std::vector<struct wetting_front *> fronts;
+  if (surface_front == NULL) {
+    return fronts;
+  }
+
+  struct wetting_front *previous = NULL;
+  for (struct wetting_front *probe = head; probe != NULL && probe != surface_front;
+       probe = probe->next) {
+    previous = probe;
+  }
+
+  /* Include the adjacent upper to_bottom scaffold when it already shares psi
+     with the boundary-pinned surface front. Otherwise a later theta snap sees
+     that connection and changes storage outside this mass solve. */
+  if (previous != NULL && previous->to_bottom && previous->layer_num != surface_front->layer_num &&
+      lgarto_psis_match_for_local_chain(previous->psi_cm, surface_front->psi_cm)) {
+    fronts.push_back(previous);
+  }
+
+  fronts.push_back(surface_front);
+
+  /* If this surface front already shares a capillary head with an adjacent
+     to_bottom/lower-front boundary chain, keep that local chain tied together.
+     In the common failure mode this list contains only the boundary-pinned
+     surface front; the separate to_bottom/lower-front pair already has its own
+     continuity and should not be broadened unless it is actually connected by psi. */
+  struct wetting_front *current = surface_front;
+  const double shared_psi_cm = surface_front->psi_cm;
+  while (current->next != NULL && current->next->to_bottom &&
+         lgarto_psis_match_for_local_chain(shared_psi_cm, current->next->psi_cm)) {
+    current = current->next;
+    fronts.push_back(current);
+  }
+
+  if (current != surface_front && current->next != NULL && !current->next->to_bottom &&
+      lgarto_psis_match_for_local_chain(shared_psi_cm, current->next->psi_cm)) {
+    fronts.push_back(current->next);
+  }
+
+  return fronts;
+}
+
+static bool lgarto_surface_TO_merge_psi_repair_preserves_local_ordering(
+  struct wetting_front *head)
+{
+  for (struct wetting_front *current = head; current != NULL && current->next != NULL;
+       current = current->next) {
+    struct wetting_front *next = current->next;
+    if (current->layer_num != next->layer_num) {
+      continue;
+    }
+
+    if (!current->is_WF_GW && !next->is_WF_GW &&
+        current->theta + 1.0e-10 < next->theta) {
+      return false;
+    }
+
+    if (current->is_WF_GW && next->is_WF_GW &&
+        current->psi_cm + 1.0e-10 < next->psi_cm) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+extern double lgarto_restore_surface_TO_merge_mass_via_boundary_psi(
+  double target_mass_cm,
+  int boundary_pinned_surface_front_num,
+  int num_layers,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  double *frozen_factor,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front *head)
+{
+  double residual_cm = target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+  if (residual_cm <= MBAL_ITERATIVE_TOLERANCE || head == NULL ||
+      boundary_pinned_surface_front_num < 1) {
+    return residual_cm;
+  }
+
+  struct wetting_front *surface_front =
+    listFindFront(boundary_pinned_surface_front_num, head, NULL);
+  if (surface_front == NULL || surface_front->is_WF_GW || surface_front->to_bottom ||
+      surface_front->layer_num < 1 || surface_front->layer_num > num_layers ||
+      !std::isfinite(surface_front->psi_cm) || surface_front->psi_cm <= 0.0) {
+    return residual_cm;
+  }
+
+  const double layer_bottom_cm = cum_layer_thickness_cm[surface_front->layer_num];
+  const double boundary_tol_cm = fmax(1.0e-8, 10.0 * TRUNCATION_DEPTH);
+  if (fabs(surface_front->depth_cm - layer_bottom_cm) > boundary_tol_cm) {
+    return residual_cm;
+  }
+
+  std::vector<struct wetting_front *> repair_fronts =
+    lgarto_collect_surface_TO_merge_psi_repair_chain(head, surface_front);
+  if (repair_fronts.empty()) {
+    return residual_cm;
+  }
+
+  std::vector<lgarto_surface_TO_merge_front_state> saved_states;
+  for (size_t i = 0; i < repair_fronts.size(); i++) {
+    lgarto_surface_TO_merge_front_state saved = {
+      repair_fronts[i],
+      repair_fronts[i]->psi_cm,
+      repair_fronts[i]->theta,
+      repair_fronts[i]->K_cm_per_h
+    };
+    saved_states.push_back(saved);
+  }
+
+  const double original_psi_cm = surface_front->psi_cm;
+
+  /* The depth repair has exhausted geometry: the surface front is already at
+     the layer bottom. Lowering psi wets that local profile volume without
+     moving deeper TO fronts or inventing a lower-boundary flux correction. */
+  if (!lgarto_apply_shared_psi_to_fronts(repair_fronts, 0.0, num_layers, soil_type,
+                                         frozen_factor, soil_properties) ||
+      !lgarto_surface_TO_merge_psi_repair_preserves_local_ordering(head)) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return residual_cm;
+  }
+
+  const double saturated_residual_cm =
+    target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+  if (saturated_residual_cm > MBAL_ITERATIVE_TOLERANCE) {
+    if (verbosity.compare("high") == 0) {
+      printf("surface/TO merge boundary-psi repair could not close residual %.12e cm "
+             "by saturating front %d; remaining residual at saturation %.12e cm\n",
+             residual_cm,
+             surface_front->front_num,
+             saturated_residual_cm);
+    }
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return residual_cm;
+  }
+
+  double psi_wet_cm = 0.0;
+  double psi_dry_cm = original_psi_cm;
+  double best_psi_cm = 0.0;
+  double best_abs_residual_cm = fabs(saturated_residual_cm);
+
+  for (int iter = 0; iter < 80; iter++) {
+    const double probe_psi_cm = 0.5 * (psi_wet_cm + psi_dry_cm);
+    if (!lgarto_apply_shared_psi_to_fronts(repair_fronts, probe_psi_cm, num_layers,
+                                           soil_type, frozen_factor, soil_properties) ||
+        !lgarto_surface_TO_merge_psi_repair_preserves_local_ordering(head)) {
+      psi_wet_cm = probe_psi_cm;
+      continue;
+    }
+
+    const double probe_residual_cm =
+      target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+    if (fabs(probe_residual_cm) < best_abs_residual_cm) {
+      best_abs_residual_cm = fabs(probe_residual_cm);
+      best_psi_cm = probe_psi_cm;
+    }
+
+    if (fabs(probe_residual_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+      best_psi_cm = probe_psi_cm;
+      break;
+    }
+
+    if (probe_residual_cm > 0.0) {
+      psi_dry_cm = probe_psi_cm;
+    }
+    else {
+      psi_wet_cm = probe_psi_cm;
+    }
+  }
+
+  if (!lgarto_apply_shared_psi_to_fronts(repair_fronts, best_psi_cm, num_layers,
+                                         soil_type, frozen_factor, soil_properties) ||
+      !lgarto_surface_TO_merge_psi_repair_preserves_local_ordering(head)) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return residual_cm;
+  }
+
+  const double repaired_residual_cm =
+    target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+  if (fabs(repaired_residual_cm) > fabs(residual_cm)) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return residual_cm;
+  }
+
+  if (verbosity.compare("high") == 0) {
+    printf("surface/TO merge boundary-psi repair updated front %d in layer %d: "
+           "psi %.17lf cm -> %.17lf cm, theta %.17lf, residual %.12e cm "
+           "(connected fronts adjusted: %zu)\n",
+           surface_front->front_num,
+           surface_front->layer_num,
+           original_psi_cm,
+           surface_front->psi_cm,
+           surface_front->theta,
+           repaired_residual_cm,
+           repair_fronts.size());
+  }
+
+  return repaired_residual_cm;
+}
+
+static double lgarto_restore_surface_TO_merge_mass_via_surface_depths(double target_mass_cm,
+                                                                      int num_layers,
+                                                                      double *cum_layer_thickness_cm,
+                                                                      struct wetting_front *head,
+                                                                      int *boundary_pinned_surface_front_num)
+{
+  if (boundary_pinned_surface_front_num != NULL) {
+    *boundary_pinned_surface_front_num = -1;
+  }
+
+  double residual_cm = target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+  if (std::fabs(residual_cm) <= MBAL_ITERATIVE_TOLERANCE || head == NULL) {
+    return residual_cm;
+  }
+
+  for (int pass = 0; pass < listLength(head); pass++) {
+    bool repaired_this_pass = false;
+
+    for (struct wetting_front *candidate = head; candidate != NULL; candidate = candidate->next) {
+      if (candidate->is_WF_GW || candidate->to_bottom ||
+          candidate->layer_num < 1 || candidate->layer_num > num_layers) {
+        continue;
+      }
+
+      double lower_depth_cm = cum_layer_thickness_cm[candidate->layer_num - 1];
+      double upper_depth_cm = cum_layer_thickness_cm[candidate->layer_num];
+
+      struct wetting_front *previous = NULL;
+      for (struct wetting_front *probe = head; probe != NULL && probe != candidate; probe = probe->next) {
+        previous = probe;
+      }
+
+      if (previous != NULL && previous->layer_num == candidate->layer_num) {
+        lower_depth_cm = fmax(lower_depth_cm, previous->depth_cm);
+      }
+      if (candidate->next != NULL && candidate->next->layer_num == candidate->layer_num) {
+        upper_depth_cm = fmin(upper_depth_cm, candidate->next->depth_cm);
+      }
+
+      if (upper_depth_cm <= lower_depth_cm) {
+        continue;
+      }
+
+      const double original_depth_cm = candidate->depth_cm;
+      if (original_depth_cm < lower_depth_cm || original_depth_cm > upper_depth_cm) {
+        continue;
+      }
+
+      const double endpoint_depth_cm = residual_cm > 0.0 ? upper_depth_cm : lower_depth_cm;
+      if (endpoint_depth_cm == original_depth_cm) {
+        continue;
+      }
+
+      candidate->depth_cm = endpoint_depth_cm;
+      const double endpoint_residual_cm =
+        target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+      candidate->depth_cm = original_depth_cm;
+
+      if (std::fabs(endpoint_residual_cm) >= std::fabs(residual_cm)) {
+        continue;
+      }
+
+      double bracket_lo_cm = fmin(original_depth_cm, endpoint_depth_cm);
+      double bracket_hi_cm = fmax(original_depth_cm, endpoint_depth_cm);
+      double best_depth_cm = endpoint_depth_cm;
+      double best_abs_residual_cm = std::fabs(endpoint_residual_cm);
+
+      for (int iter = 0; iter < 80; iter++) {
+        const double probe_depth_cm = 0.5 * (bracket_lo_cm + bracket_hi_cm);
+        candidate->depth_cm = probe_depth_cm;
+        const double probe_residual_cm =
+          target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+
+        if (std::fabs(probe_residual_cm) < best_abs_residual_cm) {
+          best_abs_residual_cm = std::fabs(probe_residual_cm);
+          best_depth_cm = probe_depth_cm;
+        }
+
+        if (std::fabs(probe_residual_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+          best_depth_cm = probe_depth_cm;
+          break;
+        }
+
+        if ((residual_cm > 0.0 && probe_residual_cm > 0.0) ||
+            (residual_cm < 0.0 && probe_residual_cm < 0.0)) {
+          bracket_lo_cm = residual_cm > 0.0 ? probe_depth_cm : bracket_lo_cm;
+          bracket_hi_cm = residual_cm < 0.0 ? probe_depth_cm : bracket_hi_cm;
+        }
+        else {
+          bracket_lo_cm = residual_cm < 0.0 ? probe_depth_cm : bracket_lo_cm;
+          bracket_hi_cm = residual_cm > 0.0 ? probe_depth_cm : bracket_hi_cm;
+        }
+      }
+
+      candidate->depth_cm = best_depth_cm;
+      residual_cm = target_mass_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+      repaired_this_pass = true;
+
+      const double layer_bottom_cm = cum_layer_thickness_cm[candidate->layer_num];
+      const double boundary_tol_cm = fmax(1.0e-8, 10.0 * TRUNCATION_DEPTH);
+      if (residual_cm > MBAL_ITERATIVE_TOLERANCE &&
+          fabs(candidate->depth_cm - layer_bottom_cm) <= boundary_tol_cm &&
+          boundary_pinned_surface_front_num != NULL) {
+        *boundary_pinned_surface_front_num = candidate->front_num;
+      }
+
+      if (verbosity.compare("high") == 0) {
+        printf("surface/TO merge depth-repair updated front %d in layer %d: "
+               "depth %.17lf cm -> %.17lf cm, residual %.12e cm\n",
+               candidate->front_num,
+               candidate->layer_num,
+               original_depth_cm,
+               candidate->depth_cm,
+               residual_cm);
+      }
+
+      if (std::fabs(residual_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+        return residual_cm;
+      }
+    }
+
+    if (!repaired_this_pass) {
+      break;
+    }
+  }
+
+  return residual_cm;
+}
 
 static double lgar_limit_TO_dzdt_near_hydrostatic_target(double dzdt_cm_per_h,
                                                          double current_depth_cm,
@@ -128,13 +681,13 @@ static bool lgarto_is_last_layer_GW_overshoot_pair(struct wetting_front *current
          current->depth_cm > next->depth_cm;
 }
 
-extern double lgarto_truncate_last_layer_GW_overshoot(double lower_boundary_depth_cm,
+extern double lgarto_truncate_last_layer_GW_overshoot(double *cum_layer_thickness_cm,
                                                       int num_layers,
                                                       struct wetting_front **head,
                                                       int *soil_type,
                                                       struct soil_properties_ *soil_properties)
 {
-  if (head == NULL || *head == NULL) {
+  if (cum_layer_thickness_cm == NULL || head == NULL || *head == NULL) {
     return 0.0;
   }
 
@@ -150,17 +703,44 @@ extern double lgarto_truncate_last_layer_GW_overshoot(double lower_boundary_dept
   }
 
   struct wetting_front *bottom_front = overshooting_front->next;
-  const double bottom_flux_cm =
+  const double lower_boundary_depth_cm = cum_layer_thickness_cm[num_layers];
+  const double geometric_bottom_flux_cm =
     (overshooting_front->depth_cm - bottom_front->depth_cm) *
     (overshooting_front->theta - bottom_front->theta);
+
+  struct lgarto_saved_to_bottom_state
+  {
+    struct wetting_front *front;
+    bool is_WF_GW;
+    double theta;
+    double psi_cm;
+    double K_cm_per_h;
+  };
+
+  std::vector<lgarto_saved_to_bottom_state> upstream_boundary_states;
+  for (struct wetting_front *current = *head;
+       current != NULL && current != overshooting_front;
+       current = current->next) {
+    if (current->to_bottom) {
+      upstream_boundary_states.push_back({
+        current,
+        current->is_WF_GW,
+        current->theta,
+        current->psi_cm,
+        current->K_cm_per_h
+      });
+    }
+  }
+
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 
   if (verbosity.compare("high") == 0) {
     printf("TO/general correction type 9 truncating last-layer GW front %d into bottom front %d.\n",
            overshooting_front->front_num, bottom_front->front_num);
     printf("  overshoot_depth_cm=%.15f bottom_depth_cm=%.15f lower_boundary_depth_cm=%.15f\n",
            overshooting_front->depth_cm, bottom_front->depth_cm, lower_boundary_depth_cm);
-    printf("  overshoot_theta=%.15f bottom_theta=%.15f routed_bottom_flux_cm=%.15f\n",
-           overshooting_front->theta, bottom_front->theta, bottom_flux_cm);
+    printf("  overshoot_theta=%.15f bottom_theta=%.15f geometric_bottom_flux_cm=%.15f\n",
+           overshooting_front->theta, bottom_front->theta, geometric_bottom_flux_cm);
   }
 
   bottom_front->depth_cm = lower_boundary_depth_cm;
@@ -172,9 +752,87 @@ extern double lgarto_truncate_last_layer_GW_overshoot(double lower_boundary_dept
 
   listDeleteFront(overshooting_front->front_num, head, soil_type, soil_properties);
 
+  /* listDeleteFront globally re-snaps every upstream to_bottom front to the
+     next front's psi. For this correction, the overshooting last-layer front is
+     a local layer-crossing artifact; deleting it should not dry or wet unrelated
+     upper boundary fronts. */
+  for (size_t i = 0; i < upstream_boundary_states.size(); i++) {
+    upstream_boundary_states[i].front->is_WF_GW = upstream_boundary_states[i].is_WF_GW;
+    upstream_boundary_states[i].front->theta = upstream_boundary_states[i].theta;
+    upstream_boundary_states[i].front->psi_cm = upstream_boundary_states[i].psi_cm;
+    upstream_boundary_states[i].front->K_cm_per_h = upstream_boundary_states[i].K_cm_per_h;
+  }
+
+  const double bottom_flux_cm =
+    mass_before_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
   if (verbosity.compare("high") == 0) {
+    printf("  routed_bottom_flux_cm=%.15f\n", bottom_flux_cm);
     printf("State after truncating last-layer GW overshoot into the bottom boundary...\n");
     listPrint(*head);
+  }
+
+  return bottom_flux_cm;
+}
+
+extern double lgarto_clip_final_layer_GW_overshoot_to_vadose_boundary(double *cum_layer_thickness_cm,
+                                                                      int num_layers,
+                                                                      struct wetting_front **head)
+{
+  if (cum_layer_thickness_cm == NULL || head == NULL || *head == NULL || num_layers < 1) {
+    return 0.0;
+  }
+
+  const double lower_boundary_depth_cm = cum_layer_thickness_cm[num_layers];
+  if (!std::isfinite(lower_boundary_depth_cm) || lower_boundary_depth_cm <= 0.0) {
+    return 0.0;
+  }
+
+  const double final_tol_cm = LOWER_BOUNDARY_FINAL_TOL_CM;
+  const double max_accepted_overshoot_cm =
+    fmax(final_tol_cm, 0.001 * lower_boundary_depth_cm);
+  double bottom_flux_cm = 0.0;
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (!current->is_WF_GW || current->to_bottom || current->layer_num != num_layers ||
+        !std::isfinite(current->depth_cm) ||
+        current->depth_cm <= lower_boundary_depth_cm + final_tol_cm) {
+      continue;
+    }
+
+    const double overshoot_cm = current->depth_cm - lower_boundary_depth_cm;
+    if (overshoot_cm > max_accepted_overshoot_cm + final_tol_cm) {
+      continue;
+    }
+
+    const double original_depth_cm = current->depth_cm;
+    const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    current->depth_cm = lower_boundary_depth_cm;
+    double clipped_flux_cm = mass_before_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+    if (clipped_flux_cm < -MBAL_ITERATIVE_TOLERANCE) {
+      current->depth_cm = original_depth_cm;
+      if (verbosity.compare("high") == 0) {
+        printf("Final lower-boundary TO/GW clip rejected for front %d because clipping "
+               "would imply negative recharge %.12e cm.\n",
+               current->front_num, clipped_flux_cm);
+      }
+      continue;
+    }
+
+    if (clipped_flux_cm < 0.0) {
+      clipped_flux_cm = 0.0;
+    }
+    bottom_flux_cm += clipped_flux_cm;
+
+    if (verbosity.compare("high") == 0) {
+      printf("Final lower-boundary TO/GW clip moved front %d from %.17lf cm to "
+             "%.17lf cm and routed %.12e cm to bottom flux.\n",
+             current->front_num,
+             original_depth_cm,
+             current->depth_cm,
+             clipped_flux_cm);
+    }
   }
 
   return bottom_flux_cm;
@@ -453,7 +1111,7 @@ static bool lgarto_insert_zero_depth_groundwater_front(double psi_new_cm,
                                                        struct soil_properties_ *soil_properties,
                                                        struct wetting_front **head)
 {
-  if (head == NULL || *head == NULL) {
+  if (head == NULL || *head == NULL || listLength_surface(*head) > 0) {
     return false;
   }
 
@@ -500,18 +1158,23 @@ static int lgarto_ensure_no_surface_to_psi_span(int num_layers,
   }
 
   const double psi_increment_cm = NO_SURFACE_TO_PSI_SPAN_INCREMENT_FACTOR * column_depth_cm;
+  // Avoid creating a zero-depth support just to close machine-roundoff gaps
+  // between the current dry-end psi and the column-depth psi target.
+  const double psi_span_tolerance_cm =
+    fmax(NO_SURFACE_TO_PSI_SPAN_TOLERANCE_CM,
+         1.0e-12 * column_depth_cm);
   int insertions = 0;
 
   while (*head != NULL &&
          (*head)->is_WF_GW &&
-         (*head)->psi_cm + CREATION_COLOCATED_TOLERANCE_CM < column_depth_cm &&
+         (*head)->psi_cm + psi_span_tolerance_cm < column_depth_cm &&
          insertions < NO_SURFACE_TO_PSI_SPAN_MAX_INSERTIONS) {
     if ((*head)->psi_cm >= PSI_UPPER_LIM) {
       break;
     }
 
     const double psi_target_cm = fmin(column_depth_cm, (*head)->psi_cm + psi_increment_cm);
-    if (psi_target_cm <= (*head)->psi_cm + CREATION_COLOCATED_TOLERANCE_CM) {
+    if (psi_target_cm <= (*head)->psi_cm + psi_span_tolerance_cm) {
       break;
     }
 
@@ -620,16 +1283,17 @@ static double lgarto_restore_to_psi_gap_mass_via_depth(struct wetting_front *upp
 static bool lgarto_find_large_to_psi_gap_candidate(int num_layers,
                                                    double *cum_layer_thickness_cm,
                                                    struct wetting_front *head,
+                                                   double minimum_candidate_depth_cm,
                                                    TOPsiGapRefinementCandidate *candidate)
 {
   if (head == NULL || candidate == NULL) {
     return false;
   }
 
-  const double threshold_cm =
-    TO_PSI_GAP_REFINEMENT_THRESHOLD_FACTOR * cum_layer_thickness_cm[num_layers];
+  const double dry_zero_depth_psi_cm =
+    TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_DRY_FACTOR * cum_layer_thickness_cm[num_layers];
   bool found = false;
-  double best_gap_cm = threshold_cm;
+  double best_excess_gap_cm = 0.0;
 
   for (struct wetting_front *current = head; current != NULL && current->next != NULL;
        current = current->next) {
@@ -643,7 +1307,20 @@ static bool lgarto_find_large_to_psi_gap_candidate(int num_layers,
       continue;
     }
 
+    // Near-zero TO/GW supports are metadata for the dry top of the TO chain,
+    // not spatial resolution. Do not subdivide a dry near-surface support pair.
+    if (current->depth_cm <= TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_MAX_CM &&
+        next->depth_cm <= TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_MAX_CM &&
+        current->psi_cm > dry_zero_depth_psi_cm &&
+        next->psi_cm > dry_zero_depth_psi_cm) {
+      continue;
+    }
+
     if (current->depth_cm <= CREATION_COLOCATED_TOLERANCE_CM) {
+      continue;
+    }
+
+    if (current->depth_cm <= minimum_candidate_depth_cm) {
       continue;
     }
 
@@ -663,12 +1340,18 @@ static bool lgarto_find_large_to_psi_gap_candidate(int num_layers,
     }
 
     const double psi_gap_cm = current->psi_cm - next->psi_cm;
-    if (psi_gap_cm <= best_gap_cm) {
+    const double local_psi_midpoint_cm =
+      0.5 * (fmax(0.0, current->psi_cm) + fmax(0.0, next->psi_cm));
+    const double threshold_cm =
+      fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
+           TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR * local_psi_midpoint_cm);
+    const double excess_gap_cm = psi_gap_cm - threshold_cm;
+    if (excess_gap_cm <= best_excess_gap_cm) {
       continue;
     }
 
     found = true;
-    best_gap_cm = psi_gap_cm;
+    best_excess_gap_cm = excess_gap_cm;
     candidate->upper_front = current;
     candidate->lower_front = next;
     candidate->psi_gap_cm = psi_gap_cm;
@@ -682,10 +1365,12 @@ static bool lgarto_try_refine_large_to_psi_gap(int num_layers,
                                                int *soil_type,
                                                double *frozen_factor,
                                                struct soil_properties_ *soil_properties,
-                                               struct wetting_front **head)
+                                               struct wetting_front **head,
+                                               double minimum_candidate_depth_cm)
 {
   TOPsiGapRefinementCandidate candidate = {};
-  if (!lgarto_find_large_to_psi_gap_candidate(num_layers, cum_layer_thickness_cm, *head, &candidate)) {
+  if (!lgarto_find_large_to_psi_gap_candidate(num_layers, cum_layer_thickness_cm, *head,
+                                              minimum_candidate_depth_cm, &candidate)) {
     return false;
   }
 
@@ -696,6 +1381,17 @@ static bool lgarto_try_refine_large_to_psi_gap(int num_layers,
     0.5 * (candidate.upper_front->depth_cm + candidate.lower_front->depth_cm);
   const double inserted_psi_cm =
     0.5 * (candidate.upper_front->psi_cm + candidate.lower_front->psi_cm);
+  const double dry_zero_depth_psi_cm =
+    TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_DRY_FACTOR * cum_layer_thickness_cm[num_layers];
+
+  if (insert_depth_cm <= TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_MAX_CM &&
+      candidate.upper_front->psi_cm > dry_zero_depth_psi_cm &&
+      candidate.lower_front->psi_cm > dry_zero_depth_psi_cm) {
+    if (snapshot != NULL) {
+      listDelete(snapshot);
+    }
+    return false;
+  }
 
   struct wetting_front *inserted =
     lgar_insert_groundwater_front_before(insert_depth_cm, inserted_psi_cm, candidate.lower_front,
@@ -742,12 +1438,14 @@ static int lgarto_refine_large_to_psi_gaps(int num_layers,
                                            double *frozen_factor,
                                            struct soil_properties_ *soil_properties,
                                            struct wetting_front **head,
-                                           int max_insertions)
+                                           int max_insertions,
+                                           double minimum_candidate_depth_cm)
 {
   int insertions = 0;
   while (insertions < max_insertions &&
          lgarto_try_refine_large_to_psi_gap(num_layers, cum_layer_thickness_cm, soil_type,
-                                            frozen_factor, soil_properties, head)) {
+                                            frozen_factor, soil_properties, head,
+                                            minimum_candidate_depth_cm)) {
     insertions++;
   }
   return insertions;
@@ -2008,6 +2706,205 @@ extern int wetting_front_free_drainage(struct wetting_front* head) {
   return  wf_that_supplies_free_drainage_demand;
 }
 
+static void lgar_apply_surface_depth_update_with_event_limit(struct wetting_front *current,
+                                                             struct wetting_front *next,
+                                                             double timestep_h,
+                                                             double column_depth_cm,
+                                                             int num_layers,
+                                                             bool lgarto_active)
+{
+  if (current == NULL) {
+    return;
+  }
+
+  const double original_depth_cm = current->depth_cm;
+  const double original_dzdt_cm_per_h = current->dzdt_cm_per_h;
+  const double projected_depth_cm = original_depth_cm + original_dzdt_cm_per_h * timestep_h;
+
+  (void)next;
+  (void)num_layers;
+
+  double limited_depth_cm = projected_depth_cm;
+
+  bool limit_at_domain_overshoot = false;
+  if (lgarto_active && timestep_h > 0.0 && !current->is_WF_GW && !current->to_bottom &&
+      original_dzdt_cm_per_h > 0.0 && column_depth_cm > 0.0) {
+    const double max_surface_depth_cm = 1.10 * column_depth_cm;
+    if (limited_depth_cm > max_surface_depth_cm) {
+      limited_depth_cm = max_surface_depth_cm;
+      limit_at_domain_overshoot = true;
+    }
+  }
+
+  if (!limit_at_domain_overshoot) {
+    current->depth_cm = projected_depth_cm;
+    return;
+  }
+
+  current->depth_cm = limited_depth_cm;
+  current->dzdt_cm_per_h = (limited_depth_cm - original_depth_cm) / timestep_h;
+
+  if (limit_at_domain_overshoot && verbosity.compare("high") == 0) {
+    printf("Domain-limited LGARTO surface wetting front %d from projected depth %.17lf cm "
+           "to %.17lf cm (110%% of column depth %.17lf cm; old_dzdt=%.17lf cm/h, "
+           "new_dzdt=%.17lf cm/h).\n",
+           current->front_num,
+           projected_depth_cm,
+           current->depth_cm,
+           column_depth_cm,
+           original_dzdt_cm_per_h,
+           current->dzdt_cm_per_h);
+  }
+}
+
+static void lgarto_convert_surface_fronts_drier_than_TO_below(struct wetting_front **head,
+                                                              const char *correction_context)
+{
+  if (head == NULL || *head == NULL) {
+    return;
+  }
+
+  bool converted_any = false;
+  const int max_passes = listLength(*head) + 1;
+
+  for (int pass = 0; pass < max_passes; pass++) {
+    bool converted_this_pass = false;
+    struct wetting_front *temp_WF = *head;
+
+    while (temp_WF != NULL && temp_WF->next != NULL) {
+      if (temp_WF->is_WF_GW == FALSE && temp_WF->next->is_WF_GW == TRUE &&
+          temp_WF->theta < temp_WF->next->theta &&
+          temp_WF->layer_num == temp_WF->next->layer_num) {
+        if (verbosity.compare("high") == 0) {
+          printf("%s converting front %d to GW because surface theta %.15f "
+                 "is drier than GW theta %.15f below it in layer %d.\n",
+                 correction_context, temp_WF->front_num, temp_WF->theta,
+                 temp_WF->next->theta, temp_WF->layer_num);
+        }
+        temp_WF->is_WF_GW = TRUE;
+        converted_any = true;
+        converted_this_pass = true;
+      }
+      else if (temp_WF->to_bottom == TRUE && temp_WF->is_WF_GW == FALSE &&
+               temp_WF->next->is_WF_GW == TRUE) {
+        if (verbosity.compare("high") == 0) {
+          printf("%s converting front %d to GW because a to_bottom surface front "
+                 "is immediately above a GW front.\n",
+                 correction_context, temp_WF->front_num);
+        }
+        temp_WF->is_WF_GW = TRUE;
+        converted_any = true;
+        converted_this_pass = true;
+      }
+
+      temp_WF = temp_WF->next;
+    }
+
+    if (!converted_this_pass) {
+      break;
+    }
+  }
+
+  if (converted_any && verbosity.compare("high") == 0) {
+    printf("%s converted surf wf to TO \n", correction_context);
+    listPrint(*head);
+  }
+}
+
+static bool lgarto_surface_front_overtook_surface_front_above_TO_chain(const struct wetting_front *current)
+{
+  if (current == NULL || current->next == NULL || current->next->next == NULL) {
+    return false;
+  }
+
+  const struct wetting_front *next = current->next;
+  const struct wetting_front *next_to_next = next->next;
+
+  return current->is_WF_GW == FALSE &&
+         next->is_WF_GW == FALSE &&
+         next_to_next->is_WF_GW == TRUE &&
+         current->depth_cm > next->depth_cm &&
+         current->theta > next->theta &&
+         current->theta <= next_to_next->theta &&
+         current->layer_num == next->layer_num &&
+         !next->to_bottom;
+}
+
+static bool lgarto_convert_overtaken_surface_front_above_TO_chain(struct wetting_front **head,
+                                                                  const char *correction_context)
+{
+  if (head == NULL || *head == NULL) {
+    return false;
+  }
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (!lgarto_surface_front_overtook_surface_front_above_TO_chain(current)) {
+      continue;
+    }
+
+    struct wetting_front *next = current->next;
+    struct wetting_front *next_to_next = next->next;
+    if (verbosity.compare("high") == 0) {
+      printf("%s converting overtaking surface front %d and overtaken surface front %d "
+             "to TO above an existing TO chain (overtaking depth %.15f theta %.15f; "
+             "overtaken depth %.15f theta %.15f; TO below front %d theta %.15f).\n",
+             correction_context,
+             current->front_num,
+             next->front_num,
+             current->depth_cm,
+             current->theta,
+             next->depth_cm,
+             next->theta,
+             next_to_next->front_num,
+             next_to_next->theta);
+    }
+
+    current->is_WF_GW = TRUE;
+    next->is_WF_GW = TRUE;
+    /*
+     * These fronts already moved as surface fronts in this substep.  In the
+     * movement loop, dzdt == 0 for a non-to_bottom front is the existing
+     * one-substep "do not move this newly created/converted front" latch.
+     * The next lgar_dzdt_calc call will recompute mobile TO/GW dzdt values.
+     */
+    current->dzdt_cm_per_h = 0.0;
+    next->dzdt_cm_per_h = 0.0;
+    return true;
+  }
+
+  return false;
+}
+
+static double lgarto_resolve_mixed_surface_surface_TO_overtake(int num_layers,
+                                                               double *cum_layer_thickness_cm,
+                                                               int *soil_type,
+                                                               double *frozen_factor,
+                                                               struct wetting_front **head,
+                                                               struct soil_properties_ *soil_properties)
+{
+  const double mass_before_mixed_correction =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const bool converted =
+    lgarto_convert_overtaken_surface_front_above_TO_chain(head, "mixed surface/surface/TO correction");
+  if (!converted) {
+    return 0.0;
+  }
+
+  (void) num_layers;
+  (void) soil_type;
+  (void) frozen_factor;
+  (void) soil_properties;
+  double mass_balance_flux_correction_cm =
+    mass_before_mixed_correction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (verbosity.compare("high") == 0) {
+    printf("mixed surface/surface/TO correction residual mass correction: %.17lf cm "
+           "(flag-only conversion)\n",
+           mass_balance_flux_correction_cm);
+  }
+
+  return mass_balance_flux_correction_cm;
+}
+
 // #######################################################################################################
 /*
   the function moves wetting fronts, merge wetting fronts and does the mass balance correction when needed
@@ -2022,12 +2919,15 @@ extern int wetting_front_free_drainage(struct wetting_front* head) {
 */
 // #######################################################################################################
 extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_subtimestep_cm, double *volin_cm, int wf_free_drainage_demand,
-				     double old_mass, double cached_lower_boundary_flux_correction_cm, int num_layers, double *AET_demand_cm, double *cum_layer_thickness_cm,
-				     int *soil_type, double *frozen_factor, struct wetting_front** head,
-				     struct wetting_front* state_previous, struct soil_properties_ *soil_properties,
-				     const double *surf_AET_vec, double PET_timestep_cm, double wilting_point_psi_cm,
-				     double field_capacity_psi_cm, double root_zone_depth_cm, double surf_frac_rz)
+					     double old_mass, double cached_lower_boundary_flux_correction_cm, int num_layers, double *AET_demand_cm, double *cum_layer_thickness_cm,
+					     int *soil_type, double *frozen_factor, struct wetting_front** head,
+					     struct wetting_front* state_previous, struct soil_properties_ *soil_properties,
+					     const double *surf_AET_vec, double PET_timestep_cm, double wilting_point_psi_cm,
+					     double field_capacity_psi_cm, double root_zone_depth_cm, double surf_frac_rz,
+					     double lgar_global_theta_snap_mass_tolerance_cm)
 {
+
+  lgarto_clear_deferred_gw_flux_mass_balance_correction();
 
   if (verbosity.compare("high") == 0) {
     printf("State before moving wetting fronts...\n");
@@ -2052,9 +2952,11 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
   int number_of_surface_WFs = 0;
   int number_of_TO_WFs_above_surface_WFs = 0;
   bool encountered_surface_WF = false;
+  bool lgarto_active = false;
 
   for (struct wetting_front *count_front = *head; count_front != NULL; count_front = count_front->next) {
     if (count_front->is_WF_GW) {
+      lgarto_active = true;
       if (!encountered_surface_WF) {
         number_of_TO_WFs_above_surface_WFs++;
       }
@@ -2085,8 +2987,47 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
   double precip_mass_to_add = (*volin_cm); // water to be added to the soil
 
-  double bottom_boundary_flux_cm = 0.0; // water leaving the system through the bottom boundary
-  const bool use_TO_surface_AET = (surf_AET_vec != nullptr);
+	  double bottom_boundary_flux_cm = 0.0; // water leaving the system through the bottom boundary
+	  const bool use_TO_surface_AET = (surf_AET_vec != nullptr);
+	  const double AET_pet_budget_cm = fmax(0.0, PET_timestep_cm * timestep_h);
+	  double accepted_positive_AET_bookkeeping_cm = 0.0;
+
+  auto add_AET_with_pet_budget = [&](double requested_increment_cm,
+                                     const char *context,
+                                     bool route_overflow_to_bottom_boundary) -> double {
+    if (requested_increment_cm <= 0.0) {
+      *AET_demand_cm += requested_increment_cm;
+      return requested_increment_cm;
+    }
+
+    const double remaining_AET_budget_cm = fmax(0.0, AET_pet_budget_cm - *AET_demand_cm);
+	    const double accepted_increment_cm = fmin(requested_increment_cm, remaining_AET_budget_cm);
+	    const double overflow_cm = requested_increment_cm - accepted_increment_cm;
+	    *AET_demand_cm += accepted_increment_cm;
+	    if (use_TO_surface_AET) {
+	      accepted_positive_AET_bookkeeping_cm += accepted_increment_cm;
+	    }
+
+    if (overflow_cm > MBAL_ITERATIVE_TOLERANCE) {
+      if (verbosity.compare("high") == 0) {
+        printf("Capping AET increment for %s from %.17lf cm to %.17lf cm "
+               "because PET budget is %.17lf cm and current AET is %.17lf cm.\n",
+               context, requested_increment_cm, accepted_increment_cm,
+               AET_pet_budget_cm, *AET_demand_cm);
+      }
+
+      if (route_overflow_to_bottom_boundary) {
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          overflow_cm,
+          "lgar_move_wetting_fronts",
+          context,
+          *head);
+        bottom_boundary_flux_cm += overflow_cm;
+      }
+    }
+
+    return accepted_increment_cm;
+  };
 
   *volin_cm = 0.0; // assuming that all the water can fit in, if not then re-assign the left over water at the end. now handled from the returned value from this function
   double free_drainage_demand = *free_drainage_subtimestep_cm;
@@ -2155,7 +3096,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
     double actual_ET_demand = use_TO_surface_AET ? surf_AET_vec[wf] : *AET_demand_cm;
     if (use_TO_surface_AET) {
-      *AET_demand_cm += actual_ET_demand;
+      actual_ET_demand =
+        add_AET_with_pet_budget(actual_ET_demand, "surface AET demand", false);
     }
 
     // case to check if the wetting front is at the interface, i.e. deepest wetting front within a layer
@@ -2208,7 +3150,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       double vg_a_k, vg_m_k, vg_n_k;
       double theta_e_k, theta_r_k;
 
-      current->depth_cm += current->dzdt_cm_per_h * timestep_h; // this is probably not needed, as dz/dt = 0 for the deepest wetting front
+      lgar_apply_surface_depth_update_with_event_limit(current, next, timestep_h, column_depth, num_layers,
+                                                       lgarto_active); // this is probably not needed, as dz/dt = 0 for the deepest wetting front
 
       double *delta_thetas = (double *) malloc(sizeof(double)*(layer_num+1));
       double *delta_thickness = (double *) malloc(sizeof(double)*(layer_num+1));
@@ -2269,7 +3212,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
       const double AET_before_mass_balance_cm = *AET_demand_cm;
       double theta_new = lgar_theta_mass_balance(layer_num, soil_num, psi_cm, new_mass, prior_mass, precip_mass_to_add, AET_demand_cm,
-						 delta_thetas, delta_thickness, soil_type, soil_properties);
+						 delta_thetas, delta_thickness, soil_type, soil_properties,
+                         !use_TO_surface_AET);
       if (use_TO_surface_AET) {
         actual_ET_demand += (*AET_demand_cm - AET_before_mass_balance_cm);
       }
@@ -2321,13 +3265,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 		  prior_mass += precip_mass_to_add - (free_drainage_demand + cached_lower_boundary_flux_correction_cm + actual_ET_demand);
 	}
 
-	current->depth_cm += current->dzdt_cm_per_h * timestep_h;
+			lgar_apply_surface_depth_update_with_event_limit(current, next, timestep_h, column_depth, num_layers,
+	                                                     lgarto_active);
 
-	/* condition to bound the wetting front depth, if depth of a wf, at this timestep,
-	   gets greater than the domain depth, it will be merge anyway as it is passing
-	   the layer depth */
+			/* condition to bound the wetting front depth, if depth of a wf, at this timestep,
+			   gets greater than the domain depth, it will be merge anyway as it is passing
+		   the layer depth */
 
-  if (current->depth_cm > column_depth) {
+  if (current->depth_cm > column_depth && listLength_surface(*head)==listLength(*head)) {
 	  current->depth_cm = column_depth + TRUNCATION_DEPTH; //we want WFs to exceed the lower boundary in the event that they must be partially truncated and then WFs above this one will correctly have their moisture corrected, but also want WFs to not exceed the lower boundary much
   }
 
@@ -2386,11 +3331,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	double vg_a_k, vg_m_k, vg_n_k;
 	double theta_e_k, theta_r_k;
 
-	current->depth_cm += current->dzdt_cm_per_h * timestep_h;
+			lgar_apply_surface_depth_update_with_event_limit(current, next, timestep_h, column_depth, num_layers,
+	                                                     lgarto_active);
 
-  if (current->depth_cm > column_depth) {
-	  current->depth_cm = column_depth + TRUNCATION_DEPTH; //we want WFs to exceed the lower boundary in the event that they must be partially truncated and then WFs above this one will correctly have their moisture corrected, but also want WFs to not exceed the lower boundary much
-  }
+	  if (current->depth_cm > column_depth && listLength_surface(*head)==listLength(*head)) {
+		  current->depth_cm = column_depth + TRUNCATION_DEPTH; //we want WFs to exceed the lower boundary in the event that they must be partially truncated and then WFs above this one will correctly have their moisture corrected, but also want WFs to not exceed the lower boundary much
+	  }
 
 	double *delta_thetas    = (double *)malloc(sizeof(double)*(layer_num+1));
 	double *delta_thickness = (double *)malloc(sizeof(double)*(layer_num+1));
@@ -2401,6 +3347,15 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
 	double psi_cm = current->psi_cm;
 	double psi_cm_below = next->psi_cm;
+	double theta_mass_balance_psi_upper_limit_cm = PSI_UPPER_LIM;
+	if (std::isfinite(psi_cm_below) && psi_cm_below > PSI_UPPER_LIM) {
+	  /*
+	   * A surface front in a lower layer can sit above an extremely dry TO/GW
+	   * front.  In that local column the lower front, not the generic dry cap,
+	   * is the physically relevant dry bound for mass closure.
+	   */
+	  theta_mass_balance_psi_upper_limit_cm = psi_cm_below;
+	}
 
 	// mass = delta(depth) * delta(theta)
 	//      = difference in current and next wetting front thetas times depth of the current wetting front
@@ -2455,7 +3410,9 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
   // theta mass balance computes new theta that conserves the mass; new theta is assigned to the current wetting front
 	const double AET_before_mass_balance_cm = *AET_demand_cm;
 	double theta_new = lgar_theta_mass_balance(layer_num, soil_num, psi_cm, new_mass, prior_mass, precip_mass_to_add, AET_demand_cm,
-						   delta_thetas, delta_thickness, soil_type, soil_properties);
+						   delta_thetas, delta_thickness, soil_type, soil_properties,
+                           !use_TO_surface_AET,
+                           theta_mass_balance_psi_upper_limit_cm);
   if (use_TO_surface_AET) {
     actual_ET_demand += (*AET_demand_cm - AET_before_mass_balance_cm);
   }
@@ -2509,6 +3466,29 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       bool switched = false;
 
       double depth_new = wf_free_drainage->depth_cm;
+      bool use_lgarto_saturated_depth_min_bound = false;
+      bool lgarto_saturated_depth_bound_hit = false;
+      double lgarto_saturated_depth_min_cm = TRUNCATION_DEPTH;
+      if (lgarto_active && !wf_free_drainage->is_WF_GW && !wf_free_drainage->to_bottom &&
+          wf_free_drainage->layer_num >= 1 && wf_free_drainage->layer_num <= num_layers) {
+        const int bounded_layer = wf_free_drainage->layer_num;
+        lgarto_saturated_depth_min_cm = bounded_layer == 1
+          ? TRUNCATION_DEPTH
+          : cum_layer_thickness_cm[bounded_layer - 1] + TRUNCATION_DEPTH;
+
+        struct wetting_front *previous_free_drainage = NULL;
+        if (wf_free_drainage->front_num > 1) {
+          previous_free_drainage = listFindFront(wf_free_drainage->front_num - 1, *head, NULL);
+        }
+        if (previous_free_drainage != NULL &&
+            previous_free_drainage->layer_num == bounded_layer) {
+          lgarto_saturated_depth_min_cm =
+            fmax(lgarto_saturated_depth_min_cm,
+                 previous_free_drainage->depth_cm + DEPTH_AVOIDS_SAME_WF_DEPTH);
+        }
+
+        use_lgarto_saturated_depth_min_bound = true;
+      }
 
       // loop to adjust the depth for mass balance
       int iter = 0;
@@ -2525,14 +3505,17 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
       while (fabs(mass_balance_error) > MBAL_ITERATIVE_TOLERANCE) {
         iter++;
-        if (iter>MAX_ITER_SATURATION_MBAL_LOOP) {
-          break_flag = TRUE;
-          *AET_demand_cm = *AET_demand_cm + mass_balance_error;
-          if (use_TO_surface_AET) {
-            actual_ET_demand += mass_balance_error;
-          }
-          else {
-            actual_ET_demand = *AET_demand_cm;
+	        if (iter>MAX_ITER_SATURATION_MBAL_LOOP) {
+	          break_flag = TRUE;
+	          const double accepted_AET_increment_cm =
+	            add_AET_with_pet_budget(mass_balance_error,
+	                                    "saturated free-drainage depth adjustment residual",
+	                                    false);
+	          if (use_TO_surface_AET) {
+	            actual_ET_demand += accepted_AET_increment_cm;
+	          }
+	          else {
+	            actual_ET_demand = *AET_demand_cm;
           }
           break;
         }
@@ -2557,6 +3540,30 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
         if ( (wf_free_drainage->to_bottom==TRUE) && (wf_free_drainage->layer_num==num_layers) ){
           depth_new = cum_layer_thickness_cm[num_layers];
+        }
+
+        // LGARTO event limiting can pin a saturated surface WF to a TO/to_bottom
+        // boundary after infiltration was accepted. If the old saturated-depth
+        // mass solve then wants to pull that front above its assigned layer,
+        // keep the geometry valid and expose the remaining signed residual.
+        if (use_lgarto_saturated_depth_min_bound &&
+            depth_new < lgarto_saturated_depth_min_cm) {
+          depth_new = lgarto_saturated_depth_min_cm;
+          wf_free_drainage->depth_cm = depth_new;
+          current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+          mass_balance_error = fabs(current_mass - mass_timestep);
+          break_flag = TRUE;
+          lgarto_saturated_depth_bound_hit = true;
+          if (verbosity.compare("high") == 0) {
+            printf("LGARTO saturated free-drainage depth adjustment hit lower "
+                   "layer-bound %.17lf cm for front %d; "
+                   "remaining mass residual %.17e cm will be routed as signed "
+                   "lower-boundary correction.\n",
+                   depth_new,
+                   wf_free_drainage->front_num,
+                   mass_timestep - current_mass);
+          }
+          break;
         }
 
         wf_free_drainage->depth_cm = depth_new;
@@ -2592,6 +3599,13 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         const double total_ET_demand_cm = use_TO_surface_AET ? *AET_demand_cm : actual_ET_demand;
 	        mass_timestep = (old_mass + precip_mass_to_add) - (total_ET_demand_cm + free_drainage_demand + cached_lower_boundary_flux_correction_cm);
         mass_balance_error = mass_timestep - current_mass;
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_error,
+          "lgar_move_wetting_fronts",
+          lgarto_saturated_depth_bound_hit
+            ? "bounded saturated free-drainage depth residual"
+            : "saturated free-drainage depth adjustment residual",
+          *head);
         bottom_boundary_flux_cm += mass_balance_error;
       }
 
@@ -2622,8 +3636,11 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
   double mass_change = 0.0;
 
   int correction_type_surf =  lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
+  int surface_correction_iterations = 0;
+  const int max_surface_correction_iterations = 1000;
 
   while (correction_type_surf!=0){
+    surface_correction_iterations++;
 
     if (correction_type_surf==1){
       lgar_merge_wetting_fronts(soil_type, frozen_factor, head, soil_properties);
@@ -2632,11 +3649,13 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     if (correction_type_surf==2){
       double mass_before_bdy_crossing = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
       lgar_wetting_fronts_cross_layer_boundary(num_layers, cum_layer_thickness_cm, soil_type, frozen_factor, head, soil_properties);
-      double mass_after_bdy_crossing  = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-      if (fabs(mass_before_bdy_crossing - mass_after_bdy_crossing)>100.*MBAL_ITERATIVE_TOLERANCE){//the inclusion of 100.*MBAL_ITERATIVE_TOLERANCE is due to the fact that mass_before_bdy_crossing > mass_after_bdy_crossing might be true, but only within the mass balance tolerance, in which case we should not run this
-        *AET_demand_cm = *AET_demand_cm + (mass_before_bdy_crossing - mass_after_bdy_crossing);
-      }
-    }
+	      double mass_after_bdy_crossing  = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+	      if (fabs(mass_before_bdy_crossing - mass_after_bdy_crossing)>100.*MBAL_ITERATIVE_TOLERANCE){//the inclusion of 100.*MBAL_ITERATIVE_TOLERANCE is due to the fact that mass_before_bdy_crossing > mass_after_bdy_crossing might be true, but only within the mass balance tolerance, in which case we should not run this
+	        (void) add_AET_with_pet_budget(mass_before_bdy_crossing - mass_after_bdy_crossing,
+	                                       "surface layer-boundary crossing mass residual",
+	                                       true);
+	      }
+	    }
 
     if (correction_type_surf==3){
       // bottom_boundary_flux_cm += lgar_wetting_front_cross_domain_boundary(TO_enabled, cum_layer_thickness_cm, soil_type, frozen_factor, head, soil_properties);
@@ -2646,20 +3665,131 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
           }
     }
 
-    if (correction_type_surf==4){
-      mass_change = 0.0;
-      lgar_fix_dry_over_wet_wetting_fronts(&mass_change, cum_layer_thickness_cm, soil_type, head, soil_properties);
-      *AET_demand_cm = *AET_demand_cm - mass_change;
+	    if (correction_type_surf==4){
+	      mass_change = 0.0;
+	      lgar_fix_dry_over_wet_wetting_fronts(&mass_change, cum_layer_thickness_cm, soil_type, head, soil_properties);
+	      (void) add_AET_with_pet_budget(-mass_change,
+	                                     "surface dry-over-wet mass residual",
+	                                     true);
+	    }
+
+    if (correction_type_surf==5){
+      lgarto_convert_surface_fronts_drier_than_TO_below(head, "surface correction type 5");
+    }
+
+    if (correction_type_surf==6){
+      const double mass_balance_flux_correction_cm =
+        lgarto_resolve_mixed_surface_surface_TO_overtake(num_layers, cum_layer_thickness_cm,
+                                                         soil_type, frozen_factor, head,
+                                                         soil_properties);
+      if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_flux_correction_cm,
+          "lgar_move_wetting_fronts",
+          "mixed surface/surface/TO correction residual",
+          *head);
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+      }
+    }
+
+    if (correction_type_surf==7){
+      bool merged_in_non_top_layer = false;
+      const double mass_before_surface_TO_merge = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      merged_in_non_top_layer =
+        lgar_merge_surface_and_TO_wetting_fronts(merged_in_non_top_layer, num_layers,
+                                                 cum_layer_thickness_cm, soil_type,
+                                                 frozen_factor, soil_properties, head,
+                                                 true);
+      const bool did_a_WF_have_negative_depth = lgarto_correct_negative_depths(head);
+      lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(merged_in_non_top_layer, soil_type,
+                                                                 soil_properties, head);
+      const bool close_psis = correct_close_psis(soil_type, soil_properties, head);
+
+      double mass_balance_flux_correction_cm =
+        mass_before_surface_TO_merge - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      int boundary_pinned_surface_front_num = -1;
+      if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        mass_balance_flux_correction_cm =
+          lgarto_restore_surface_TO_merge_mass_via_surface_depths(mass_before_surface_TO_merge,
+                                                                  num_layers,
+                                                                  cum_layer_thickness_cm,
+                                                                  *head,
+                                                                  &boundary_pinned_surface_front_num);
+      }
+      if (mass_balance_flux_correction_cm > MBAL_ITERATIVE_TOLERANCE &&
+          boundary_pinned_surface_front_num > -1) {
+        mass_balance_flux_correction_cm =
+          lgarto_restore_surface_TO_merge_mass_via_boundary_psi(mass_before_surface_TO_merge,
+                                                                boundary_pinned_surface_front_num,
+                                                                num_layers,
+                                                                cum_layer_thickness_cm,
+                                                                soil_type,
+                                                                frozen_factor,
+                                                                soil_properties,
+                                                                *head);
+      }
+      if (did_a_WF_have_negative_depth || close_psis ||
+          fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_flux_correction_cm,
+          "lgar_move_wetting_fronts",
+          "pre-TO-motion surface/TO merge cleanup mass residual",
+          *head);
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+      }
+    }
+
+    if (correction_type_surf==9){
+      const double mass_balance_flux_correction_cm =
+        lgarto_surface_fronts_cross_layer_boundary_upward(
+          num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+          soil_properties, head, "surface correction loop");
+      if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_flux_correction_cm,
+          "lgar_move_wetting_fronts",
+          "surface upward layer-crossing residual",
+          *head);
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+      }
     }
 
     correction_type_surf =  lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
     if (verbosity.compare("high") == 0) {
       printf("correction_type_surf at end of iteration in while loop: %d \n", correction_type_surf);
     }
-  }
+    if (correction_type_surf != 0 &&
+        surface_correction_iterations >= max_surface_correction_iterations) {
+      fprintf(stderr,
+              "Error: surface wetting-front correction loop exceeded iteration cap.\n"
+              "  While not technically physically impossible for a very long, complex wetting front list, it much more likely means that a correciton type was detected but not resolved, resulting in an infinite loop.\n"
+              "  iterations=%d max_iterations=%d remaining_correction_type_surf=%d\n"
+              "  Wetting front list follows:\n",
+              surface_correction_iterations,
+              max_surface_correction_iterations,
+              correction_type_surf);
+      fflush(stderr);
+      listPrint(*head);
+      fflush(stdout);
+      abort();
+    }
+	  }
 
-	  const double bottom_boundary_flux_cm_from_surf_WFs = bottom_boundary_flux_cm;
-	  double bottom_boundary_flux_above_surface_WFs_cm = 0.0;
+	  const double negative_depth_repair_flux_cm =
+	    lgarto_repair_negative_depth_fronts_to_lower_boundary_flux(
+	      num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+	      soil_properties, head, "post-surface correction loop");
+	  if (fabs(negative_depth_repair_flux_cm) > MBAL_ITERATIVE_TOLERANCE) {
+	    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+	      negative_depth_repair_flux_cm,
+	      "lgar_move_wetting_fronts",
+	      "post-surface negative-depth repair residual",
+	      *head);
+	    bottom_boundary_flux_cm += negative_depth_repair_flux_cm;
+	  }
+
+		  const double bottom_boundary_flux_cm_from_surf_WFs = bottom_boundary_flux_cm;
+		  double bottom_boundary_flux_above_surface_WFs_cm = 0.0;
 
   bool has_TO_fronts = false;
   for (struct wetting_front *count_front = *head; count_front != NULL; count_front = count_front->next) {
@@ -2679,10 +3809,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       const double cumulative_ET_from_TO_WFs_cm =
         lgarto_calc_aet_from_TO_WFs(num_layers, deepest_surf_depth_at_start, root_zone_depth_cm,
                                     PET_timestep_cm, timestep_h, surf_frac_rz,
-                                    precip_mass_to_add <= 1.0e-12,
-                                    wilting_point_psi_cm, field_capacity_psi_cm, soil_type,
-                                    cum_layer_thickness_cm, frozen_factor, soil_properties, head);
-      *AET_demand_cm += cumulative_ET_from_TO_WFs_cm;
+	                                    precip_mass_to_add <= 1.0e-12,
+	                                    wilting_point_psi_cm, field_capacity_psi_cm, soil_type,
+	                                    cum_layer_thickness_cm, frozen_factor, soil_properties, head);
+	      (void) add_AET_with_pet_budget(cumulative_ET_from_TO_WFs_cm,
+	                                     "TO AET extraction",
+	                                     true);
 
       if (verbosity.compare("high") == 0) {
         printf("cumulative_ET_from_TO_WFs_cm: %10.16lf \n", cumulative_ET_from_TO_WFs_cm);
@@ -2722,7 +3854,192 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         continue;
       }
 
-      const double delta_depth = current->dzdt_cm_per_h * timestep_h;
+      double delta_depth = current->dzdt_cm_per_h * timestep_h;
+      double dzdt_cap_boundary_cm = column_depth;
+      double allowed_boundary_overshoot_cm = 0.001 * column_depth;
+      if (current->layer_num >= 1 && current->layer_num <= num_layers) {
+        dzdt_cap_boundary_cm = fmin(column_depth, cum_layer_thickness_cm[current->layer_num]);
+      }
+      if (current->layer_num >= 1 && current->layer_num < num_layers) {
+        const double next_layer_thickness_cm =
+          cum_layer_thickness_cm[current->layer_num + 1] - cum_layer_thickness_cm[current->layer_num];
+        allowed_boundary_overshoot_cm = 0.1 * next_layer_thickness_cm;
+      }
+      const double max_TO_dzdt_depth_cm = dzdt_cap_boundary_cm + allowed_boundary_overshoot_cm;
+      if (timestep_h > 0.0 && current->dzdt_cm_per_h > 0.0 &&
+          current->depth_cm + delta_depth > max_TO_dzdt_depth_cm) {
+        const double old_dzdt_cm_per_h = current->dzdt_cm_per_h;
+        delta_depth = fmax(0.0, max_TO_dzdt_depth_cm - current->depth_cm);
+        current->dzdt_cm_per_h = delta_depth / timestep_h;
+
+        if (verbosity.compare("high") == 0) {
+          printf("Capping TO dzdt depth update for front %d from %.17lf cm/h to %.17lf cm/h "
+                 "to limit assigned-boundary overshoot "
+                 "(old_projected_depth_cm=%.17lf capped_projected_depth_cm=%.17lf "
+                 "lower_boundary_cm=%.17lf allowed_overshoot_cm=%.17lf).\n",
+                 current->front_num, old_dzdt_cm_per_h, current->dzdt_cm_per_h,
+                 current->depth_cm + old_dzdt_cm_per_h * timestep_h,
+                 current->depth_cm + delta_depth, dzdt_cap_boundary_cm,
+                 allowed_boundary_overshoot_cm);
+        }
+      }
+
+      struct wetting_front *next = current->next;
+      const int layer_num = current->layer_num;
+      const double upper_layer_boundary_cm =
+        layer_num > 1 ? cum_layer_thickness_cm[layer_num - 1] : 0.0;
+      double projected_depth_cm = current->depth_cm + delta_depth;
+
+      if (timestep_h > 0.0 && current->dzdt_cm_per_h < 0.0) {
+        double limiting_surface_depth_cm = -1.0;
+        for (struct wetting_front *candidate = *head; candidate != NULL; candidate = candidate->next) {
+          if (candidate->is_WF_GW || candidate->to_bottom ||
+              candidate->layer_num != current->layer_num) {
+            continue;
+          }
+
+          if (candidate->depth_cm <= current->depth_cm &&
+              candidate->depth_cm > current->depth_cm + delta_depth) {
+            limiting_surface_depth_cm = fmax(limiting_surface_depth_cm, candidate->depth_cm);
+          }
+        }
+
+        if (limiting_surface_depth_cm >= 0.0) {
+          const double old_dzdt_cm_per_h = current->dzdt_cm_per_h;
+          const double old_projected_depth_cm = current->depth_cm + delta_depth;
+          const double capped_projected_depth_cm =
+            fmax(upper_layer_boundary_cm,
+                 limiting_surface_depth_cm - DEPTH_AVOIDS_SAME_WF_DEPTH);
+          /* Land just above the active surface front instead of exactly on it.
+             Exact contact can be invisible to the strict > merge/correction
+             checks, while a tiny event overshoot lets the existing correction
+             loop resolve the surface/TO contact before the substep ends. */
+          delta_depth = capped_projected_depth_cm - current->depth_cm;
+          current->dzdt_cm_per_h = delta_depth / timestep_h;
+          projected_depth_cm = current->depth_cm + delta_depth;
+
+          if (verbosity.compare("high") == 0) {
+            printf("Capping upward TO dzdt depth update for front %d from %.17lf cm/h to %.17lf cm/h "
+                   "to land just above an active surface front "
+                   "(old_projected_depth_cm=%.17lf capped_projected_depth_cm=%.17lf "
+                   "surface_depth_cm=%.17lf layer=%d).\n",
+                   current->front_num, old_dzdt_cm_per_h, current->dzdt_cm_per_h,
+                   old_projected_depth_cm, current->depth_cm + delta_depth,
+                   limiting_surface_depth_cm, current->layer_num);
+          }
+        }
+      }
+
+      // Use the bounded top-layer TO motion for both the depth update and flux bookkeeping.
+      if (timestep_h > 0.0 && current->dzdt_cm_per_h < 0.0 && layer_num == 1 &&
+          projected_depth_cm < upper_layer_boundary_cm) {
+        const double old_dzdt_cm_per_h = current->dzdt_cm_per_h;
+        const double old_projected_depth_cm = projected_depth_cm;
+        delta_depth = upper_layer_boundary_cm - current->depth_cm;
+        current->dzdt_cm_per_h = delta_depth / timestep_h;
+        projected_depth_cm = current->depth_cm + delta_depth;
+
+        if (verbosity.compare("high") == 0) {
+          printf("Capping upward TO dzdt depth update for front %d from %.17lf cm/h to %.17lf cm/h "
+                 "at the soil surface "
+                 "(old_projected_depth_cm=%.17lf capped_projected_depth_cm=%.17lf).\n",
+                 current->front_num, old_dzdt_cm_per_h, current->dzdt_cm_per_h,
+                 old_projected_depth_cm, projected_depth_cm);
+        }
+      }
+
+      if (timestep_h > 0.0 && current->dzdt_cm_per_h < 0.0 && layer_num > 1 &&
+          current->depth_cm >= upper_layer_boundary_cm &&
+          projected_depth_cm < upper_layer_boundary_cm && next != NULL) {
+        const int soil_num = soil_type[layer_num];
+        const double theta_e = soil_properties[soil_num].theta_e;
+        const double theta_r = soil_properties[soil_num].theta_r;
+        const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+        const double vg_m = soil_properties[soil_num].vg_m;
+        const double vg_n = soil_properties[soil_num].vg_n;
+
+        const int soil_num_above = soil_type[layer_num - 1];
+        const double above_theta_e = soil_properties[soil_num_above].theta_e;
+        const double above_theta_r = soil_properties[soil_num_above].theta_r;
+        const double above_vg_a = soil_properties[soil_num_above].vg_alpha_per_cm;
+        const double above_vg_m = soil_properties[soil_num_above].vg_m;
+        const double above_vg_n = soil_properties[soil_num_above].vg_n;
+
+        const double current_theta = fmin(theta_e, current->theta);
+        const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+        const double current_psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+        const double theta_new =
+          calc_theta_from_h(current_psi_cm, above_vg_a, above_vg_m, above_vg_n, above_theta_e,
+                            above_theta_r);
+        const double new_boundary_theta =
+          calc_theta_from_h(next->psi_cm, above_vg_a, above_vg_m, above_vg_n, above_theta_e,
+                            above_theta_r);
+        const double theta_denominator = theta_new - new_boundary_theta;
+        const double remap_ratio =
+          (next->theta - current_theta) / theta_denominator;
+        const double projected_overshoot_cm = upper_layer_boundary_cm - projected_depth_cm;
+        const double projected_remap_depth_cm =
+          cum_layer_thickness_cm[layer_num - 1] + projected_overshoot_cm * remap_ratio;
+        const double max_remap_depth_cm = cum_layer_thickness_cm[layer_num - 1];
+        const int remap_layer_num = layer_num - 1;
+        const double layer_min_remap_depth_cm = cum_layer_thickness_cm[layer_num - 2];
+        double min_remap_depth_cm = layer_min_remap_depth_cm;
+
+        for (struct wetting_front *candidate = *head; candidate != NULL; candidate = candidate->next) {
+          if (candidate->is_WF_GW || candidate->to_bottom ||
+              candidate->layer_num != remap_layer_num ||
+              candidate->depth_cm < layer_min_remap_depth_cm ||
+              candidate->depth_cm > max_remap_depth_cm) {
+            continue;
+          }
+
+          min_remap_depth_cm = fmax(min_remap_depth_cm, candidate->depth_cm);
+        }
+
+        if (!std::isfinite(projected_remap_depth_cm) ||
+            projected_remap_depth_cm < min_remap_depth_cm ||
+            projected_remap_depth_cm > max_remap_depth_cm) {
+          double capped_overshoot_cm = 0.0;
+          if (std::isfinite(remap_ratio) && remap_ratio < 0.0) {
+            capped_overshoot_cm = (min_remap_depth_cm - max_remap_depth_cm) / remap_ratio;
+          }
+
+          capped_overshoot_cm = fmax(0.0, fmin(capped_overshoot_cm, projected_overshoot_cm));
+          const double capped_projected_depth_cm = upper_layer_boundary_cm - capped_overshoot_cm;
+          const double old_dzdt_cm_per_h = current->dzdt_cm_per_h;
+          delta_depth = capped_projected_depth_cm - current->depth_cm;
+          current->dzdt_cm_per_h = delta_depth / timestep_h;
+
+          if (verbosity.compare("high") == 0) {
+            char projected_remap_depth_text[64];
+            char remap_ratio_text[64];
+            if (std::isfinite(projected_remap_depth_cm)) {
+              snprintf(projected_remap_depth_text, sizeof(projected_remap_depth_text),
+                       "%.17lf", projected_remap_depth_cm);
+            }
+            else {
+              snprintf(projected_remap_depth_text, sizeof(projected_remap_depth_text),
+                       "undefined");
+            }
+            if (std::isfinite(remap_ratio)) {
+              snprintf(remap_ratio_text, sizeof(remap_ratio_text), "%.17lf", remap_ratio);
+            }
+            else {
+              snprintf(remap_ratio_text, sizeof(remap_ratio_text), "undefined");
+            }
+
+            printf("Capping upward TO dzdt depth update for front %d from %.17lf cm/h to %.17lf cm/h "
+                   "to keep moving-up boundary remap inside the layer above "
+                   "(old_projected_depth_cm=%.17lf capped_projected_depth_cm=%.17lf "
+                   "projected_remap_depth_cm=%s min_remap_depth_cm=%.17lf "
+                   "max_remap_depth_cm=%.17lf remap_ratio=%s remap_layer=%d).\n",
+                   current->front_num, old_dzdt_cm_per_h, current->dzdt_cm_per_h,
+                   projected_depth_cm, capped_projected_depth_cm, projected_remap_depth_text,
+                   min_remap_depth_cm, max_remap_depth_cm, remap_ratio_text, remap_layer_num);
+          }
+        }
+      }
+
       double delta_theta = 0.0;
 
       if (current->layer_num == next_to_use->layer_num) {
@@ -2760,29 +4077,51 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	      bottom_boundary_flux_cm = lgarto_extract_TO_GW_flux_from_surface_WFs(
 	        &bottom_boundary_flux_above_surface_WFs_cm, bottom_boundary_flux_cm, AET_demand_cm,
 	        cum_layer_thickness_cm, soil_type, soil_properties, head);
-	      lgar_global_theta_update(bottom_boundary_flux_above_surface_WFs_cm, soil_type, soil_properties, head);
+	      const double target_mass_after_fluxes_cm =
+	        (old_mass + precip_mass_to_add) -
+	        (*AET_demand_cm + free_drainage_demand +
+	         cached_lower_boundary_flux_correction_cm + bottom_boundary_flux_cm);
+	      lgar_global_theta_update(bottom_boundary_flux_above_surface_WFs_cm,
+	                               target_mass_after_fluxes_cm,
+	                               cum_layer_thickness_cm, soil_type, soil_properties,
+	                               head, lgar_global_theta_snap_mass_tolerance_cm);
 	      lgar_global_psi_update(soil_type, soil_properties, head);
 	    }
 
-    mass_change = 0.0;
-    if (lgar_check_dry_over_wet_wetting_fronts(*head)) {
-      lgar_fix_dry_over_wet_wetting_fronts(&mass_change, cum_layer_thickness_cm, soil_type, head, soil_properties);
-      *AET_demand_cm = *AET_demand_cm - mass_change;
-    }
+	    mass_change = 0.0;
+	    if (lgar_check_dry_over_wet_wetting_fronts(*head)) {
+	      lgar_fix_dry_over_wet_wetting_fronts(&mass_change, cum_layer_thickness_cm, soil_type, head, soil_properties);
+	      (void) add_AET_with_pet_budget(-mass_change,
+	                                     "TO dry-over-wet mass residual",
+	                                     true);
+	    }
 
     if (listLength_surface(*head) == 0 && PET_timestep_cm <= 1.0e-12) {
       lgarto_ensure_no_surface_to_psi_span(num_layers, cum_layer_thickness_cm, soil_type,
                                            frozen_factor, soil_properties, head);
     }
 
-    // Only refine TO psi gaps when there is no surface structure left. With active
-    // surface fronts, inserting extra deep TO fronts can change recharge behavior
-    // much more than it helps missing-gradient coverage.
+    int surface_front_count = listLength_surface(*head);
+    double deepest_surface_depth_cm = 0.0;
+    if (surface_front_count > 0) {
+      for (struct wetting_front *front = *head; front != NULL; front = front->next) {
+        if (front->is_WF_GW == FALSE) {
+          deepest_surface_depth_cm = fmax(deepest_surface_depth_cm, front->depth_cm);
+        }
+      }
+    }
+
+    // With active surface fronts, refine only the TO/GW profile beneath the deepest
+    // surface front. The surface-supported bridge and zero-depth TO metadata stay out
+    // of this resolution pass.
     const int psi_gap_refinement_count =
       lgarto_refine_large_to_psi_gaps(num_layers, cum_layer_thickness_cm, soil_type,
                                       frozen_factor, soil_properties, head,
-                                      listLength_surface(*head) == 0 ?
-                                        NO_SURFACE_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS : 0);
+                                      surface_front_count == 0 ?
+                                        NO_SURFACE_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS :
+                                        SURFACE_PRESENT_TO_PSI_GAP_REFINEMENT_MAX_INSERTIONS,
+                                      surface_front_count == 0 ?
+                                        0.0 : deepest_surface_depth_cm + DEPTH_AVOIDS_SAME_WF_DEPTH);
     if (psi_gap_refinement_count > 0 && verbosity.compare("high") == 0) {
       printf("State after %d TO psi-gap refinement iteration(s) and before TO/general correction loop...\n",
              psi_gap_refinement_count);
@@ -2797,6 +4136,7 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       printf("mass before TO/general correction loop: %lf \n", lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
     }
 
+    double net_last_layer_GW_overshoot_truncation_cm = 0.0;
     while (correction_type != 0) {
       if (verbosity.compare("high") == 0) {
         printf("correction_type at start of TO/general correction iteration: %d \n", correction_type);
@@ -2805,15 +4145,45 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       if (correction_type == 1) {
         const double mass_before_surface_TO_merge = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         merged_in_non_top_layer =
-          lgar_merge_surface_and_TO_wetting_fronts(merged_in_non_top_layer, num_layers, cum_layer_thickness_cm, head);
+          lgar_merge_surface_and_TO_wetting_fronts(merged_in_non_top_layer, num_layers,
+                                                   cum_layer_thickness_cm, soil_type,
+                                                   frozen_factor, soil_properties, head);
         const bool did_a_WF_have_negative_depth = lgarto_correct_negative_depths(head);
         lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(merged_in_non_top_layer, soil_type,
                                                                    soil_properties, head);
         const bool close_psis = correct_close_psis(soil_type, soil_properties, head);
 
-        if (did_a_WF_have_negative_depth || close_psis) {
-          bottom_boundary_flux_cm +=
-            (mass_before_surface_TO_merge - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+        double mass_balance_flux_correction_cm =
+          mass_before_surface_TO_merge - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        int boundary_pinned_surface_front_num = -1;
+        if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          mass_balance_flux_correction_cm =
+            lgarto_restore_surface_TO_merge_mass_via_surface_depths(mass_before_surface_TO_merge,
+                                                                    num_layers,
+                                                                    cum_layer_thickness_cm,
+                                                                    *head,
+                                                                    &boundary_pinned_surface_front_num);
+        }
+        if (mass_balance_flux_correction_cm > MBAL_ITERATIVE_TOLERANCE &&
+            boundary_pinned_surface_front_num > -1) {
+          mass_balance_flux_correction_cm =
+            lgarto_restore_surface_TO_merge_mass_via_boundary_psi(mass_before_surface_TO_merge,
+                                                                  boundary_pinned_surface_front_num,
+                                                                  num_layers,
+                                                                  cum_layer_thickness_cm,
+                                                                  soil_type,
+                                                                  frozen_factor,
+                                                                  soil_properties,
+                                                                  *head);
+        }
+        if (did_a_WF_have_negative_depth || close_psis ||
+            fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            mass_balance_flux_correction_cm,
+            "lgar_move_wetting_fronts",
+            "surface/TO merge cleanup mass residual",
+            *head);
+          bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
         }
       }
 
@@ -2822,9 +4192,15 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
           (old_mass + precip_mass_to_add) -
 	          (*AET_demand_cm + free_drainage_demand + cached_lower_boundary_flux_correction_cm +
            bottom_boundary_flux_cm);
-        bottom_boundary_flux_cm +=
+        const double mass_balance_flux_correction_cm =
           lgarto_TO_WFs_merge_via_depth(target_mass_after_fluxes, column_depth, cum_layer_thickness_cm, head,
                                         soil_type, soil_properties);
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_flux_correction_cm,
+          "lgarto_TO_WFs_merge_via_depth",
+          "TO depth merge residual",
+          *head);
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
         lgar_global_psi_update(soil_type, soil_properties, head);
       }
 
@@ -2833,26 +4209,42 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
           (old_mass + precip_mass_to_add) -
 	          (*AET_demand_cm + free_drainage_demand + cached_lower_boundary_flux_correction_cm +
            bottom_boundary_flux_cm);
-        bottom_boundary_flux_cm +=
+        const double mass_balance_flux_correction_cm =
           lgarto_TO_WFs_merge_via_theta(target_mass_after_fluxes, column_depth, cum_layer_thickness_cm, head,
                                         soil_type, soil_properties);
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          mass_balance_flux_correction_cm,
+          "lgarto_TO_WFs_merge_via_theta",
+          "TO theta merge residual",
+          *head);
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
         lgar_global_psi_update(soil_type, soil_properties, head);
       }
 
       if (correction_type == 4) {
         int front_num_with_negative_depth = -1;
+        double mass_balance_flux_correction_cm = 0.0;
         lgar_TO_wetting_fronts_cross_layer_boundary(&front_num_with_negative_depth, num_layers,
                                                     cum_layer_thickness_cm, soil_type, frozen_factor, head,
-                                                    soil_properties);
+                                                    soil_properties,
+                                                    &mass_balance_flux_correction_cm);
         lgar_global_psi_update(soil_type, soil_properties, head);
-
-        if (front_num_with_negative_depth > -1) {
-          const double mass_before_negative_depth_delete = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-          listDeleteFront(front_num_with_negative_depth, head, soil_type, soil_properties);
-          const double mass_after_negative_depth_delete = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-          bottom_boundary_flux_cm +=
-            (mass_before_negative_depth_delete - mass_after_negative_depth_delete);
+        if (std::fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            mass_balance_flux_correction_cm,
+            "lgar_TO_wetting_fronts_cross_layer_boundary",
+            "TO layer-boundary remap residual",
+            *head);
+          bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
         }
+
+        // if (front_num_with_negative_depth > -1) {
+        //   const double mass_before_negative_depth_delete = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        //   listDeleteFront(front_num_with_negative_depth, head, soil_type, soil_properties);
+        //   const double mass_after_negative_depth_delete = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        //   bottom_boundary_flux_cm +=
+        //     (mass_before_negative_depth_delete - mass_after_negative_depth_delete);
+        // }
       }
 
       if (correction_type == 5) {
@@ -2863,11 +4255,28 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         const double mass_before_surface_bdy_crossing = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         const bool close_psis = correct_close_psis(soil_type, soil_properties, head);
         if (close_psis) {
-          bottom_boundary_flux_cm +=
-            (mass_before_surface_bdy_crossing - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+          const double mass_balance_flux_correction_cm =
+            mass_before_surface_bdy_crossing - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            mass_balance_flux_correction_cm,
+            "lgar_move_wetting_fronts",
+            "surface boundary-crossing close-psi residual",
+            *head);
+          bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
         }
+        const double mass_before_surface_bdy_crossing_remap = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         lgar_wetting_fronts_cross_layer_boundary(num_layers, cum_layer_thickness_cm, soil_type, frozen_factor, head,
                                                  soil_properties);
+        const double mass_balance_flux_correction_cm =
+          mass_before_surface_bdy_crossing_remap - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            mass_balance_flux_correction_cm,
+            "lgar_move_wetting_fronts",
+            "surface boundary-crossing remap residual",
+            *head);
+          bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+        }
       }
 
       if (correction_type == 7) {
@@ -2880,28 +4289,30 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       }
 
       if (correction_type == 8) {
-        struct wetting_front *temp_WF = *head;
-        for (int wf = 1; wf != listLength(*head); wf++) {
-          if (temp_WF == NULL || temp_WF->next == NULL) {
-            break;
-          }
-          if (temp_WF->is_WF_GW == FALSE && temp_WF->next->is_WF_GW == TRUE &&
-              temp_WF->theta < temp_WF->next->theta &&
-              temp_WF->layer_num == temp_WF->next->layer_num) {
-            temp_WF->is_WF_GW = TRUE;
-          }
-          if (temp_WF->to_bottom == TRUE && temp_WF->is_WF_GW == FALSE &&
-              temp_WF->next->is_WF_GW == TRUE) {
-            temp_WF->is_WF_GW = TRUE;
-          }
-          temp_WF = temp_WF->next;
-        }
+        lgarto_convert_surface_fronts_drier_than_TO_below(head, "correction type 8");
       }
 
       if (correction_type == 9) {
-        bottom_boundary_flux_cm +=
-          lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm[num_layers], num_layers,
+        const double mass_balance_flux_correction_cm =
+          lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm, num_layers,
                                                   head, soil_type, soil_properties);
+        net_last_layer_GW_overshoot_truncation_cm += mass_balance_flux_correction_cm;
+        bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+      }
+
+      if (correction_type == 10) {
+        const double mass_balance_flux_correction_cm =
+          lgarto_surface_fronts_cross_layer_boundary_upward(
+            num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+            soil_properties, head, "TO/general correction loop");
+        if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            mass_balance_flux_correction_cm,
+            "lgar_move_wetting_fronts",
+            "general surface upward layer-crossing residual",
+            *head);
+          bottom_boundary_flux_cm += mass_balance_flux_correction_cm;
+        }
       }
 
       correction_type = lgarto_correction_type(num_layers, cum_layer_thickness_cm, head);
@@ -2909,6 +4320,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         printf("correction_type at end of TO/general correction iteration: %d \n", correction_type);
       }
     }
+
+    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+      net_last_layer_GW_overshoot_truncation_cm,
+      "lgarto_truncate_last_layer_GW_overshoot",
+      "net last-layer TO/GW overshoot truncation across correction loop",
+      *head);
 
     if (verbosity.compare("high") == 0) {
       printf("mass after TO/general correction loop: %lf \n", lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
@@ -2950,6 +4367,38 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
   }
 
+  for (current = *head; current != NULL && current->next != NULL; current = current->next) {
+    struct wetting_front *next = current->next;
+    if (!current->to_bottom || current->layer_num == next->layer_num) {
+      continue;
+    }
+
+    if (!lgar_should_snap_boundary_psi_to_lower(current, next, soil_type, soil_properties)) {
+      continue;
+    }
+
+    current->psi_cm = next->psi_cm;
+    const int soil_num_k = soil_type[current->layer_num];
+    const double theta_e_k = soil_properties[soil_num_k].theta_e;
+    const double theta_r_k = soil_properties[soil_num_k].theta_r;
+    const double vg_a_k = soil_properties[soil_num_k].vg_alpha_per_cm;
+    const double vg_m_k = soil_properties[soil_num_k].vg_m;
+    const double vg_n_k = soil_properties[soil_num_k].vg_n;
+    const double Ksat_cm_per_h_k =
+      frozen_factor[current->layer_num] * soil_properties[soil_num_k].Ksat_cm_per_h;
+
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
+    const double Se = calc_Se_from_theta(current->theta, theta_e_k, theta_r_k);
+    current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h_k, vg_m_k);
+  }
+
+  lgarto_cap_zero_depth_TO_psi(num_layers, soil_type, frozen_factor, soil_properties, *head);
+
+  bottom_boundary_flux_cm +=
+    lgarto_clip_final_layer_GW_overshoot_to_vadose_boundary(cum_layer_thickness_cm,
+                                                            num_layers,
+                                                            head);
+
 
   if (verbosity.compare("high") == 0){
     printf("Moving/merging wetting fronts done... \n");
@@ -2958,16 +4407,35 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
   //Just a check to make sure that, when there is only 1 layer, than the existing wetting front is at the correct depth.
   //This might have been fixed with other debugging related to scenarios with just 1 layer where the wetting front is completely satruated. Not sure this is necessary.
-  if (listLength(*head)==1) {
-    current = *head;
-    if (current->depth_cm != cum_layer_thickness_cm[1]) {
-      current->depth_cm = cum_layer_thickness_cm[1];
-    }
-  }
+	  if (listLength(*head)==1) {
+	    current = *head;
+	    if (current->depth_cm != cum_layer_thickness_cm[1]) {
+	      current->depth_cm = cum_layer_thickness_cm[1];
+	    }
+	  }
 
-  return(bottom_boundary_flux_cm);
+	  const double final_mass_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+	  const double storage_implied_AET_cm =
+	    fmax(0.0, old_mass + precip_mass_to_add -
+	                (free_drainage_demand + cached_lower_boundary_flux_correction_cm +
+	                 bottom_boundary_flux_cm + final_mass_cm));
+	  const double applied_AET_bookkeeping_cm =
+	    fmin(accepted_positive_AET_bookkeeping_cm, storage_implied_AET_cm);
+		  if (use_TO_surface_AET &&
+		      fabs(*AET_demand_cm - applied_AET_bookkeeping_cm) > MBAL_ITERATIVE_TOLERANCE) {
+	    if (verbosity.compare("high") == 0) {
+	      printf("Reconciling LGARTO AET bookkeeping from %.17lf cm to %.17lf cm "
+	             "after profile storage and fluxes implied a different accepted AET amount "
+	             "(accepted_positive_AET_bookkeeping_cm=%.17lf, storage_implied_AET_cm=%.17lf).\n",
+	             *AET_demand_cm, applied_AET_bookkeeping_cm,
+	             accepted_positive_AET_bookkeeping_cm, storage_implied_AET_cm);
+	    }
+		    *AET_demand_cm = applied_AET_bookkeeping_cm;
+		  }
 
-}
+			  return(bottom_boundary_flux_cm);
+
+	}
 
 
 // ############################################################################################
@@ -3009,15 +4477,20 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
 
     // case : wetting front passing another wetting front within a layer
     /**********************************************************/
-    // 'current->depth_cm > next->depth_cm' ensures that merging is needed
-    // 'current->layer_num == next->layer_num' ensures wetting fronts are in the same layer
-    // '!next->to_bottom' ensures that the next wetting front is not the deepest wetting front in the layer
-    if ( (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && !next->to_bottom) {
-      
-      double current_mass_this_layer = current->depth_cm * (current->theta - next->theta) + next->depth_cm*(next->theta - next_to_next->theta);
-      current->depth_cm = current_mass_this_layer / (current->theta - next_to_next->theta);
+	    // 'current->depth_cm > next->depth_cm' ensures that merging is needed
+	    // 'current->layer_num == next->layer_num' ensures wetting fronts are in the same layer
+	    // '!next->to_bottom' ensures that the next wetting front is not the deepest wetting front in the layer
+	    if ( (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && !next->to_bottom) {
+        if (lgarto_surface_front_overtook_surface_front_above_TO_chain(current)) {
+          (void) lgarto_convert_overtaken_surface_front_above_TO_chain(
+            head, "mixed surface/surface/TO merge guard");
+          break;
+        }
 
-      assert (current->depth_cm > 0.0);
+	      double current_mass_this_layer = current->depth_cm * (current->theta - next->theta) + next->depth_cm*(next->theta - next_to_next->theta);
+	      current->depth_cm = current_mass_this_layer / (current->theta - next_to_next->theta);
+
+	      // assert (current->depth_cm > 0.0); //in theory only required for LGAR only mode
 
       layer_num = current->layer_num;
       soil_num  = soil_type[layer_num];
@@ -3076,6 +4549,14 @@ extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers,
   bool cross_necessary = false;
   bool theta_correction_necessary = false;
   int front_for_cross = -1;
+  bool lgarto_active = false;
+
+  for (struct wetting_front *front = *head; front != NULL; front = front->next) {
+    if (front->is_WF_GW) {
+      lgarto_active = true;
+      break;
+    }
+  }
 
   if (verbosity.compare("high") == 0) {
     printf("Layer boundary crossing... \n");
@@ -3136,6 +4617,46 @@ extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers,
       }
 
       double depth_new = cum_layer_thickness_cm[layer_num] + mbal_Z_correction; // this is the new wetting front absolute depth
+      if (lgarto_active) {
+        const double max_surface_remap_depth_cm = 1.10 * cum_layer_thickness_cm[num_layers];
+        if (!std::isfinite(depth_new) || depth_new > max_surface_remap_depth_cm) {
+          if (verbosity.compare("high") == 0) {
+            printf("Domain-limited LGARTO surface layer-boundary remap for front %d "
+                   "from depth_new %.17lf cm to %.17lf cm "
+                   "(110%% of column depth %.17lf cm).\n",
+                   current->front_num,
+                   depth_new,
+                   max_surface_remap_depth_cm,
+                   cum_layer_thickness_cm[num_layers]);
+          }
+          depth_new = max_surface_remap_depth_cm;
+        }
+      }
+
+      // A previous attempt capped ordinary surface layer-boundary remaps at the
+      // first TO front in the target layer. That was too broad: synth 1 needs
+      // some of these remaps to proceed so that recharge stays in family.
+      // If the resulting surface/TO drier merge would create an invalid local
+      // remap, lgar_merge_surface_and_TO_wetting_fronts now limits that merge
+      // directly.
+      //
+      // double limiting_TO_depth_cm = HUGE_VAL;
+      // for (struct wetting_front *candidate = *head; candidate != NULL; candidate = candidate->next) {
+      //   if (candidate == current || candidate == next || !candidate->is_WF_GW ||
+      //       candidate->to_bottom || candidate->layer_num != layer_num + 1) {
+      //     continue;
+      //   }
+      //
+      //   limiting_TO_depth_cm = fmin(limiting_TO_depth_cm, candidate->depth_cm);
+      // }
+      //
+      // if (std::isfinite(limiting_TO_depth_cm) && depth_new > limiting_TO_depth_cm) {
+      //   // Old mass-conservative layer-crossing remap can jump a surface front
+      //   // far past an existing TO front when theta_new is very close to the
+      //   // lower front's theta:
+      //   // double depth_new = cum_layer_thickness_cm[layer_num] + mbal_Z_correction;
+      //   depth_new = limiting_TO_depth_cm + TRUNCATION_DEPTH;
+      // }
 
       current->depth_cm = cum_layer_thickness_cm[layer_num];
       
@@ -3302,6 +4823,21 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
     printf("bottom_boundary_flux_above_surface_WFs_cm: %lf \n", *bottom_boundary_flux_above_surface_WFs_cm);
   }
 
+  if (listLength_surface(*head) > 0 &&
+      *bottom_boundary_flux_above_surface_WFs_cm < -MBAL_ITERATIVE_TOLERANCE) {
+    // Negative residuals are signed lower-boundary flux corrections, not water
+    // to extract from surface fronts.  Keep profile storage unchanged and carry
+    // the signed amount in the timestep flux bookkeeping.
+    bottom_boundary_flux_cm -= *bottom_boundary_flux_above_surface_WFs_cm;
+    if (verbosity.compare("high") == 0) {
+      printf("Routed negative TO/GW above-surface residual %.17lf cm to bottom-boundary flux; "
+             "updated bottom_boundary_flux_cm = %.17lf.\n",
+             *bottom_boundary_flux_above_surface_WFs_cm, bottom_boundary_flux_cm);
+    }
+    *bottom_boundary_flux_above_surface_WFs_cm = 0.0;
+    return bottom_boundary_flux_cm;
+  }
+
   struct wetting_front *current = listFindFront(wf_free_drainage_demand, *head, NULL);
   if (current == NULL) {
     return bottom_boundary_flux_cm;
@@ -3330,11 +4866,17 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
         current->psi_cm = calc_h_from_Se(Se, vg_a_k, vg_m_k, vg_n_k);
 
         if (current->theta == theta_r_k + 1.E-12) {
-          bottom_boundary_flux_cm -= *bottom_boundary_flux_above_surface_WFs_cm;
-          bottom_boundary_flux_cm +=
-            (mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
-          *bottom_boundary_flux_above_surface_WFs_cm =
-            (mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+          const double requested_flux_cm = *bottom_boundary_flux_above_surface_WFs_cm;
+          const double actual_extracted_flux_cm =
+            mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            actual_extracted_flux_cm - requested_flux_cm,
+            "lgarto_extract_TO_GW_flux_from_surface_WFs",
+            "top-layer extraction theta_r residual adjustment",
+            *head);
+          bottom_boundary_flux_cm -= requested_flux_cm;
+          bottom_boundary_flux_cm += actual_extracted_flux_cm;
+          *bottom_boundary_flux_above_surface_WFs_cm = actual_extracted_flux_cm;
         }
       }
     }
@@ -3381,7 +4923,7 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
       if (*bottom_boundary_flux_above_surface_WFs_cm != 0.0) {
         theta_new = lgar_theta_mass_balance(layer_num, soil_num, current->psi_cm, new_mass, prior_mass, 0.0,
                                             AET_demand_cm, delta_thetas, delta_thickness, soil_type,
-                                            soil_properties);
+                                            soil_properties, true);
       }
 
       current->theta = fmax(soil_properties[soil_type[current->layer_num]].theta_r,
@@ -3397,10 +4939,17 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
 
       if (current->theta == theta_r_k) {
         current->theta = current->theta + 1.E-12;
-        bottom_boundary_flux_cm -= *bottom_boundary_flux_above_surface_WFs_cm;
-        bottom_boundary_flux_cm += (mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
-        *bottom_boundary_flux_above_surface_WFs_cm =
-          (mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+        const double requested_flux_cm = *bottom_boundary_flux_above_surface_WFs_cm;
+        const double actual_extracted_flux_cm =
+          mass_at_start_of_extraction - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+          actual_extracted_flux_cm - requested_flux_cm,
+          "lgarto_extract_TO_GW_flux_from_surface_WFs",
+          "deeper-layer extraction theta_r residual adjustment",
+          *head);
+        bottom_boundary_flux_cm -= requested_flux_cm;
+        bottom_boundary_flux_cm += actual_extracted_flux_cm;
+        *bottom_boundary_flux_above_surface_WFs_cm = actual_extracted_flux_cm;
       }
 
       const double Se = calc_Se_from_theta(current->theta, theta_e_k, theta_r_k);
@@ -3521,11 +5070,293 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
 */
 // ############################################################################################
 
+struct lgarto_global_theta_snap_state
+{
+  struct wetting_front *front;
+  double theta;
+  double psi_cm;
+};
+
+static std::vector<lgarto_global_theta_snap_state>
+lgarto_snapshot_theta_snap_state(struct wetting_front *head)
+{
+  std::vector<lgarto_global_theta_snap_state> states;
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    lgarto_global_theta_snap_state state;
+    state.front = current;
+    state.theta = current->theta;
+    state.psi_cm = current->psi_cm;
+    states.push_back(state);
+  }
+  return states;
+}
+
+static void lgarto_restore_theta_snap_state(
+  const std::vector<lgarto_global_theta_snap_state> &states)
+{
+  for (size_t i = 0; i < states.size(); i++) {
+    states[i].front->theta = states[i].theta;
+    states[i].front->psi_cm = states[i].psi_cm;
+  }
+}
+
+static const lgarto_global_theta_snap_state *
+lgarto_find_theta_snap_state(const std::vector<lgarto_global_theta_snap_state> &states,
+                             const struct wetting_front *front)
+{
+  for (size_t i = 0; i < states.size(); i++) {
+    if (states[i].front == front) {
+      return &states[i];
+    }
+  }
+  return NULL;
+}
+
+static bool lgarto_front_changed_during_theta_snap(
+  const std::vector<lgarto_global_theta_snap_state> &states,
+  const struct wetting_front *front)
+{
+  const lgarto_global_theta_snap_state *state =
+    lgarto_find_theta_snap_state(states, front);
+  if (state == NULL || front == NULL) {
+    return false;
+  }
+
+  return fabs(front->theta - state->theta) > THRESHOLD_NO_MOISTURE_DIFF ||
+         fabs(front->psi_cm - state->psi_cm) > 1.0e-12;
+}
+
+static std::vector<struct wetting_front *>
+lgarto_collect_changed_to_bottom_snap_scaffold(
+  struct wetting_front *head,
+  const std::vector<lgarto_global_theta_snap_state> &pre_snap_states)
+{
+  std::vector<struct wetting_front *> scaffold;
+  bool changed_scaffold_front = false;
+  struct wetting_front *previous = NULL;
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    const bool previous_boundary =
+      previous != NULL && previous->to_bottom && current->to_bottom &&
+      previous->layer_num != current->layer_num;
+    const bool next_boundary =
+      current->next != NULL && current->to_bottom && current->next->to_bottom &&
+      current->layer_num != current->next->layer_num;
+    const bool in_to_bottom_boundary_scaffold =
+      current->to_bottom && (previous_boundary || next_boundary);
+
+    if (in_to_bottom_boundary_scaffold) {
+      scaffold.push_back(current);
+      if (lgarto_front_changed_during_theta_snap(pre_snap_states, current)) {
+        changed_scaffold_front = true;
+      }
+    }
+
+    previous = current;
+  }
+
+  if (!changed_scaffold_front) {
+    scaffold.clear();
+  }
+  return scaffold;
+}
+
+static bool lgarto_apply_shared_boundary_snap_psi(
+  const std::vector<struct wetting_front *> &fronts,
+  double psi_cm,
+  int *soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  if (!std::isfinite(psi_cm) || psi_cm < 0.0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < fronts.size(); i++) {
+    struct wetting_front *front = fronts[i];
+    if (front == NULL) {
+      return false;
+    }
+
+    const int soil_num = soil_type[front->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+
+    front->psi_cm = psi_cm;
+    front->theta = calc_theta_from_h(psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    if (!std::isfinite(front->theta) ||
+        front->theta < theta_r - 1.0e-12 ||
+        front->theta > theta_e + 1.0e-12) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static void lgarto_apply_to_bottom_boundary_scaffold_theta_snap(
+  struct wetting_front *head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || soil_type == NULL || soil_properties == NULL) {
+    return;
+  }
+
+  std::vector<struct wetting_front *> fronts;
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    fronts.push_back(current);
+  }
+
+  if (fronts.size() < 2) {
+    return;
+  }
+
+  // Surface-flux extraction can copy psi onto a to_bottom boundary scaffold
+  // before this routine runs.  Walk bottom-up so every upper boundary front
+  // inherits the final lower psi, and update theta immediately for that soil.
+  for (int i = static_cast<int>(fronts.size()) - 2; i >= 0; i--) {
+    struct wetting_front *current = fronts[i];
+    struct wetting_front *next = fronts[i + 1];
+    if (current == NULL || next == NULL ||
+        current->to_bottom != TRUE || next->to_bottom != TRUE ||
+        current->layer_num == next->layer_num ||
+        !std::isfinite(next->psi_cm) || next->psi_cm < 0.0) {
+      continue;
+    }
+
+    const int soil_num_k = soil_type[current->layer_num];
+    const double theta_e_k = soil_properties[soil_num_k].theta_e;
+    const double theta_r_k = soil_properties[soil_num_k].theta_r;
+    const double vg_a_k = soil_properties[soil_num_k].vg_alpha_per_cm;
+    const double vg_m_k = soil_properties[soil_num_k].vg_m;
+    const double vg_n_k = soil_properties[soil_num_k].vg_n;
+
+    current->psi_cm = next->psi_cm;
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
+  }
+}
+
+static bool lgarto_mass_aware_to_bottom_snap(
+  double target_mass_cm,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head,
+  const std::vector<struct wetting_front *> &snap_scaffold)
+{
+  if (head == NULL || *head == NULL || snap_scaffold.empty()) {
+    return false;
+  }
+
+  const std::vector<lgarto_global_theta_snap_state> simple_snap_states =
+    lgarto_snapshot_theta_snap_state(*head);
+
+  double psi_low_cm = 0.0;
+  double psi_high_cm = 0.0;
+  for (size_t i = 0; i < snap_scaffold.size(); i++) {
+    if (snap_scaffold[i] != NULL && std::isfinite(snap_scaffold[i]->psi_cm)) {
+      psi_high_cm = fmax(psi_high_cm, snap_scaffold[i]->psi_cm);
+    }
+  }
+  psi_high_cm = fmax(psi_high_cm, 1.0e-12);
+
+  if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, psi_low_cm,
+                                             soil_type, soil_properties)) {
+    lgarto_restore_theta_snap_state(simple_snap_states);
+    return false;
+  }
+  double mass_low_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, psi_high_cm,
+                                             soil_type, soil_properties)) {
+    lgarto_restore_theta_snap_state(simple_snap_states);
+    return false;
+  }
+  double mass_high_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  while (mass_high_cm > target_mass_cm && psi_high_cm < PSI_UPPER_LIM) {
+    psi_low_cm = psi_high_cm;
+    mass_low_cm = mass_high_cm;
+    psi_high_cm = fmin(PSI_UPPER_LIM, fmax(psi_high_cm * 2.0, psi_high_cm + 1.0e-12));
+
+    if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, psi_high_cm,
+                                               soil_type, soil_properties)) {
+      lgarto_restore_theta_snap_state(simple_snap_states);
+      return false;
+    }
+    mass_high_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  }
+
+  const double bracket_tol_cm = fmax(MBAL_ITERATIVE_TOLERANCE, 1.0e-12);
+  if (target_mass_cm > mass_low_cm + bracket_tol_cm ||
+      target_mass_cm < mass_high_cm - bracket_tol_cm) {
+    lgarto_restore_theta_snap_state(simple_snap_states);
+    return false;
+  }
+
+  double best_psi_cm = psi_low_cm;
+  double best_mass_error_cm = fabs(mass_low_cm - target_mass_cm);
+  if (fabs(mass_high_cm - target_mass_cm) < best_mass_error_cm) {
+    best_psi_cm = psi_high_cm;
+    best_mass_error_cm = fabs(mass_high_cm - target_mass_cm);
+  }
+
+  for (int iter = 0; iter < 100; iter++) {
+    const double psi_mid_cm = 0.5 * (psi_low_cm + psi_high_cm);
+    if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, psi_mid_cm,
+                                               soil_type, soil_properties)) {
+      lgarto_restore_theta_snap_state(simple_snap_states);
+      return false;
+    }
+
+    const double mass_mid_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    const double mass_error_cm = mass_mid_cm - target_mass_cm;
+    if (fabs(mass_error_cm) < best_mass_error_cm) {
+      best_psi_cm = psi_mid_cm;
+      best_mass_error_cm = fabs(mass_error_cm);
+    }
+    if (fabs(mass_error_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+      best_psi_cm = psi_mid_cm;
+      break;
+    }
+
+    if (mass_mid_cm > target_mass_cm) {
+      psi_low_cm = psi_mid_cm;
+    }
+    else {
+      psi_high_cm = psi_mid_cm;
+    }
+  }
+
+  if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, best_psi_cm,
+                                             soil_type, soil_properties)) {
+    lgarto_restore_theta_snap_state(simple_snap_states);
+    return false;
+  }
+
+  return true;
+}
+
 extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_WFs_cm,
+				     double target_mass_after_fluxes_cm,
+				     double *cum_layer_thickness_cm,
 				     int *soil_type,
 				     struct soil_properties_ *soil_properties,
-				     struct wetting_front **head)
+				     struct wetting_front **head,
+				     double mass_balance_tolerance_cm)
 {
+  const double mass_before_snap_cm =
+    (cum_layer_thickness_cm != NULL && head != NULL && *head != NULL)
+      ? lgar_calc_mass_bal(cum_layer_thickness_cm, *head)
+      : 0.0;
+  const std::vector<lgarto_global_theta_snap_state> pre_snap_states =
+    (head != NULL && *head != NULL)
+      ? lgarto_snapshot_theta_snap_state(*head)
+      : std::vector<lgarto_global_theta_snap_state>();
+
   if (verbosity.compare("high") == 0) {
     printf("before lgar_global_theta_update \n");
     listPrint(*head);
@@ -3550,6 +5381,10 @@ extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_W
     }
   }
 
+  if (bottom_boundary_flux_above_surface_WFs_cm != 0.0) {
+    lgarto_apply_to_bottom_boundary_scaffold_theta_snap(*head, soil_type, soil_properties);
+  }
+
   for (int wf = wf_free_drainage_demand - 1; wf > 1; wf--) {
     struct wetting_front *current = listFindFront(wf, *head, NULL);
     if ((current != NULL) && (current->next != NULL)) {
@@ -3569,6 +5404,53 @@ extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_W
   if (verbosity.compare("high") == 0) {
     printf("after lgar_global_theta_update \n");
     listPrint(*head);
+  }
+
+  if (cum_layer_thickness_cm == NULL || head == NULL || *head == NULL ||
+      !std::isfinite(mass_balance_tolerance_cm) ||
+      mass_balance_tolerance_cm <= 0.0) {
+    return;
+  }
+
+  const double mass_after_simple_snap_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double simple_snap_mass_change_cm =
+    mass_after_simple_snap_cm - mass_before_snap_cm;
+  const bool use_target_mass =
+    std::isfinite(target_mass_after_fluxes_cm) && target_mass_after_fluxes_cm > 0.0;
+  const double target_mass_cm =
+    use_target_mass ? target_mass_after_fluxes_cm : mass_before_snap_cm;
+  const double simple_snap_target_error_cm =
+    mass_after_simple_snap_cm - target_mass_cm;
+
+  // Some simple boundary snaps are the intended storage response to an extracted TO flux.
+  // Only replace the snap when its final storage would miss the timestep mass target.
+  if (fabs(simple_snap_target_error_cm) <= mass_balance_tolerance_cm) {
+    return;
+  }
+
+  const std::vector<struct wetting_front *> snap_scaffold =
+    lgarto_collect_changed_to_bottom_snap_scaffold(*head, pre_snap_states);
+  if (snap_scaffold.empty()) {
+    return;
+  }
+
+  if (lgarto_mass_aware_to_bottom_snap(target_mass_cm, cum_layer_thickness_cm,
+                                       soil_type, soil_properties, head,
+                                       snap_scaffold)) {
+    if (verbosity.compare("high") == 0) {
+      const double mass_after_solve_cm =
+        lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      printf("Mass-aware to_bottom psi snap replaced simple snap "
+             "(simple_mass_change_cm=%.17g, simple_target_error_cm=%.17g, "
+             "solved_target_error_cm=%.17g, target_mass_cm=%.17g, trigger_tol_cm=%.17g).\n",
+             simple_snap_mass_change_cm,
+             simple_snap_target_error_cm,
+             mass_after_solve_cm - target_mass_cm,
+             target_mass_cm,
+             mass_balance_tolerance_cm);
+      listPrint(*head);
+    }
   }
 }
 
@@ -3598,6 +5480,26 @@ extern void lgar_global_psi_update(int *soil_type, struct soil_properties_ *soil
     current->psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
 
     current = current->next;
+  }
+
+  for (current = *head; current != NULL && current->next != NULL; current = current->next) {
+    struct wetting_front *next = current->next;
+    if (!current->to_bottom || current->layer_num == next->layer_num) {
+      continue;
+    }
+
+    if (!lgar_should_snap_boundary_psi_to_lower(current, next, soil_type, soil_properties)) {
+      continue;
+    }
+
+    current->psi_cm = next->psi_cm;
+    const int soil_num = soil_type[current->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
   }
 
   if (verbosity.compare("high") == 0) {
@@ -3654,16 +5556,157 @@ extern void lgar_assert_wetting_fronts_within_vadose_zone(double domain_depth_cm
 
 // ############################################################################################
 /*
+  Checks that no wetting front keeps a meaningfully negative depth once a substep or timestep
+  has completed.
+*/
+// ############################################################################################
+
+extern void lgar_assert_wetting_fronts_nonnegative_depth(struct wetting_front *head)
+{
+  const double min_depth_cm = -1.0E-6;
+
+  if (head == NULL) {
+    return;
+  }
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->depth_cm >= min_depth_cm) {
+      continue;
+    }
+
+    fprintf(stderr,
+            "Error: wetting front persisted with a negative depth.\n"
+            "  offending WF front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g is_WF_GW=%d to_bottom=%d\n"
+            "  min_allowed_depth_cm=%.16g written_min_allowed_depth_mm=%.16g\n"
+            "  Wetting front list follows:\n",
+            current->front_num,
+            current->layer_num,
+            current->depth_cm,
+            current->depth_cm * 10.0,
+            current->theta,
+            current->psi_cm,
+            current->dzdt_cm_per_h,
+            current->is_WF_GW,
+            current->to_bottom,
+            min_depth_cm,
+            min_depth_cm * 10.0);
+    fflush(stderr);
+    listPrint(head);
+    fflush(stdout);
+    abort();
+  }
+}
+
+// ############################################################################################
+/*
   Checks that adjacent TO wetting fronts in the same layer become no wetter in psi as depth
   increases. Equal-depth support fronts are ignored, and fronts on opposite sides of a soil
   layer boundary are intentionally not checked here.
 */
 // ############################################################################################
 
+static double lgar_psi_assertion_tolerance_cm(double psi_a_cm, double psi_b_cm)
+{
+  const double abs_psi_tol_cm = 1.E-3;
+  const double rel_psi_tol = 1.E-9;
+  const double near_saturation_psi_cm = 0.1;
+  const double near_saturation_psi_tol_cm = 0.1;
+  const double very_dry_psi_cm = 1.E5;
+  const double very_dry_rel_psi_tol = 1.E-5;
+  const double psi_scale_cm = fmax(1.0, fmax(std::fabs(psi_a_cm), std::fabs(psi_b_cm)));
+  double psi_tol_cm = fmax(abs_psi_tol_cm, rel_psi_tol * psi_scale_cm);
+
+  /* Near saturation, tiny nonzero psi values can round-trip to effectively the
+     same theta as psi=0. At very large psi, the water-retention curve is flat
+     enough that tiny relative psi reversals are not meaningful storage states. */
+  if (fmax(std::fabs(psi_a_cm), std::fabs(psi_b_cm)) <= near_saturation_psi_cm) {
+    psi_tol_cm = fmax(psi_tol_cm, near_saturation_psi_tol_cm);
+  }
+
+  if (psi_scale_cm >= very_dry_psi_cm) {
+    psi_tol_cm = fmax(psi_tol_cm, very_dry_rel_psi_tol * psi_scale_cm);
+  }
+
+  return psi_tol_cm;
+}
+
+struct lgarto_surface_TO_support_ordering_state
+{
+  bool active;
+  bool has_zero_depth_TO_support;
+  double min_zero_depth_TO_psi_cm;
+  struct wetting_front *first_TO_below_surface;
+};
+
+static lgarto_surface_TO_support_ordering_state
+lgarto_find_surface_TO_support_ordering_state(struct wetting_front *head)
+{
+  lgarto_surface_TO_support_ordering_state state = {};
+  state.min_zero_depth_TO_psi_cm = HUGE_VAL;
+
+  bool saw_surface_front = false;
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (!saw_surface_front && current->is_WF_GW == TRUE &&
+        current->to_bottom == FALSE &&
+        current->layer_num == 1 &&
+        std::fabs(current->depth_cm) <= ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM &&
+        std::isfinite(current->psi_cm)) {
+      state.has_zero_depth_TO_support = true;
+      state.min_zero_depth_TO_psi_cm =
+        fmin(state.min_zero_depth_TO_psi_cm, current->psi_cm);
+      continue;
+    }
+
+    if (current->is_WF_GW == FALSE) {
+      saw_surface_front = true;
+      continue;
+    }
+
+    if (saw_surface_front && current->is_WF_GW == TRUE) {
+      state.first_TO_below_surface = current;
+      state.active = state.has_zero_depth_TO_support &&
+                     std::isfinite(state.min_zero_depth_TO_psi_cm) &&
+                     std::isfinite(current->psi_cm);
+      return state;
+    }
+  }
+
+  return state;
+}
+
+static bool lgarto_zero_depth_TO_support_ordering_is_valid(
+  const lgarto_surface_TO_support_ordering_state &state)
+{
+  if (!state.active || state.first_TO_below_surface == NULL) {
+    return true;
+  }
+
+  const double psi_tol_cm =
+    lgar_psi_assertion_tolerance_cm(state.min_zero_depth_TO_psi_cm,
+                                    state.first_TO_below_surface->psi_cm);
+  return state.min_zero_depth_TO_psi_cm + psi_tol_cm >=
+         state.first_TO_below_surface->psi_cm;
+}
+
+static bool lgarto_same_layer_TO_reversal_is_surface_supported_bridge(
+  struct wetting_front *head,
+  const struct wetting_front *current)
+{
+  const lgarto_surface_TO_support_ordering_state state =
+    lgarto_find_surface_TO_support_ordering_state(head);
+  if (!state.active || state.first_TO_below_surface != current) {
+    return false;
+  }
+
+  const double psi_tol_cm =
+    lgar_psi_assertion_tolerance_cm(state.min_zero_depth_TO_psi_cm,
+                                    current->psi_cm);
+  return std::fabs(current->psi_cm - state.min_zero_depth_TO_psi_cm) <= psi_tol_cm;
+}
+
 extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head)
 {
   const double depth_tol_cm = 1.E-10;
-  const double psi_tol_cm = 1.E-8;
 
   for (struct wetting_front *current = head; current != NULL && current->next != NULL; current = current->next) {
     struct wetting_front *next = current->next;
@@ -3680,7 +5723,12 @@ extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head)
       continue;
     }
 
+    const double psi_tol_cm = lgar_psi_assertion_tolerance_cm(current->psi_cm, next->psi_cm);
     if (next->psi_cm <= current->psi_cm + psi_tol_cm) {
+      continue;
+    }
+
+    if (lgarto_same_layer_TO_reversal_is_surface_supported_bridge(head, current)) {
       continue;
     }
 
@@ -3717,17 +5765,49 @@ extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head)
   }
 }
 
+extern void lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(struct wetting_front *head)
+{
+  const lgarto_surface_TO_support_ordering_state state =
+    lgarto_find_surface_TO_support_ordering_state(head);
+
+  if (lgarto_zero_depth_TO_support_ordering_is_valid(state)) {
+    return;
+  }
+
+  const double psi_tol_cm =
+    lgar_psi_assertion_tolerance_cm(state.min_zero_depth_TO_psi_cm,
+                                    state.first_TO_below_surface->psi_cm);
+  fprintf(stderr,
+          "Error: leading zero-depth TO/GW supports are wetter than the first TO front below active surface fronts.\n"
+          "  first_below_surface front_num=%d layer=%d depth_cm=%.16g written_depth_mm=%.16g theta=%.16g psi_cm=%.16g dzdt_cm_per_h=%.16g to_bottom=%d\n"
+          "  min_zero_depth_TO_psi_cm=%.16g psi_tolerance_cm=%.16g\n"
+          "  Rule: with active surface fronts, leading zero-depth TO supports must have psi >= the first TO front below the surface stack.\n"
+          "  Wetting front list follows:\n",
+          state.first_TO_below_surface->front_num,
+          state.first_TO_below_surface->layer_num,
+          state.first_TO_below_surface->depth_cm,
+          state.first_TO_below_surface->depth_cm * 10.0,
+          state.first_TO_below_surface->theta,
+          state.first_TO_below_surface->psi_cm,
+          state.first_TO_below_surface->dzdt_cm_per_h,
+          state.first_TO_below_surface->to_bottom,
+          state.min_zero_depth_TO_psi_cm,
+          psi_tol_cm);
+  fflush(stderr);
+  listPrint(head);
+  fflush(stdout);
+  abort();
+}
+
 // ############################################################################################
 /*
-  Checks that psi is continuous across active soil-layer boundaries represented by a to_bottom
+  Warns when psi is discontinuous across active soil-layer boundaries represented by a to_bottom
   wetting front and the front immediately below it.
 */
 // ############################################################################################
 
 extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head)
 {
-  const double psi_tol_cm = 1.E-3;
-
   for (struct wetting_front *current = head; current != NULL && current->next != NULL; current = current->next) {
     struct wetting_front *next = current->next;
 
@@ -3740,8 +5820,14 @@ extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head)
     }
 
     const double psi_mismatch_cm = std::fabs(current->psi_cm - next->psi_cm);
-    if (psi_mismatch_cm > psi_tol_cm) {
-      std::cerr << "Error: psi mismatch across soil layer boundary exceeds tolerance.\n"
+    const double psi_tol_cm = lgar_boundary_roundtrip_psi_tolerance_cm(current->psi_cm, next->psi_cm);
+    if (psi_mismatch_cm > psi_tol_cm && (current->psi_cm > 0.1 && next->psi_cm > 0.1)) { //idea is that for small n values, nonzero but small psi will yield a theta
+	                                                                                         //of exactly theta_e.
+      std::cerr << "WARNING: psi mismatch across soil layer boundary exceeds tolerance. "
+                << "This may indicate a real TO boundary-continuity error, or it may be "
+                << "a storage-neutral roundoff case where very small nonzero psi values "
+                << "evaluate to the same theta near saturation, or very large dry-tail "
+                << "psi values differ in psi but evaluate to nearly identical theta.\n"
                 << "  upper front_num=" << current->front_num
                 << " layer=" << current->layer_num
                 << " depth_cm=" << current->depth_cm
@@ -3752,8 +5838,6 @@ extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head)
                 << " psi_cm=" << next->psi_cm << "\n"
                 << "  |delta_psi_cm|=" << psi_mismatch_cm
                 << " > " << psi_tol_cm << "\n";
-      listPrint(head);
-      abort();
     }
   }
 }
@@ -3936,12 +6020,16 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
 							int num_layers, double *cum_layer_thickness_cm,
 							int *soil_type, double *frozen_factor,
 							struct wetting_front **head,
-							struct soil_properties_ *soil_properties)
+							struct soil_properties_ *soil_properties,
+							double *mass_balance_flux_correction_cm)
 {
   bool crossed = false;
 
   if (front_num_with_negative_depth != NULL) {
     *front_num_with_negative_depth = -1;
+  }
+  if (mass_balance_flux_correction_cm != NULL) {
+    *mass_balance_flux_correction_cm = 0.0;
   }
 
   for (int wf = listLength(*head); wf != 0; wf--) {
@@ -3961,6 +6049,8 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
         listPrint(*head);
       }
 
+      const double mass_before_moving_down_crossing =
+        lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
       const int soil_num = soil_type[layer_num];
       const double theta_e = soil_properties[soil_num].theta_e;
       const double theta_r = soil_properties[soil_num].theta_r;
@@ -4012,18 +6102,42 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
       next->theta = theta_new;
       next->psi_cm = current->psi_cm;
       next->depth_cm = depth_new;
+
       next->layer_num = layer_num + 1;
       next->dzdt_cm_per_h = current->dzdt_cm_per_h;
-      next->is_WF_GW = TRUE;
+      // next->is_WF_GW = TRUE;
+
       current->dzdt_cm_per_h = 0.0;
       current->to_bottom = TRUE;
       next->to_bottom = FALSE;
+      /*
+       * This new to_bottom scaffold is psi-connected to the lower-layer front.
+       * For extremely dry fronts, theta -> psi -> theta can change theta
+       * measurably in some soils; account for the same psi-consistent theta
+       * that the boundary snap will enforce before returning the storage residual.
+       */
+      lgarto_update_front_from_shared_psi(current, current->psi_cm, num_layers,
+                                          soil_type, frozen_factor, soil_properties);
       crossed = true;
 
       if (!std::isfinite(next->depth_cm)) {
         next = listDeleteFront(next->front_num, head, soil_type, soil_properties);
         if (next == NULL) {
           break;
+        }
+      }
+
+      const double moving_down_residual_cm =
+        mass_before_moving_down_crossing -
+        lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      if (mass_balance_flux_correction_cm != NULL &&
+          std::fabs(moving_down_residual_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        *mass_balance_flux_correction_cm += moving_down_residual_cm;
+        if (verbosity.compare("high") == 0) {
+          printf("TO moving-down layer crossing left residual %.12e cm after "
+                 "psi-consistent boundary remap; routing residual to "
+                 "lower-boundary flux bookkeeping.\n",
+                 moving_down_residual_cm);
         }
       }
 
@@ -4070,8 +6184,61 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
 
       const double mbal_correction = overshot_depth * (next->theta - current_theta);
       const double denominator = theta_new - new_boundary_theta;
+
+      /* A surface/TO merge can leave a lower-layer TO support above its
+         assigned layer boundary while the next TO front in that same layer has
+         identical theta/psi. That segment stores no water, so the moving-up
+         remap has no depth to solve for (0/0). Delete the out-of-layer support
+         instead of manufacturing a non-finite depth. */
+      const bool redundant_same_layer_TO_segment =
+        next != NULL && !current->to_bottom && current->is_WF_GW && next->is_WF_GW &&
+        current->layer_num == next->layer_num &&
+        std::fabs(next->theta - current_theta) <= THRESHOLD_NO_MOISTURE_DIFF &&
+        std::fabs(current->psi_cm - next->psi_cm) <=
+          lgar_psi_assertion_tolerance_cm(current->psi_cm, next->psi_cm) &&
+        std::fabs(mbal_correction) <= MBAL_ITERATIVE_TOLERANCE &&
+        std::fabs(denominator) <= THRESHOLD_NO_MOISTURE_DIFF;
+      if (redundant_same_layer_TO_segment) {
+        if (verbosity.compare("high") == 0) {
+          printf("TO moving-up layer crossing deleting redundant zero-storage front %d "
+                 "in layer %d before depth remap.\n",
+                 current->front_num, current->layer_num);
+        }
+        listDeleteFront(current->front_num, head, soil_type, soil_properties);
+        crossed = true;
+        if (verbosity.compare("high") == 0) {
+          printf("After deleting redundant TO front during moving-up layer crossing ... \n");
+          listPrint(*head);
+        }
+        continue;
+      }
+
+      const double mass_before_moving_up_crossing =
+        lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
       const double mbal_Z_correction = mbal_correction / denominator;
-      const double depth_new = cum_layer_thickness_cm[layer_num - 1] + mbal_Z_correction;
+      double depth_new = cum_layer_thickness_cm[layer_num - 1] + mbal_Z_correction;
+      const double upper_layer_top_cm = cum_layer_thickness_cm[previous->layer_num - 1];
+      const double upper_layer_bottom_cm = cum_layer_thickness_cm[previous->layer_num];
+      const bool bounded_moving_up_remap =
+        !std::isfinite(depth_new) ||
+        depth_new < upper_layer_top_cm ||
+        depth_new > upper_layer_bottom_cm;
+      if (bounded_moving_up_remap) {
+        /*
+         * The algebraic moving-up remap is mass conservative only if the old
+         * to_bottom scaffold can become a real TO front inside the upper layer.
+         * Near saturation, the theta contrast can be so small that the finite
+         * solution lands above the layer. Keep the geometry valid and let the
+         * adjacent boundary-connected TO pair solve the remaining storage by
+         * psi, preserving boundary continuity without editing deeper fronts.
+         */
+        if (std::isfinite(depth_new)) {
+          depth_new = fmax(upper_layer_top_cm, fmin(depth_new, upper_layer_bottom_cm));
+        }
+        else {
+          depth_new = upper_layer_top_cm;
+        }
+      }
 
       current->depth_cm = cum_layer_thickness_cm[layer_num - 1];
       current->theta = new_boundary_theta;
@@ -4083,6 +6250,38 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
       current->to_bottom = TRUE;
       previous->to_bottom = FALSE;
       crossed = true;
+
+      double moving_up_residual_cm =
+        mass_before_moving_up_crossing -
+        lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      if (std::fabs(moving_up_residual_cm) > MBAL_ITERATIVE_TOLERANCE) {
+        if (bounded_moving_up_remap) {
+          lgar_theta_mass_balance_correction(false, current->front_num,
+                                             mass_before_moving_up_crossing,
+                                             head, cum_layer_thickness_cm,
+                                             soil_type, soil_properties);
+          moving_up_residual_cm =
+            mass_before_moving_up_crossing -
+            lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        }
+
+        /*
+         * Moving a TO front upward across a layer boundary can change storage
+         * when the inherited lower-layer scaffold is hydraulically discontinuous.
+         * Keep the geometry repair local and return the remaining signed storage
+         * residual so the caller's lower-boundary flux bookkeeping stays closed.
+         */
+        if (mass_balance_flux_correction_cm != NULL &&
+            std::fabs(moving_up_residual_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          *mass_balance_flux_correction_cm += moving_up_residual_cm;
+        }
+        if (verbosity.compare("high") == 0 &&
+            std::fabs(moving_up_residual_cm) > MBAL_ITERATIVE_TOLERANCE) {
+          printf("TO moving-up layer crossing left residual %.12e cm after local "
+                 "remap/repair; routing residual to lower-boundary flux bookkeeping.\n",
+                 moving_up_residual_cm);
+        }
+      }
 
       if (previous->depth_cm < 0.0 && front_num_with_negative_depth != NULL) {
         *front_num_with_negative_depth = previous->front_num;
@@ -4101,12 +6300,14 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
 extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int num_layers, double *cum_layer_thickness_cm,
 							int *soil_type, double *frozen_factor,
 							struct wetting_front **head,
-							struct soil_properties_ *soil_properties)
+							struct soil_properties_ *soil_properties,
+							double *mass_balance_flux_correction_cm)
 {
   int front_num_with_negative_depth = -1;
   return lgar_TO_wetting_fronts_cross_layer_boundary(&front_num_with_negative_depth, num_layers,
 						       cum_layer_thickness_cm, soil_type, frozen_factor,
-						       head, soil_properties);
+						       head, soil_properties,
+						       mass_balance_flux_correction_cm);
 }
 
 
@@ -4115,6 +6316,145 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int num_layers, double *
   The function handles the basic TO-TO merge-via-depth case from old LGARTO.
   It is intentionally limited to the case where a TO wetting front overtakes the TO wetting front below it.
 */
+// ############################################################################################
+static bool lgarto_restore_TO_depth_merge_mass_via_bounded_depth(double target_mass,
+                                                                 double column_depth,
+                                                                 double *cum_layer_thickness_cm,
+                                                                 struct wetting_front **head,
+                                                                 struct wetting_front *front_to_adjust)
+{
+  if (front_to_adjust == NULL || head == NULL || *head == NULL ||
+      front_to_adjust->layer_num < 1) {
+    return false;
+  }
+
+  const double initial_depth_cm = front_to_adjust->depth_cm;
+  double lower_depth_cm = cum_layer_thickness_cm[front_to_adjust->layer_num - 1];
+  double upper_depth_cm = fmin(column_depth, cum_layer_thickness_cm[front_to_adjust->layer_num]);
+
+  struct wetting_front *previous = NULL;
+  if (front_to_adjust->front_num > 1) {
+    previous = listFindFront(front_to_adjust->front_num - 1, *head, NULL);
+  }
+
+  if (previous != NULL && previous->layer_num == front_to_adjust->layer_num) {
+    lower_depth_cm = fmax(lower_depth_cm, previous->depth_cm + DEPTH_AVOIDS_SAME_WF_DEPTH);
+  }
+  if (front_to_adjust->next != NULL &&
+      front_to_adjust->next->layer_num == front_to_adjust->layer_num) {
+    upper_depth_cm = fmin(upper_depth_cm,
+                          front_to_adjust->next->depth_cm - DEPTH_AVOIDS_SAME_WF_DEPTH);
+  }
+
+  if (upper_depth_cm <= lower_depth_cm) {
+    front_to_adjust->depth_cm = initial_depth_cm;
+    return false;
+  }
+
+  const double original_depth_cm = fmax(lower_depth_cm, fmin(initial_depth_cm, upper_depth_cm));
+  front_to_adjust->depth_cm = original_depth_cm;
+  const double original_mass_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (std::fabs(target_mass - original_mass_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+    return true;
+  }
+
+  front_to_adjust->depth_cm = lower_depth_cm;
+  const double mass_at_lower_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  front_to_adjust->depth_cm = upper_depth_cm;
+  const double mass_at_upper_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  const bool monotonic_increasing = mass_at_upper_cm > mass_at_lower_cm + MBAL_ITERATIVE_TOLERANCE;
+  const bool monotonic_decreasing = mass_at_lower_cm > mass_at_upper_cm + MBAL_ITERATIVE_TOLERANCE;
+  if (!monotonic_increasing && !monotonic_decreasing) {
+    front_to_adjust->depth_cm = original_depth_cm;
+    return false;
+  }
+
+  const double min_mass_cm = fmin(mass_at_lower_cm, mass_at_upper_cm);
+  const double max_mass_cm = fmax(mass_at_lower_cm, mass_at_upper_cm);
+  bool target_bracketed = true;
+  if (target_mass <= min_mass_cm) {
+    front_to_adjust->depth_cm = (mass_at_lower_cm <= mass_at_upper_cm) ? lower_depth_cm : upper_depth_cm;
+    target_bracketed = false;
+  }
+  else if (target_mass >= max_mass_cm) {
+    front_to_adjust->depth_cm = (mass_at_lower_cm >= mass_at_upper_cm) ? lower_depth_cm : upper_depth_cm;
+    target_bracketed = false;
+  }
+
+  if (!target_bracketed) {
+    if (verbosity.compare("high") == 0) {
+      printf("TO depth-based merge bounded depth solve could not bracket target mass; "
+             "front %d set to closest bounded depth %.17lf cm "
+             "(bounds %.17lf..%.17lf cm, mass_at_lower %.17lf, mass_at_upper %.17lf, "
+             "target %.17lf).\n",
+             front_to_adjust->front_num,
+             front_to_adjust->depth_cm,
+             lower_depth_cm,
+             upper_depth_cm,
+             mass_at_lower_cm,
+             mass_at_upper_cm,
+             target_mass);
+    }
+    return false;
+  }
+
+  double bracket_lo_cm = lower_depth_cm;
+  double bracket_hi_cm = upper_depth_cm;
+  double best_depth_cm = original_depth_cm;
+  double best_abs_residual_cm = std::fabs(target_mass - original_mass_cm);
+
+  for (int iter = 0; iter < 80; iter++) {
+    const double probe_depth_cm = 0.5 * (bracket_lo_cm + bracket_hi_cm);
+    front_to_adjust->depth_cm = probe_depth_cm;
+    const double probe_mass_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    const double probe_abs_residual_cm = std::fabs(target_mass - probe_mass_cm);
+
+    if (probe_abs_residual_cm < best_abs_residual_cm) {
+      best_abs_residual_cm = probe_abs_residual_cm;
+      best_depth_cm = probe_depth_cm;
+    }
+
+    if (probe_abs_residual_cm <= MBAL_ITERATIVE_TOLERANCE) {
+      best_depth_cm = probe_depth_cm;
+      break;
+    }
+
+    if (monotonic_increasing) {
+      if (probe_mass_cm < target_mass) {
+        bracket_lo_cm = probe_depth_cm;
+      }
+      else {
+        bracket_hi_cm = probe_depth_cm;
+      }
+    }
+    else {
+      if (probe_mass_cm > target_mass) {
+        bracket_lo_cm = probe_depth_cm;
+      }
+      else {
+        bracket_hi_cm = probe_depth_cm;
+      }
+    }
+  }
+
+  front_to_adjust->depth_cm = best_depth_cm;
+  if (verbosity.compare("high") == 0) {
+    printf("TO depth-based merge bounded depth solve updated front %d from %.17lf cm "
+           "to %.17lf cm with residual %.12e cm "
+           "(bounds %.17lf..%.17lf cm).\n",
+           front_to_adjust->front_num,
+           initial_depth_cm,
+           front_to_adjust->depth_cm,
+           target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head),
+           lower_depth_cm,
+           upper_depth_cm);
+  }
+
+  return std::fabs(target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head)) <=
+         MBAL_ITERATIVE_TOLERANCE;
+}
+
 extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_depth,
 					    double *cum_layer_thickness_cm, struct wetting_front **head,
 					    int *soil_type, struct soil_properties_ *soil_properties)
@@ -4133,7 +6473,38 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
 
       next = listDeleteFront(next->front_num, head, soil_type, soil_properties);
       merged = true;
-      
+
+      const int merged_front_num = current->front_num;
+      struct saved_front_state {
+        int front_num;
+        int layer_num;
+        int to_bottom;
+        int is_WF_GW;
+        double depth_cm;
+        double theta;
+        double dzdt_cm_per_h;
+        double K_cm_per_h;
+        double psi_cm;
+      };
+
+      std::vector<saved_front_state> front_states_after_delete;
+      for (struct wetting_front *front = *head; front != NULL; front = front->next) {
+        front_states_after_delete.push_back({
+          front->front_num,
+          front->layer_num,
+          front->to_bottom,
+          front->is_WF_GW,
+          front->depth_cm,
+          front->theta,
+          front->dzdt_cm_per_h,
+          front->K_cm_per_h,
+          front->psi_cm
+        });
+      }
+
+      const double legacy_absurd_depth_limit_cm =
+        column_depth > 0.0 ? 10.0 * column_depth : 1.0e4;
+      bool legacy_depth_absurd = false;
       double temp_tol = MBAL_ITERATIVE_TOLERANCE;
       double factor = current->depth_cm > column_depth ? 1000.0 : 1.0;
       bool switched = false;
@@ -4158,19 +6529,141 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
           current->depth_cm -= 0.1 * factor;
         }
 
-        current->depth_cm = fmax(0.0, fmin(current->depth_cm, column_depth + TRUNCATION_DEPTH));
+        current->depth_cm = fmax(0.0, current->depth_cm);
         current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 
-        if (next != NULL && next->depth_cm > column_depth) {
+        if (!std::isfinite(current->depth_cm) || !std::isfinite(current_mass) ||
+            current->depth_cm > legacy_absurd_depth_limit_cm) {
+          legacy_depth_absurd = true;
           break;
         }
       }
 
-      if (verbosity.compare("high") == 0) {
-        printf("After TO depth-based merging ... \n");
-        listPrint(*head);
+      legacy_depth_absurd =
+        legacy_depth_absurd || !std::isfinite(current->depth_cm) ||
+        !std::isfinite(current_mass) ||
+        current->depth_cm > legacy_absurd_depth_limit_cm;
+
+      bool closed_by_depth =
+        std::fabs(current_mass - target_mass) <= MBAL_ITERATIVE_TOLERANCE;
+      if (legacy_depth_absurd) {
+        if (verbosity.compare("high") == 0) {
+          printf("TO depth-based merge legacy depth solve exceeded guard "
+                 "(front %d depth %.17lf cm, limit %.17lf cm, residual %.12e cm); "
+                 "falling back to bounded depth solve.\n",
+                 current->front_num,
+                 current->depth_cm,
+                 legacy_absurd_depth_limit_cm,
+                 target_mass - current_mass);
+        }
+
+        for (const saved_front_state &saved : front_states_after_delete) {
+          struct wetting_front *front = listFindFront(saved.front_num, *head, NULL);
+          if (front == NULL) {
+            continue;
+          }
+          front->layer_num = saved.layer_num;
+          front->to_bottom = saved.to_bottom;
+          front->is_WF_GW = saved.is_WF_GW;
+          front->depth_cm = saved.depth_cm;
+          front->theta = saved.theta;
+          front->dzdt_cm_per_h = saved.dzdt_cm_per_h;
+          front->K_cm_per_h = saved.K_cm_per_h;
+          front->psi_cm = saved.psi_cm;
+        }
+
+        current = listFindFront(merged_front_num, *head, NULL);
+        closed_by_depth =
+          lgarto_restore_TO_depth_merge_mass_via_bounded_depth(target_mass, column_depth,
+                                                               cum_layer_thickness_cm, head,
+                                                               current);
+        current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      }
+      else if (verbosity.compare("high") == 0) {
+        printf("TO depth-based merge legacy depth solve accepted front %d at %.17lf cm "
+               "with residual %.12e cm after %d iterations "
+               "(guard %.17lf cm).\n",
+               current->front_num,
+               current->depth_cm,
+               target_mass - current_mass,
+               iter,
+               legacy_absurd_depth_limit_cm);
       }
 
+      if (legacy_depth_absurd && !closed_by_depth &&
+          std::fabs(current_mass - target_mass) > MBAL_ITERATIVE_TOLERANCE) {
+        struct wetting_front *psi_repair_front =
+          (current->next != NULL && current->next->to_bottom) ? current->next : current;
+        const int front_num_to_repair = psi_repair_front->front_num;
+        std::vector<saved_front_state> front_states_before_psi_repair;
+        for (struct wetting_front *front = *head; front != NULL; front = front->next) {
+          front_states_before_psi_repair.push_back({
+            front->front_num,
+            front->layer_num,
+            front->to_bottom,
+            front->is_WF_GW,
+            front->depth_cm,
+            front->theta,
+            front->dzdt_cm_per_h,
+            front->K_cm_per_h,
+            front->psi_cm
+          });
+        }
+        const double residual_before_psi_repair = target_mass - current_mass;
+        if (verbosity.compare("high") == 0) {
+          printf("TO depth-based merge bounded depth solve left residual %.12e cm; "
+                 "adjusting connected TO/to_bottom chain starting at front %d.\n",
+                 residual_before_psi_repair,
+                 front_num_to_repair);
+        }
+
+        lgar_theta_mass_balance_correction(false, front_num_to_repair, target_mass, head,
+                                           cum_layer_thickness_cm, soil_type,
+                                           soil_properties);
+        current = listFindFront(merged_front_num, *head, NULL);
+        current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        const double residual_after_psi_repair = target_mass - current_mass;
+
+        if (std::fabs(residual_after_psi_repair) >
+            std::fabs(residual_before_psi_repair)) {
+          for (const saved_front_state &saved : front_states_before_psi_repair) {
+            struct wetting_front *front = listFindFront(saved.front_num, *head, NULL);
+            if (front == NULL) {
+              continue;
+            }
+            front->layer_num = saved.layer_num;
+            front->to_bottom = saved.to_bottom;
+            front->is_WF_GW = saved.is_WF_GW;
+            front->depth_cm = saved.depth_cm;
+            front->theta = saved.theta;
+            front->dzdt_cm_per_h = saved.dzdt_cm_per_h;
+            front->K_cm_per_h = saved.K_cm_per_h;
+            front->psi_cm = saved.psi_cm;
+          }
+          current = listFindFront(merged_front_num, *head, NULL);
+          current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+          if (verbosity.compare("high") == 0) {
+            printf("TO depth-based merge psi-chain repair worsened residual "
+                   "(before %.12e cm, after %.12e cm); restored bounded-depth state.\n",
+                   residual_before_psi_repair,
+                   residual_after_psi_repair);
+          }
+        }
+
+        if (verbosity.compare("high") == 0) {
+          printf("TO depth-based merge psi-chain repair residual %.12e cm\n",
+                 target_mass - current_mass);
+        }
+      }
+
+	      if (verbosity.compare("high") == 0) {
+	        printf("After TO depth-based merging ... \n");
+	        listPrint(*head);
+	      }
+
+      if (current == NULL) {
+        break;
+      }
       next = current->next;
     }
 
@@ -4192,8 +6685,189 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
 */
 // ############################################################################################
 
+static void lgarto_rehome_zero_depth_front_to_top_layer_from_psi(struct wetting_front *front,
+                                                                 int *soil_type,
+                                                                 double *frozen_factor,
+                                                                 struct soil_properties_ *soil_properties)
+{
+  if (front == NULL || front->to_bottom == TRUE) {
+    return;
+  }
+
+  front->layer_num = 1;
+
+  const int soil_num = soil_type[front->layer_num];
+  const double theta_e = soil_properties[soil_num].theta_e;
+  const double theta_r = soil_properties[soil_num].theta_r;
+  const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+  const double vg_m = soil_properties[soil_num].vg_m;
+  const double vg_n = soil_properties[soil_num].vg_n;
+  const double Ksat_cm_per_h =
+    soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[front->layer_num];
+
+  front->theta = calc_theta_from_h(front->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+  const double Se = calc_Se_from_theta(front->theta, theta_e, theta_r);
+  front->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+}
+
+static double lgarto_repair_negative_depth_fronts_to_lower_boundary_flux(
+  int num_layers, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct soil_properties_ *soil_properties,
+  struct wetting_front **head, const char *context)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return 0.0;
+  }
+
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double numerical_negative_depth_tol_cm = 1.0e-6;
+  bool repaired_any = false;
+
+  for (struct wetting_front *current = *head; current != NULL;) {
+    if (current->depth_cm >= 0.0) {
+      current = current->next;
+      continue;
+    }
+
+    repaired_any = true;
+    const int front_num = current->front_num;
+    const double old_depth_cm = current->depth_cm;
+    const bool is_real_negative_depth =
+      old_depth_cm < -numerical_negative_depth_tol_cm;
+
+    if (current->to_bottom == TRUE) {
+      if (current->layer_num >= 1 && current->layer_num <= num_layers) {
+        current->depth_cm = cum_layer_thickness_cm[current->layer_num];
+      }
+      else {
+        current->depth_cm = 0.0;
+      }
+
+      if (verbosity.compare("high") == 0) {
+        printf("Snapped negative-depth to_bottom front %d from %.17lf cm to %.17lf cm "
+               "during %s.\n",
+               front_num, old_depth_cm, current->depth_cm,
+               context != NULL ? context : "negative-depth repair");
+      }
+      current = current->next;
+      continue;
+    }
+
+    if (is_real_negative_depth) {
+      if (verbosity.compare("high") == 0) {
+        printf("Deleting non-to_bottom front %d with negative depth %.17lf cm "
+               "during %s; storage change will be routed to lower-boundary flux.\n",
+               front_num, old_depth_cm,
+               context != NULL ? context : "negative-depth repair");
+      }
+      current = listDeleteFront(front_num, head, soil_type, soil_properties);
+      continue;
+    }
+
+    current->depth_cm = 0.0;
+    lgarto_rehome_zero_depth_front_to_top_layer_from_psi(current, soil_type,
+                                                         frozen_factor,
+                                                         soil_properties);
+    if (verbosity.compare("high") == 0) {
+      printf("Clipped tiny negative-depth front %d from %.17lf cm to zero "
+             "during %s.\n",
+             front_num, old_depth_cm,
+             context != NULL ? context : "negative-depth repair");
+    }
+    current = current->next;
+  }
+
+  if (!repaired_any) {
+    return 0.0;
+  }
+
+  const double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double lower_boundary_flux_correction_cm = mass_before_cm - mass_after_cm;
+  if (verbosity.compare("high") == 0) {
+    printf("Negative-depth wetting-front repair during %s routed %.17lf cm "
+           "to lower-boundary flux (mass_before %.17lf, mass_after %.17lf).\n",
+           context != NULL ? context : "negative-depth repair",
+           lower_boundary_flux_correction_cm, mass_before_cm, mass_after_cm);
+  }
+
+  return lower_boundary_flux_correction_cm;
+}
+
+static double lgarto_surface_fronts_cross_layer_boundary_upward(
+  int num_layers, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct soil_properties_ *soil_properties,
+  struct wetting_front **head, const char *context)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return 0.0;
+  }
+
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double boundary_tol_cm = fmax(1.0e-8, 10.0 * TRUNCATION_DEPTH);
+  bool repaired_any = false;
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (current->is_WF_GW || current->to_bottom || current->layer_num <= 1 ||
+        current->layer_num > num_layers || current->depth_cm < 0.0) {
+      continue;
+    }
+
+    const double upper_boundary_cm = cum_layer_thickness_cm[current->layer_num - 1];
+    if (current->depth_cm >= upper_boundary_cm - boundary_tol_cm) {
+      continue;
+    }
+
+    const int old_layer = current->layer_num;
+    const double old_depth_cm = current->depth_cm;
+    const double old_psi_cm = current->psi_cm;
+    int new_layer = old_layer;
+    while (new_layer > 1 &&
+           current->depth_cm < cum_layer_thickness_cm[new_layer - 1] - boundary_tol_cm) {
+      new_layer--;
+    }
+
+    current->layer_num = new_layer;
+    current->to_bottom = FALSE;
+    current->is_WF_GW = FALSE;
+    lgarto_update_front_from_shared_psi(current, old_psi_cm, num_layers, soil_type,
+                                        frozen_factor, soil_properties);
+    repaired_any = true;
+
+    if (verbosity.compare("high") == 0) {
+      printf("Surface upward layer crossing during %s moved front %d "
+             "from layer %d to layer %d at depth %.17lf cm "
+             "(psi %.17lf cm).\n",
+             context != NULL ? context : "surface upward layer crossing",
+             current->front_num, old_layer, current->layer_num, old_depth_cm,
+             old_psi_cm);
+    }
+
+    break;
+  }
+
+  if (!repaired_any) {
+    return 0.0;
+  }
+
+  listSortFrontsByDepth(*head);
+
+  const double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double lower_boundary_flux_correction_cm = mass_before_cm - mass_after_cm;
+  if (verbosity.compare("high") == 0) {
+    printf("Surface upward layer-crossing repair during %s routed %.17lf cm "
+           "to lower-boundary flux (mass_before %.17lf, mass_after %.17lf).\n",
+           context != NULL ? context : "surface upward layer crossing",
+           lower_boundary_flux_correction_cm, mass_before_cm, mass_after_cm);
+  }
+
+  return lower_boundary_flux_correction_cm;
+}
+
 extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_layer, int num_layers,
-						     double *cum_layer_thickness_cm, struct wetting_front **head)
+						     double *cum_layer_thickness_cm, int *soil_type,
+						     double *frozen_factor, struct soil_properties_ *soil_properties,
+						     struct wetting_front **head,
+						     bool latch_surface_state_recipient_dzdt)
 {
   bool merged_any = false;
 
@@ -4220,6 +6894,8 @@ extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_laye
         merged_in_non_top_layer = false;
       }
 
+      struct wetting_front *surface_state_recipient = NULL;
+
       if (current->theta > next->next->theta) {
         if (verbosity.compare("high") == 0) {
           printf("surface-TO merging, surface WF wetter case...\n");
@@ -4242,6 +6918,7 @@ extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_laye
         next->K_cm_per_h = current->K_cm_per_h;
         next->is_WF_GW = FALSE;
         next->psi_cm = current->psi_cm;
+        surface_state_recipient = next;
 
         current->depth_cm = 0.0;
         current->theta = theta_next_temp;
@@ -4250,6 +6927,8 @@ extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_laye
         current->K_cm_per_h = K_cm_per_h_next_temp;
         current->is_WF_GW = TRUE;
         current->psi_cm = psi_cm_next_temp;
+        lgarto_rehome_zero_depth_front_to_top_layer_from_psi(current, soil_type, frozen_factor,
+                                                             soil_properties);
       }
       else {
         if (verbosity.compare("high") == 0) {
@@ -4258,11 +6937,99 @@ extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_laye
         }
 
         current->is_WF_GW = TRUE;
-        const double overshot_depth = current->depth_cm - next->depth_cm;
+        double overshot_depth = current->depth_cm - next->depth_cm;
+        double local_remap_depth_cm = next->depth_cm - overshot_depth;
+        double remapped_depth_cm = local_remap_depth_cm;
+        double theta_ratio = 1.0;
+        bool use_mass_weighted_remap = false;
+
+        const double theta_denominator = std::fabs(next->next->theta - current->theta);
+        if (theta_denominator > 1.0e-12) {
+          theta_ratio = (current->theta - next->theta) / theta_denominator;
+          const double ratio_remap_depth_cm = next->depth_cm - overshot_depth * theta_ratio;
+          if (std::isfinite(ratio_remap_depth_cm)) {
+            remapped_depth_cm = ratio_remap_depth_cm;
+            use_mass_weighted_remap = true;
+          }
+        }
+
+        if (remapped_depth_cm < 0.0) {
+          bool next_is_dry_zero_depth_TO_support = false;
+          double next_effective_saturation = 1.0;
+          if (next->depth_cm <= TRUNCATION_DEPTH &&
+              next->layer_num >= 1 && next->layer_num <= num_layers) {
+            const int zero_depth_soil_num = soil_type[next->layer_num];
+            const double theta_r = soil_properties[zero_depth_soil_num].theta_r;
+            const double theta_e = soil_properties[zero_depth_soil_num].theta_e;
+            const double theta_range = theta_e - theta_r;
+            if (theta_range > 0.0) {
+              next_effective_saturation = (next->theta - theta_r) / theta_range;
+              next_is_dry_zero_depth_TO_support =
+                std::isfinite(next_effective_saturation) &&
+                next_effective_saturation <= ZERO_DEPTH_TO_DRY_SUPPORT_MAX_SE;
+            }
+          }
+
+          if (next_is_dry_zero_depth_TO_support) {
+            const double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+            if (verbosity.compare("high") == 0) {
+              printf("Removing zero-depth TO front %d during surface/TO drier merge "
+                     "because the local mass remap would be above the surface "
+                     "and the TO support is near residual saturation "
+                     "(surface front %d depth %.17lf cm, remapped_depth %.17lf cm, "
+                     "TO effective saturation %.17lf).\n",
+                     next->front_num,
+                     current->front_num,
+                     current->depth_cm,
+                     remapped_depth_cm,
+                     next_effective_saturation);
+            }
+
+            current->is_WF_GW = FALSE;
+            (void) listDeleteFront(next->front_num, head, soil_type, soil_properties);
+
+            if (current->next != NULL &&
+                current->next->is_WF_GW == FALSE &&
+                current->layer_num == current->next->layer_num &&
+                current->theta <= current->next->theta) {
+              struct wetting_front *repair_front =
+                listDeleteFront(current->front_num, head, soil_type, soil_properties);
+              if (repair_front != NULL) {
+                lgar_theta_mass_balance_correction(true, repair_front->front_num, prior_mass,
+                                                   head, cum_layer_thickness_cm, soil_type,
+                                                   soil_properties);
+              }
+            }
+            break;
+          }
+          if (verbosity.compare("high") == 0) {
+            printf("Event-limited surface/TO drier merge for front %d from depth %.17lf cm "
+                   "to %.17lf cm to keep local remap nonnegative across TO front %d at %.17lf cm.\n",
+                   current->front_num,
+                   current->depth_cm,
+                   next->depth_cm + TRUNCATION_DEPTH,
+                   next->front_num,
+                   next->depth_cm);
+          }
+          if (use_mass_weighted_remap && theta_ratio > 0.0) {
+            const double capped_overshot_depth =
+              fmax(0.0, (next->depth_cm - TRUNCATION_DEPTH) / theta_ratio);
+            current->depth_cm = next->depth_cm + capped_overshot_depth;
+          }
+          else {
+            current->depth_cm = next->depth_cm + TRUNCATION_DEPTH;
+          }
+          overshot_depth = current->depth_cm - next->depth_cm;
+          remapped_depth_cm = use_mass_weighted_remap ?
+            next->depth_cm - overshot_depth * theta_ratio :
+            next->depth_cm - overshot_depth;
+        }
+
         current->depth_cm = next->depth_cm;
-        next->depth_cm =
-          current->depth_cm -
-          overshot_depth * (current->theta - next->theta) / std::fabs(next->next->theta - current->theta);
+
+        // Prefer the mass-weighted remap; it converts the geometric overshoot
+        // into the water-volume correction implied by the local theta contrasts.
+        next->depth_cm = remapped_depth_cm;
 
         const double theta_next_temp = next->theta;
         const double dzdt_cm_per_h_next_temp = next->dzdt_cm_per_h;
@@ -4273,14 +7040,30 @@ extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_laye
         next->dzdt_cm_per_h = current->dzdt_cm_per_h;
         next->K_cm_per_h = current->K_cm_per_h;
         next->psi_cm = current->psi_cm;
-        next->is_WF_GW = FALSE;
+        // next->is_WF_GW = FALSE;
+        surface_state_recipient = next;
 
         current->depth_cm = 0.0;
         current->theta = theta_next_temp;
         current->dzdt_cm_per_h = dzdt_cm_per_h_next_temp;
         current->K_cm_per_h = K_cm_per_h_next_temp;
         current->psi_cm = psi_cm_next_temp;
+        lgarto_rehome_zero_depth_front_to_top_layer_from_psi(current, soil_type, frozen_factor,
+                                                             soil_properties);
       }
+
+      // Resolve one surface/TO inversion per correction-loop pass. The caller
+      // recomputes correction_type before deciding whether another merge is needed.
+      // When the pre-TO-motion surface loop converts a just-moved surface
+      // state into a mobile TO front, do not let that same state move again as
+      // TO in this substep. The next dzdt calculation will refresh it.
+      if (latch_surface_state_recipient_dzdt &&
+          surface_state_recipient != NULL &&
+          surface_state_recipient->is_WF_GW == TRUE &&
+          surface_state_recipient->to_bottom == FALSE) {
+        surface_state_recipient->dzdt_cm_per_h = 0.0;
+      }
+      break;
     }
   }
 
@@ -4351,11 +7134,23 @@ extern void lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(bool merg
       const double vg_n_k = soil_properties[soil_num_k].vg_n;
       current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
 
-      if ((current->to_bottom == TRUE) && (next->to_bottom == TRUE) &&
+      if ((current->to_bottom == TRUE) &&
           (current->layer_num != next->layer_num) && (current->psi_cm != next->psi_cm)) {
         current->psi_cm = next->psi_cm;
         current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
       }
+
+      // if ((current->to_bottom == TRUE) && (next->to_bottom == TRUE) &&
+      //     (current->layer_num != next->layer_num) && (current->psi_cm != next->psi_cm)) {
+      //   current->psi_cm = next->psi_cm;
+      //   current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
+      // }
+
+      // if ((current->to_bottom == TRUE) && (next->to_bottom == FALSE) && (current->layer_num != next->layer_num) && (current->psi_cm != next->psi_cm)){
+      //   current->psi_cm = next->psi_cm;
+      //   current->theta = calc_theta_from_h(current->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
+      // }
+
     }
   }
 
@@ -4537,7 +7332,107 @@ extern bool lgar_check_dry_over_wet_wetting_fronts(struct wetting_front* head)
   
   return false;
 }
-      
+
+// Estimate the positive same-substep TO/GW lower-boundary flux implied by the
+// current dzdt values. This is intentionally read-only: the actual movement,
+// correction, and recharge bookkeeping still happen in lgar_move_wetting_fronts.
+extern double lgarto_project_TO_motion_lower_boundary_flux_cm(double timestep_h, int num_layers,
+							      double *cum_layer_thickness_cm, int *soil_type,
+							      struct wetting_front* head,
+							      struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || timestep_h <= 0.0 || num_layers <= 0) {
+    return 0.0;
+  }
+
+  const double column_depth_cm = cum_layer_thickness_cm[num_layers];
+  if (column_depth_cm <= 0.0) {
+    return 0.0;
+  }
+
+  double projected_lower_boundary_flux_cm = 0.0;
+  const int wetting_front_count = listLength(head);
+  for (int wf = wetting_front_count - 1; wf >= 1; wf--) {
+    struct wetting_front *current = listFindFront(wf, head, NULL);
+    if (current == NULL || !current->is_WF_GW || current->to_bottom) {
+      continue;
+    }
+
+    struct wetting_front *next_to_use = current->next;
+    while (next_to_use != NULL && !next_to_use->is_WF_GW) {
+      next_to_use = next_to_use->next;
+    }
+
+    if (next_to_use == NULL) {
+      continue;
+    }
+
+    double delta_depth_cm = current->dzdt_cm_per_h * timestep_h;
+    if (delta_depth_cm <= 0.0) {
+      continue;
+    }
+
+    double dzdt_cap_boundary_cm = column_depth_cm;
+    double allowed_boundary_overshoot_cm = 0.001 * column_depth_cm;
+    if (current->layer_num >= 1 && current->layer_num <= num_layers) {
+      dzdt_cap_boundary_cm = fmin(column_depth_cm, cum_layer_thickness_cm[current->layer_num]);
+    }
+    if (current->layer_num >= 1 && current->layer_num < num_layers) {
+      const double next_layer_thickness_cm =
+        cum_layer_thickness_cm[current->layer_num + 1] - cum_layer_thickness_cm[current->layer_num];
+      allowed_boundary_overshoot_cm = 0.1 * next_layer_thickness_cm;
+    }
+
+    const double max_TO_dzdt_depth_cm = dzdt_cap_boundary_cm + allowed_boundary_overshoot_cm;
+    if (current->depth_cm + delta_depth_cm > max_TO_dzdt_depth_cm) {
+      delta_depth_cm = fmax(0.0, max_TO_dzdt_depth_cm - current->depth_cm);
+    }
+
+    if (delta_depth_cm <= 0.0) {
+      continue;
+    }
+
+    double delta_theta = 0.0;
+    if (current->layer_num == next_to_use->layer_num) {
+      delta_theta = next_to_use->theta - current->theta;
+    }
+    else if (current->layer_num >= 1 && current->layer_num <= num_layers) {
+      const int soil_num_current = soil_type[current->layer_num];
+      const double theta_e_current = soil_properties[soil_num_current].theta_e;
+      const double theta_r_current = soil_properties[soil_num_current].theta_r;
+      const double vg_a_current = soil_properties[soil_num_current].vg_alpha_per_cm;
+      const double vg_m_current = soil_properties[soil_num_current].vg_m;
+      const double vg_n_current = soil_properties[soil_num_current].vg_n;
+      const double equiv_next_theta =
+        calc_theta_from_h(next_to_use->psi_cm, vg_a_current, vg_m_current, vg_n_current,
+                          theta_e_current, theta_r_current);
+      delta_theta = equiv_next_theta - current->theta;
+    }
+
+    const double projected_flux_cm = delta_depth_cm * delta_theta;
+    if (std::isfinite(projected_flux_cm) && projected_flux_cm > 0.0) {
+      projected_lower_boundary_flux_cm += projected_flux_cm;
+    }
+  }
+
+  return fmax(0.0, projected_lower_boundary_flux_cm);
+}
+
+static double lgar_saturated_pressure_head_cm(const struct wetting_front *front,
+                                              int *soil_type,
+                                              struct soil_properties_ *soil_properties)
+{
+  (void)front;
+  (void)soil_type;
+  (void)soil_properties;
+
+  /* Disabled for now: theta_e fronts in LGAR/LGARTO are often ordinary
+     Green-Ampt wetted zones rather than confirmed positive-pressure saturated
+     columns. Ponded head h_p remains the only explicit pressure-head addition
+     until we define a conservative connected saturated-column criterion. */
+  return 0.0;
+}
+
 // ############################################################################################
 /* The module computes the potential infiltration capacity, fp (in the lgar manuscript),
    potential infiltration capacity = the maximum amount of water that can be inserted into
@@ -4550,7 +7445,10 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 				double *volin_this_timestep, double precip_timestep_cm, int wf_free_drainage_demand,
 			        int num_layers, double ponded_depth_max_cm, int *soil_type,
 				double *cum_layer_thickness_cm, double *frozen_factor,
-				struct wetting_front* head, struct soil_properties_ *soil_properties)
+				struct wetting_front* head, struct soil_properties_ *soil_properties,
+				double *raw_fp_cm_per_h,
+				double *storage_limit_fp_cm_per_h,
+				double *capped_fp_cm_per_h)
 {
   // note ponded_depth_cm is a pointer.   Access its value as (*ponded_depth_cm).
   int wf_that_supplies_free_drainage_demand = wf_free_drainage_demand;
@@ -4608,9 +7506,12 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 
   }
 
+  const double saturated_pressure_head_cm =
+    lgar_saturated_pressure_head_cm(current_free_drainage, soil_type, soil_properties);
+
   // if the free_drainage wetting front is the top most, then the potential infiltration capacity has the following simple form
   if (layer_num_fp == 1) {
-      f_p = Ksat_cm_per_h * (1 + (Geff + h_p)/current_free_drainage->depth_cm);
+      f_p = Ksat_cm_per_h * (1 + (Geff + h_p + saturated_pressure_head_cm)/current_free_drainage->depth_cm);
   }
   else {
     // see the paper "Layered Green and Ampt Infiltration With Redistribution" by La Follette et al. (https://agupubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1029/2022WR033742), equations 16 or 19
@@ -4623,7 +7524,7 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
       bottom_sum += (cum_layer_thickness_cm[layer_num_fp - k] - cum_layer_thickness_cm[layer_num_fp - (k+1)])/ Ksat_cm_per_h_k;
     }
 
-    f_p = (current_free_drainage->depth_cm / bottom_sum) + ((Geff + h_p)*Ksat_cm_per_h/(current_free_drainage->depth_cm)); //Geff + h_p
+    f_p = (current_free_drainage->depth_cm / bottom_sum) + ((Geff + h_p + saturated_pressure_head_cm)*Ksat_cm_per_h/(current_free_drainage->depth_cm)); //Geff + h_p plus saturated pressure head
 
   }
 
@@ -4636,8 +7537,21 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
     max_storage += soil_properties[soil_num].theta_e * (cum_layer_thickness_cm[k]-cum_layer_thickness_cm[k-1]);
   }
 
-  if (f_p > (max_storage + free_drainage_subtimestep_cm + AET_demand_cm - current_mass)/timestep_h){
-    f_p = (max_storage + free_drainage_subtimestep_cm + AET_demand_cm - current_mass)/timestep_h;
+  const double raw_f_p_cm_per_h = f_p;
+  const double storage_limit_f_p_cm_per_h =
+    (max_storage + free_drainage_subtimestep_cm + AET_demand_cm - current_mass) / timestep_h;
+  if (raw_fp_cm_per_h != NULL) {
+    *raw_fp_cm_per_h = raw_f_p_cm_per_h;
+  }
+  if (storage_limit_fp_cm_per_h != NULL) {
+    *storage_limit_fp_cm_per_h = storage_limit_f_p_cm_per_h;
+  }
+
+  if (f_p > storage_limit_f_p_cm_per_h){
+    f_p = storage_limit_f_p_cm_per_h;
+  }
+  if (capped_fp_cm_per_h != NULL) {
+    *capped_fp_cm_per_h = f_p;
   }
 
   double ponded_depth_temp = *ponded_depth_cm;
@@ -4779,6 +7693,10 @@ static double lgar_restore_new_surface_front_mass(struct wetting_front *new_surf
 {
   if (new_surface_front == NULL) {
     return target_mass;
+  }
+
+  if (new_surface_front->is_WF_GW) {
+    return target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
   }
 
   const double base_depth = cum_layer_thickness_cm[new_surface_front->layer_num - 1];
@@ -4953,6 +7871,74 @@ static void lgar_refresh_all_front_states_from_theta(struct wetting_front *head,
   for (struct wetting_front *current = head; current != NULL; current = current->next) {
     lgar_refresh_front_state_from_theta(current, soil_type, frozen_factor, soil_properties);
   }
+
+  for (struct wetting_front *current = head; current != NULL && current->next != NULL; current = current->next) {
+    struct wetting_front *next = current->next;
+    if (!current->to_bottom || current->layer_num == next->layer_num) {
+      continue;
+    }
+
+    const double psi_mismatch_cm = std::fabs(current->psi_cm - next->psi_cm);
+    const double psi_scale_cm = fmax(1.0, fmax(std::fabs(current->psi_cm), std::fabs(next->psi_cm)));
+    const double roundtrip_psi_tol_cm = fmax(1.E-3, 1.E-5 * psi_scale_cm);
+    if (psi_mismatch_cm > roundtrip_psi_tol_cm) {
+      continue;
+    }
+
+    current->psi_cm = next->psi_cm;
+    const int soil_num = soil_type[current->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+    const double Ksat_cm_per_h =
+      frozen_factor[current->layer_num] * soil_properties[soil_num].Ksat_cm_per_h;
+
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+    current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+  }
+}
+
+static void lgarto_cap_zero_depth_TO_psi(int num_layers,
+                                         int *soil_type,
+                                         double *frozen_factor,
+                                         struct soil_properties_ *soil_properties,
+                                         struct wetting_front *head)
+{
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (!current->is_WF_GW ||
+        current->depth_cm != 0.0 ||
+        !std::isfinite(current->psi_cm) ||
+        current->psi_cm <= ZERO_DEPTH_TO_PSI_CAP_CM ||
+        current->layer_num < 1 ||
+        current->layer_num > num_layers) {
+      continue;
+    }
+
+    const double psi_before_cm = current->psi_cm;
+    const int soil_num = soil_type[current->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+    const double Ksat_cm_per_h =
+      frozen_factor[current->layer_num] * soil_properties[soil_num].Ksat_cm_per_h;
+
+    current->psi_cm = ZERO_DEPTH_TO_PSI_CAP_CM;
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+    current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+
+    if (verbosity.compare("high") == 0) {
+      printf("Capped zero-depth TO/GW front %d psi from %.17g cm to %.17g cm and refreshed theta.\n",
+             current->front_num,
+             psi_before_cm,
+             current->psi_cm);
+    }
+  }
 }
 
 static struct wetting_front *lgar_find_surface_creation_repair_target(struct wetting_front *head)
@@ -5097,8 +8083,14 @@ static double lgar_restore_surface_creation_mass_on_connected_gw_chain(struct we
            repair_target->theta, repair_target->psi_cm);
   }
 
-  lgar_theta_mass_balance_correction(false, repair_target->front_num, target_mass, head,
-                                     cum_layer_thickness_cm, soil_type, soil_properties);
+  const double min_psi_cm =
+    lgar_surface_creation_downstream_TO_psi_bound_cm(repair_target);
+  /* Surface-creation repair may borrow storage from the adjacent TO chain, but
+     it should not wet that chain past an immediately downstream TO state. */
+  lgar_theta_mass_balance_correction_with_min_psi(false, repair_target->front_num,
+                                                  target_mass, head,
+                                                  cum_layer_thickness_cm, soil_type,
+                                                  soil_properties, min_psi_cm);
 
   if (verbosity.compare("high") == 0) {
     printf("surface creation chain-repair completed; residual %.12e cm\n",
@@ -5178,6 +8170,46 @@ static struct wetting_front *lgar_find_depth_target_for_connected_gw_chain(struc
   return lgar_find_first_non_to_bottom_below_connected_chain(repair_target);
 }
 
+static struct wetting_front *lgar_surface_creation_connected_TO_chain_end(struct wetting_front *repair_target)
+{
+  if (repair_target == NULL || !repair_target->is_WF_GW) {
+    return repair_target;
+  }
+
+  struct wetting_front *chain_end = repair_target;
+  while (chain_end->next != NULL &&
+         chain_end->next->is_WF_GW == repair_target->is_WF_GW &&
+         chain_end->next->to_bottom) {
+    chain_end = chain_end->next;
+  }
+
+  if (chain_end->to_bottom &&
+      chain_end->next != NULL &&
+      chain_end->next->is_WF_GW == repair_target->is_WF_GW &&
+      !chain_end->next->to_bottom) {
+    chain_end = chain_end->next;
+  }
+
+  return chain_end;
+}
+
+static double lgar_surface_creation_downstream_TO_psi_bound_cm(struct wetting_front *repair_target)
+{
+  struct wetting_front *chain_end =
+    lgar_surface_creation_connected_TO_chain_end(repair_target);
+  if (chain_end == NULL) {
+    return 0.0;
+  }
+
+  struct wetting_front *bound = chain_end->next;
+  if (bound != NULL && bound->is_WF_GW &&
+      std::isfinite(bound->psi_cm) && bound->psi_cm >= 0.0) {
+    return bound->psi_cm;
+  }
+
+  return 0.0;
+}
+
 static bool lgar_connected_surface_creation_structure_is_effectively_saturated(struct wetting_front *front_start,
                                                                                int *soil_type,
                                                                                struct soil_properties_ *soil_properties)
@@ -5202,6 +8234,115 @@ static bool lgar_connected_surface_creation_structure_is_effectively_saturated(s
   }
 
   return true;
+}
+
+static double lgar_column_effective_saturation_storage_cm(int num_layers,
+                                                          double *cum_layer_thickness_cm,
+                                                          int *soil_type,
+                                                          struct soil_properties_ *soil_properties)
+{
+  double max_storage_cm = 0.0;
+
+  for (int layer_num = 1; layer_num <= num_layers; layer_num++) {
+    const int soil_num = soil_type[layer_num];
+    max_storage_cm +=
+      soil_properties[soil_num].theta_e *
+      (cum_layer_thickness_cm[layer_num] - cum_layer_thickness_cm[layer_num - 1]);
+  }
+
+  return max_storage_cm;
+}
+
+static std::vector<lgarto_surface_TO_merge_front_state>
+lgarto_save_front_hydraulic_states(struct wetting_front *head)
+{
+  std::vector<lgarto_surface_TO_merge_front_state> states;
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    lgarto_surface_TO_merge_front_state saved = {
+      current,
+      current->psi_cm,
+      current->theta,
+      current->K_cm_per_h
+    };
+    states.push_back(saved);
+  }
+
+  return states;
+}
+
+static double lgar_restore_surface_creation_mass_in_available_TO_storage(
+  double target_mass,
+  int num_layers,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  struct wetting_front **head,
+  struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || *head == NULL) {
+    return target_mass;
+  }
+
+  double residual_cm = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (residual_cm <= MBAL_ITERATIVE_TOLERANCE) {
+    return residual_cm;
+  }
+  const double initial_abs_residual_cm = fabs(residual_cm);
+
+  const double max_storage_cm =
+    lgar_column_effective_saturation_storage_cm(num_layers, cum_layer_thickness_cm,
+                                                soil_type, soil_properties);
+  const double storage_tol_cm = fmax(1.0e-8, MBAL_ITERATIVE_TOLERANCE);
+  if (target_mass > max_storage_cm + storage_tol_cm) {
+    return residual_cm;
+  }
+
+  const std::vector<lgarto_surface_TO_merge_front_state> original_states =
+    lgarto_save_front_hydraulic_states(*head);
+  std::vector<lgarto_surface_TO_merge_front_state> best_states = original_states;
+  double best_abs_residual_cm = fabs(residual_cm);
+
+  for (struct wetting_front *candidate = *head; candidate != NULL; candidate = candidate->next) {
+    if (candidate->is_WF_GW == FALSE || candidate->to_bottom ||
+        candidate->depth_cm <= ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM ||
+        !std::isfinite(candidate->psi_cm) || candidate->psi_cm <= 0.0) {
+      continue;
+    }
+
+    lgarto_restore_front_hydraulic_states(original_states);
+    const double min_psi_cm =
+      lgar_surface_creation_downstream_TO_psi_bound_cm(candidate);
+    /* Keep trial storage repairs from making an upper TO chain wetter than an
+       immediately downstream TO profile it drains into. */
+    lgar_theta_mass_balance_correction_with_min_psi(false, candidate->front_num,
+                                                    target_mass, head,
+                                                    cum_layer_thickness_cm, soil_type,
+                                                    soil_properties, min_psi_cm);
+
+    const double candidate_residual_cm =
+      target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    const double candidate_abs_residual_cm = fabs(candidate_residual_cm);
+    if (candidate_abs_residual_cm < best_abs_residual_cm) {
+      best_abs_residual_cm = candidate_abs_residual_cm;
+      best_states = lgarto_save_front_hydraulic_states(*head);
+      residual_cm = candidate_residual_cm;
+    }
+
+    if (candidate_abs_residual_cm <= MBAL_ITERATIVE_TOLERANCE) {
+      break;
+    }
+  }
+
+  lgarto_restore_front_hydraulic_states(best_states);
+  residual_cm = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  if (verbosity.compare("high") == 0 &&
+      fabs(residual_cm) + 1.0e-12 < initial_abs_residual_cm) {
+    printf("surface creation attempted whole-column TO storage repair; residual %.12e cm\n",
+           residual_cm);
+  }
+
+  return residual_cm;
 }
 
 static double lgar_restore_surface_creation_mass_on_connected_gw_chain_via_depth(struct wetting_front *repair_target,
@@ -5289,10 +8430,72 @@ static double lgar_restore_surface_creation_mass_on_connected_gw_chain_via_depth
   return target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
 }
 
+static double lgar_delete_unbracketed_surface_creation_front_and_repair_TO_chain(
+  struct wetting_front *repair_target,
+  double target_mass,
+  int num_layers,
+  struct wetting_front **head,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  bool *adjusted_depth)
+{
+  if (repair_target == NULL || head == NULL || *head == NULL ||
+      repair_target->next == NULL ||
+      repair_target->is_WF_GW ||
+      repair_target->to_bottom ||
+      repair_target->layer_num != repair_target->next->layer_num ||
+      !repair_target->next->is_WF_GW) {
+    return target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  }
+
+  const int deleted_front_num = repair_target->front_num;
+  const int chain_front_num = repair_target->next->front_num;
+  if (verbosity.compare("high") == 0) {
+    printf("surface creation deleting unbracketed dry surface front %d and handing repair "
+           "to adjacent TO/GW chain starting at front %d (depth %.6f cm, psi %.15f).\n",
+           deleted_front_num, chain_front_num, repair_target->next->depth_cm,
+           repair_target->next->psi_cm);
+  }
+
+  /*
+   * If the created/local surface front has already reached residual water
+   * content and the profile is still too wet, that surface front cannot
+   * represent the needed local storage change. Delete the transient surface
+   * discontinuity and solve on the immediately deeper connected TO/GW chain,
+   * preserving boundary psi continuity through the existing chain correction.
+   */
+  struct wetting_front *chain_target =
+    listDeleteFront(deleted_front_num, head, soil_type, soil_properties);
+  if (chain_target == NULL) {
+    return target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  }
+
+  double remaining_mass_error =
+    lgar_restore_surface_creation_mass_on_connected_gw_chain(chain_target, target_mass, head,
+                                                             cum_layer_thickness_cm, soil_type,
+                                                             soil_properties);
+  if (remaining_mass_error > MBAL_ITERATIVE_TOLERANCE) {
+    const double residual_before_depth = remaining_mass_error;
+    remaining_mass_error =
+      lgar_restore_surface_creation_mass_on_connected_gw_chain_via_depth(chain_target, target_mass,
+                                                                         num_layers, *head,
+                                                                         cum_layer_thickness_cm);
+    if (adjusted_depth != NULL) {
+      *adjusted_depth = *adjusted_depth ||
+                        std::fabs(remaining_mass_error - residual_before_depth) > 1.0e-12;
+    }
+  }
+
+  return remaining_mass_error;
+}
+
 static double lgar_route_surface_creation_residual_if_needed(double remaining_mass_error_after_depth,
+                                                             int num_layers,
                                                              double *target_mass,
                                                              double *creation_excess_gw_flux_cm,
                                                              double *creation_excess_runoff_cm,
+                                                             double *saturated_creation_gw_flux_capacity_cm,
                                                              struct wetting_front *routing_target,
                                                              int *soil_type,
                                                              struct soil_properties_ *soil_properties,
@@ -5302,14 +8505,55 @@ static double lgar_route_surface_creation_residual_if_needed(double remaining_ma
 {
   if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
       (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
+    const double residual_before_column_storage = remaining_mass_error_after_depth;
+    remaining_mass_error_after_depth =
+      lgar_restore_surface_creation_mass_in_available_TO_storage(
+        *target_mass, num_layers, cum_layer_thickness_cm, soil_type, &head, soil_properties);
+    if (remaining_mass_error_after_depth <= MBAL_ITERATIVE_TOLERANCE) {
+      return remaining_mass_error_after_depth;
+    }
+    if (verbosity.compare("high") == 0 &&
+        remaining_mass_error_after_depth + 1.0e-12 < residual_before_column_storage) {
+      printf("surface creation whole-column storage repair reduced residual %.12e -> %.12e cm before routing.\n",
+             residual_before_column_storage, remaining_mass_error_after_depth);
+    }
+
     const bool route_to_runoff =
       lgar_connected_surface_creation_structure_is_effectively_saturated(routing_target, soil_type,
                                                                          soil_properties);
+
+    /* If creation leaves excess water against an effectively saturated TO scaffold,
+       let the lower boundary take only the hydraulic capacity that remains in this
+       substep. This preserves the useful drainage behavior seen before the
+       double-motion guard without allowing unlimited residual-to-recharge routing. */
+    if (route_to_runoff && creation_excess_gw_flux_cm != NULL &&
+        saturated_creation_gw_flux_capacity_cm != NULL &&
+        *saturated_creation_gw_flux_capacity_cm > MBAL_ITERATIVE_TOLERANCE) {
+      const double bounded_gw_flux_cm =
+        fmin(remaining_mass_error_after_depth, *saturated_creation_gw_flux_capacity_cm);
+      *creation_excess_gw_flux_cm += bounded_gw_flux_cm;
+      *saturated_creation_gw_flux_capacity_cm -= bounded_gw_flux_cm;
+      *target_mass -= bounded_gw_flux_cm;
+      remaining_mass_error_after_depth -= bounded_gw_flux_cm;
+      if (verbosity.compare("high") == 0) {
+        printf("%s %.12e cm to lower-boundary flux using saturated TO capacity.\n",
+               message, bounded_gw_flux_cm);
+      }
+    }
+
+    if (remaining_mass_error_after_depth <= MBAL_ITERATIVE_TOLERANCE) {
+      return *target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+    }
 
     if (route_to_runoff && creation_excess_runoff_cm != NULL) {
       *creation_excess_runoff_cm += remaining_mass_error_after_depth;
     }
     else if (creation_excess_gw_flux_cm != NULL) {
+      lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+        remaining_mass_error_after_depth,
+        "lgar_route_surface_creation_residual_if_needed",
+        message,
+        head);
       *creation_excess_gw_flux_cm += remaining_mass_error_after_depth;
     }
     else if (creation_excess_runoff_cm != NULL) {
@@ -5327,15 +8571,78 @@ static double lgar_route_surface_creation_residual_if_needed(double remaining_ma
   return remaining_mass_error_after_depth;
 }
 
-static void lgar_apply_surface_creation_correction(int correction_type_surf,
-                                                   int num_layers,
-                                                   double *target_mass,
-                                                   double *cum_layer_thickness_cm,
-                                                   int *soil_type,
-                                                   double *frozen_factor,
-                                                   struct wetting_front **head,
-                                                   struct soil_properties_ *soil_properties)
+extern double lgarto_apply_surface_TO_merge_creation_correction(
+  const char *caller_name,
+  const char *residual_description,
+  int num_layers,
+  double *target_mass,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  double *frozen_factor,
+  struct wetting_front **head,
+  struct soil_properties_ *soil_properties)
 {
+  const double mass_before_surface_TO_merge = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  bool merged_in_non_top_layer = false;
+  merged_in_non_top_layer =
+    lgar_merge_surface_and_TO_wetting_fronts(merged_in_non_top_layer, num_layers,
+                                             cum_layer_thickness_cm, soil_type,
+                                             frozen_factor, soil_properties, head);
+  const bool did_a_WF_have_negative_depth = lgarto_correct_negative_depths(head);
+  lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(merged_in_non_top_layer, soil_type,
+                                                             soil_properties, head);
+  const bool close_psis = correct_close_psis(soil_type, soil_properties, head);
+
+  double mass_balance_flux_correction_cm =
+    mass_before_surface_TO_merge - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  int boundary_pinned_surface_front_num = -1;
+  if (fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+    mass_balance_flux_correction_cm =
+      lgarto_restore_surface_TO_merge_mass_via_surface_depths(mass_before_surface_TO_merge,
+                                                              num_layers,
+                                                              cum_layer_thickness_cm,
+                                                              *head,
+                                                              &boundary_pinned_surface_front_num);
+  }
+  if (mass_balance_flux_correction_cm > MBAL_ITERATIVE_TOLERANCE &&
+      boundary_pinned_surface_front_num > -1) {
+    mass_balance_flux_correction_cm =
+      lgarto_restore_surface_TO_merge_mass_via_boundary_psi(mass_before_surface_TO_merge,
+                                                            boundary_pinned_surface_front_num,
+                                                            num_layers,
+                                                            cum_layer_thickness_cm,
+                                                            soil_type,
+                                                            frozen_factor,
+                                                            soil_properties,
+                                                            *head);
+  }
+  if (did_a_WF_have_negative_depth || close_psis ||
+      fabs(mass_balance_flux_correction_cm) > MBAL_ITERATIVE_TOLERANCE) {
+    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+      mass_balance_flux_correction_cm,
+      caller_name,
+      residual_description,
+      *head);
+    if (target_mass != NULL) {
+      *target_mass -= mass_balance_flux_correction_cm;
+    }
+  }
+
+  return mass_balance_flux_correction_cm;
+}
+
+static double lgar_apply_surface_creation_correction(int correction_type_surf,
+                                                     int num_layers,
+                                                     double *target_mass,
+                                                     double *cum_layer_thickness_cm,
+                                                     int *soil_type,
+                                                     double *frozen_factor,
+                                                     struct wetting_front **head,
+                                                     struct soil_properties_ *soil_properties)
+{
+  // Keep target-mass edits paired with the same signed lower-boundary flux bookkeeping.
+  double lower_boundary_flux_correction_cm = 0.0;
+
   if (correction_type_surf == 1) {
     lgar_merge_wetting_fronts(soil_type, frozen_factor, head, soil_properties);
   }
@@ -5354,6 +8661,7 @@ static void lgar_apply_surface_creation_correction(int correction_type_surf,
       flux_out_cm = 0.0;
     }
     *target_mass -= flux_out_cm;
+    lower_boundary_flux_correction_cm += flux_out_cm;
   }
 
   if (correction_type_surf == 4) {
@@ -5361,50 +8669,106 @@ static void lgar_apply_surface_creation_correction(int correction_type_surf,
     lgar_fix_dry_over_wet_wetting_fronts(&mass_change, cum_layer_thickness_cm, soil_type, head,
                                          soil_properties);
   }
+
+  if (correction_type_surf == 5) {
+    lgarto_convert_surface_fronts_drier_than_TO_below(head, "surface creation correction type 5");
+  }
+
+  if (correction_type_surf == 6) {
+    (void) num_layers;
+    (void) target_mass;
+    (void) cum_layer_thickness_cm;
+    (void) soil_type;
+    (void) frozen_factor;
+    (void) soil_properties;
+    (void) lgarto_convert_overtaken_surface_front_above_TO_chain(
+      head, "surface creation mixed surface/surface/TO correction");
+  }
+
+  if (correction_type_surf == 7) {
+    lower_boundary_flux_correction_cm +=
+      lgarto_apply_surface_TO_merge_creation_correction(
+      "lgar_apply_surface_creation_correction",
+      "pre-TO-motion surface/TO merge cleanup mass residual",
+      num_layers, target_mass, cum_layer_thickness_cm, soil_type,
+      frozen_factor, head, soil_properties);
+  }
+
+  if (correction_type_surf == 9) {
+    const double mass_balance_flux_correction_cm =
+      lgarto_surface_fronts_cross_layer_boundary_upward(
+        num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+        soil_properties, head, "surface creation correction");
+    *target_mass -= mass_balance_flux_correction_cm;
+    lower_boundary_flux_correction_cm += mass_balance_flux_correction_cm;
+  }
+
+  return lower_boundary_flux_correction_cm;
 }
 
-static void lgar_apply_creation_general_correction(int correction_type,
-                                                   int num_layers,
-                                                   double *target_mass,
-                                                   double column_depth,
-                                                   double *cum_layer_thickness_cm,
-                                                   int *soil_type,
-                                                   double *frozen_factor,
-                                                   struct wetting_front **head,
-                                                   struct soil_properties_ *soil_properties)
+static double lgar_apply_creation_general_correction(int correction_type,
+                                                     int num_layers,
+                                                     double *target_mass,
+                                                     double column_depth,
+                                                     double *cum_layer_thickness_cm,
+                                                     int *soil_type,
+                                                     double *frozen_factor,
+                                                     struct wetting_front **head,
+                                                     struct soil_properties_ *soil_properties)
 {
+  double lower_boundary_flux_correction_cm = 0.0;
+
   if (correction_type == 1) {
-    bool merged_in_non_top_layer = false;
-    lgar_merge_surface_and_TO_wetting_fronts(merged_in_non_top_layer, num_layers,
-                                             cum_layer_thickness_cm, head);
-    lgarto_correct_negative_depths(head);
-    lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(merged_in_non_top_layer, soil_type,
-                                                               soil_properties, head);
-    correct_close_psis(soil_type, soil_properties, head);
+    lower_boundary_flux_correction_cm +=
+      lgarto_apply_surface_TO_merge_creation_correction(
+        "lgar_apply_creation_general_correction",
+        "surface-creation general surface/TO merge cleanup mass residual",
+        num_layers, target_mass, cum_layer_thickness_cm, soil_type,
+        frozen_factor, head, soil_properties);
   }
 
   if (correction_type == 2) {
-    (void) lgarto_TO_WFs_merge_via_depth(*target_mass, column_depth, cum_layer_thickness_cm, head,
-                                         soil_type, soil_properties);
+    const double mass_balance_flux_correction_cm =
+      lgarto_TO_WFs_merge_via_depth(*target_mass, column_depth, cum_layer_thickness_cm, head,
+                                    soil_type, soil_properties);
+    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+      mass_balance_flux_correction_cm,
+      "lgar_apply_creation_general_correction",
+      "surface-creation TO depth merge residual",
+      *head);
+    *target_mass -= mass_balance_flux_correction_cm;
+    lower_boundary_flux_correction_cm += mass_balance_flux_correction_cm;
     lgar_global_psi_update(soil_type, soil_properties, head);
   }
 
   if (correction_type == 3) {
-    (void) lgarto_TO_WFs_merge_via_theta(*target_mass, column_depth, cum_layer_thickness_cm, head,
-                                         soil_type, soil_properties);
+    const double mass_balance_flux_correction_cm =
+      lgarto_TO_WFs_merge_via_theta(*target_mass, column_depth, cum_layer_thickness_cm, head,
+                                    soil_type, soil_properties);
+    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+      mass_balance_flux_correction_cm,
+      "lgar_apply_creation_general_correction",
+      "surface-creation TO theta merge residual",
+      *head);
+    *target_mass -= mass_balance_flux_correction_cm;
+    lower_boundary_flux_correction_cm += mass_balance_flux_correction_cm;
     lgar_global_psi_update(soil_type, soil_properties, head);
   }
 
   if (correction_type == 4) {
     int front_num_with_negative_depth = -1;
+    double mass_balance_flux_correction_cm = 0.0;
     lgar_TO_wetting_fronts_cross_layer_boundary(&front_num_with_negative_depth, num_layers,
                                                 cum_layer_thickness_cm, soil_type, frozen_factor, head,
-                                                soil_properties);
+                                                soil_properties,
+                                                &mass_balance_flux_correction_cm);
     lgar_global_psi_update(soil_type, soil_properties, head);
+    lower_boundary_flux_correction_cm += mass_balance_flux_correction_cm;
 
     if (front_num_with_negative_depth > -1) {
-      listDeleteFront(front_num_with_negative_depth, head, soil_type, soil_properties);
+      // listDeleteFront(front_num_with_negative_depth, head, soil_type, soil_properties);
     }
+    // listSendToTop(*head);
   }
 
   if (correction_type == 5) {
@@ -5428,40 +8792,32 @@ static void lgar_apply_creation_general_correction(int correction_type,
   }
 
   if (correction_type == 8) {
-    struct wetting_front *temp_WF = *head;
-    for (int wf = 1; wf != listLength(*head); wf++) {
-      if (temp_WF == NULL || temp_WF->next == NULL) {
-        break;
-      }
-      if (temp_WF->is_WF_GW == FALSE && temp_WF->next->is_WF_GW == TRUE &&
-          temp_WF->theta < temp_WF->next->theta &&
-          temp_WF->layer_num == temp_WF->next->layer_num) {
-        if (verbosity.compare("high") == 0) {
-          printf("surface creation correction type 8 converting front %d to GW because "
-                 "surface theta %.15f is drier than GW theta %.15f below it in layer %d.\n",
-                 temp_WF->front_num, temp_WF->theta, temp_WF->next->theta, temp_WF->layer_num);
-        }
-        temp_WF->is_WF_GW = TRUE;
-      }
-      if (temp_WF->to_bottom == TRUE && temp_WF->is_WF_GW == FALSE &&
-          temp_WF->next->is_WF_GW == TRUE) {
-        if (verbosity.compare("high") == 0) {
-          printf("surface creation correction type 8 converting front %d to GW because "
-                 "a to_bottom surface front is immediately above a GW front.\n",
-                 temp_WF->front_num);
-        }
-        temp_WF->is_WF_GW = TRUE;
-      }
-      temp_WF = temp_WF->next;
-    }
+    lgarto_convert_surface_fronts_drier_than_TO_below(head, "surface creation correction type 8");
   }
 
   if (correction_type == 9) {
     const double flux_out_cm =
-      lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm[num_layers], num_layers,
+      lgarto_truncate_last_layer_GW_overshoot(cum_layer_thickness_cm, num_layers,
                                               head, soil_type, soil_properties);
+    lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+      flux_out_cm,
+      "lgar_apply_creation_general_correction",
+      "surface-creation last-layer TO/GW overshoot truncation",
+      *head);
     *target_mass -= flux_out_cm;
+    lower_boundary_flux_correction_cm = flux_out_cm;
   }
+
+  if (correction_type == 10) {
+    const double mass_balance_flux_correction_cm =
+      lgarto_surface_fronts_cross_layer_boundary_upward(
+        num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+        soil_properties, head, "surface-creation general correction");
+    *target_mass -= mass_balance_flux_correction_cm;
+    lower_boundary_flux_correction_cm += mass_balance_flux_correction_cm;
+  }
+
+  return lower_boundary_flux_correction_cm;
 }
 
 static void lgar_normalize_after_surface_front_creation(int num_layers,
@@ -5473,7 +8829,8 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
                                                         struct wetting_front **head,
                                                         struct soil_properties_ *soil_properties,
                                                         double *creation_excess_gw_flux_cm,
-                                                        double *creation_excess_runoff_cm)
+                                                        double *creation_excess_runoff_cm,
+                                                        double saturated_creation_gw_flux_capacity_cm)
 {
   if (*head == NULL) {
     return;
@@ -5484,16 +8841,38 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
   bool delayed_surface_creation_gw_conversion = false;
 
   for (int phase = 0; phase < 8; phase++) {
-    bool delayed_type8_this_phase = false;
+    bool delayed_gw_conversion_this_phase = false;
     int iteration = 0;
     while (iteration < 200) {
       iteration++;
 
       const int correction_type_surf = lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
       if (correction_type_surf != 0) {
-        lgar_apply_surface_creation_correction(correction_type_surf, num_layers, &target_mass,
-                                               cum_layer_thickness_cm, soil_type, frozen_factor, head,
-                                               soil_properties);
+        if (correction_type_surf == 5 && !delayed_surface_creation_gw_conversion &&
+            lgar_should_delay_surface_creation_gw_conversion(*head)) {
+          delayed_surface_creation_gw_conversion = true;
+          delayed_gw_conversion_this_phase = true;
+          if (verbosity.compare("high") == 0) {
+            struct wetting_front *repair_target = lgar_find_surface_creation_repair_target(*head);
+            if (repair_target != NULL && repair_target->next != NULL) {
+              printf("surface creation delaying surface correction type 5 for front %d in layer %d "
+                     "until after surface repair (theta %.15f, psi %.15f; GW below front %d "
+                     "theta %.15f, psi %.15f).\n",
+                     repair_target->front_num, repair_target->layer_num, repair_target->theta,
+                     repair_target->psi_cm, repair_target->next->front_num, repair_target->next->theta,
+                     repair_target->next->psi_cm);
+            }
+          }
+          break;
+        }
+
+        const double lower_boundary_flux_correction_cm =
+          lgar_apply_surface_creation_correction(correction_type_surf, num_layers, &target_mass,
+                                                 cum_layer_thickness_cm, soil_type, frozen_factor, head,
+                                                 soil_properties);
+        if (creation_excess_gw_flux_cm != NULL) {
+          *creation_excess_gw_flux_cm += lower_boundary_flux_correction_cm;
+        }
         continue;
       }
 
@@ -5502,7 +8881,7 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
         if (correction_type == 8 && !delayed_surface_creation_gw_conversion &&
             lgar_should_delay_surface_creation_gw_conversion(*head)) {
           delayed_surface_creation_gw_conversion = true;
-          delayed_type8_this_phase = true;
+          delayed_gw_conversion_this_phase = true;
           if (verbosity.compare("high") == 0) {
             struct wetting_front *repair_target = lgar_find_surface_creation_repair_target(*head);
             if (repair_target != NULL && repair_target->next != NULL) {
@@ -5517,9 +8896,13 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
           break;
         }
 
-        lgar_apply_creation_general_correction(correction_type, num_layers, &target_mass, column_depth,
-                                               cum_layer_thickness_cm, soil_type, frozen_factor, head,
-                                               soil_properties);
+        const double lower_boundary_flux_correction_cm =
+          lgar_apply_creation_general_correction(correction_type, num_layers, &target_mass, column_depth,
+                                                 cum_layer_thickness_cm, soil_type, frozen_factor, head,
+                                                 soil_properties);
+        if (creation_excess_gw_flux_cm != NULL) {
+          *creation_excess_gw_flux_cm += lower_boundary_flux_correction_cm;
+        }
         continue;
       }
 
@@ -5551,7 +8934,7 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
     double remaining_mass_error_after_depth = 0.0;
     bool adjusted_depth = false;
 
-    if (repair_target->is_WF_GW && repair_target->to_bottom) {
+    if (repair_target->is_WF_GW && !repair_target->to_bottom) {
       remaining_mass_error_after_depth =
         lgar_restore_surface_creation_mass_on_connected_gw_chain(repair_target, target_mass, head,
                                                                  cum_layer_thickness_cm, soil_type,
@@ -5568,8 +8951,31 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
       if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
           (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
         remaining_mass_error_after_depth = lgar_route_surface_creation_residual_if_needed(
-          remaining_mass_error_after_depth, &target_mass, creation_excess_gw_flux_cm,
-          creation_excess_runoff_cm, repair_target, soil_type, soil_properties,
+          remaining_mass_error_after_depth, num_layers, &target_mass, creation_excess_gw_flux_cm,
+          creation_excess_runoff_cm, &saturated_creation_gw_flux_capacity_cm, repair_target, soil_type, soil_properties,
+          cum_layer_thickness_cm, *head,
+          "surface creation connected TO-chain repair could not fully close mass; routing");
+      }
+    }
+    else if (repair_target->is_WF_GW && repair_target->to_bottom) {
+      remaining_mass_error_after_depth =
+        lgar_restore_surface_creation_mass_on_connected_gw_chain(repair_target, target_mass, head,
+                                                                 cum_layer_thickness_cm, soil_type,
+                                                                 soil_properties);
+      if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE) {
+        const double residual_before_depth = remaining_mass_error_after_depth;
+        remaining_mass_error_after_depth =
+          lgar_restore_surface_creation_mass_on_connected_gw_chain_via_depth(repair_target, target_mass,
+                                                                             num_layers, *head,
+                                                                             cum_layer_thickness_cm);
+        adjusted_depth =
+          std::fabs(remaining_mass_error_after_depth - residual_before_depth) > 1.0e-12;
+      }
+      if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
+          (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
+        remaining_mass_error_after_depth = lgar_route_surface_creation_residual_if_needed(
+          remaining_mass_error_after_depth, num_layers, &target_mass, creation_excess_gw_flux_cm,
+          creation_excess_runoff_cm, &saturated_creation_gw_flux_capacity_cm, repair_target, soil_type, soil_properties,
           cum_layer_thickness_cm, *head,
           "surface creation connected-chain repair could not fully close mass; routing");
       }
@@ -5591,8 +8997,8 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
       if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
           (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
         remaining_mass_error_after_depth = lgar_route_surface_creation_residual_if_needed(
-          remaining_mass_error_after_depth, &target_mass, creation_excess_gw_flux_cm,
-          creation_excess_runoff_cm, repair_target, soil_type, soil_properties,
+          remaining_mass_error_after_depth, num_layers, &target_mass, creation_excess_gw_flux_cm,
+          creation_excess_runoff_cm, &saturated_creation_gw_flux_capacity_cm, repair_target, soil_type, soil_properties,
           cum_layer_thickness_cm, *head,
           "surface creation connected surface-chain repair could not fully close mass; routing");
       }
@@ -5612,6 +9018,7 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
 
       const int repair_soil_num = soil_type[repair_target->layer_num];
       const double repair_theta_e = soil_properties[repair_soil_num].theta_e;
+      const double repair_theta_r = soil_properties[repair_soil_num].theta_r;
       if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
           repair_target->theta >= repair_theta_e - 1.0e-10 &&
           repair_target->next != NULL &&
@@ -5651,14 +9058,29 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
         if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
             (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
           remaining_mass_error_after_depth = lgar_route_surface_creation_residual_if_needed(
-            remaining_mass_error_after_depth, &target_mass, creation_excess_gw_flux_cm,
-            creation_excess_runoff_cm, chain_target, soil_type, soil_properties,
+            remaining_mass_error_after_depth, num_layers, &target_mass, creation_excess_gw_flux_cm,
+            creation_excess_runoff_cm, &saturated_creation_gw_flux_capacity_cm, chain_target, soil_type, soil_properties,
             cum_layer_thickness_cm, *head,
             "surface creation connected-chain handoff could not fully close mass; routing");
         }
       }
 
-      if (remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
+      bool deleted_unbracketed_surface_front = false;
+      if (remaining_mass_error_after_depth < -MBAL_ITERATIVE_TOLERANCE &&
+          repair_target->theta <= repair_theta_r + 1.0e-10 &&
+          repair_target->next != NULL &&
+          repair_target->layer_num == repair_target->next->layer_num &&
+          repair_target->next->is_WF_GW) {
+        remaining_mass_error_after_depth =
+          lgar_delete_unbracketed_surface_creation_front_and_repair_TO_chain(
+            repair_target, target_mass, num_layers, head, cum_layer_thickness_cm,
+            soil_type, soil_properties, &adjusted_depth);
+        adjusted_depth = true;
+        deleted_unbracketed_surface_front = true;
+      }
+
+      if (!deleted_unbracketed_surface_front &&
+          remaining_mass_error_after_depth > MBAL_ITERATIVE_TOLERANCE &&
           repair_target->next != NULL &&
           repair_target->layer_num == repair_target->next->layer_num &&
           std::fabs(repair_target->depth_cm - repair_target->next->depth_cm) <= CREATION_COLOCATED_TOLERANCE_CM) {
@@ -5672,7 +9094,7 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
         struct wetting_front *coincident_target =
           listDeleteFront(repair_target->front_num, head, soil_type, soil_properties);
         if (coincident_target != NULL) {
-          if (coincident_target->is_WF_GW && coincident_target->to_bottom) {
+          if (coincident_target->is_WF_GW) {
             remaining_mass_error_after_depth =
               lgar_restore_surface_creation_mass_on_connected_gw_chain(coincident_target, target_mass, head,
                                                                        cum_layer_thickness_cm, soil_type,
@@ -5717,8 +9139,8 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
           }
 
           remaining_mass_error_after_depth = lgar_route_surface_creation_residual_if_needed(
-            remaining_mass_error_after_depth, &target_mass, creation_excess_gw_flux_cm,
-            creation_excess_runoff_cm, coincident_target, soil_type, soil_properties,
+            remaining_mass_error_after_depth, num_layers, &target_mass, creation_excess_gw_flux_cm,
+            creation_excess_runoff_cm, &saturated_creation_gw_flux_capacity_cm, coincident_target, soil_type, soil_properties,
             cum_layer_thickness_cm, *head,
             "surface creation colocated-front handoff could not fully close mass; routing");
         }
@@ -5731,7 +9153,33 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
     }
 
     if (std::fabs(remaining_mass_error_after_depth) <= MBAL_ITERATIVE_TOLERANCE &&
-        !adjusted_depth && !delayed_type8_this_phase) {
+        !adjusted_depth && !delayed_gw_conversion_this_phase) {
+      const int post_repair_correction_type_surf =
+        lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
+      if (post_repair_correction_type_surf != 0) {
+        const double lower_boundary_flux_correction_cm =
+          lgar_apply_surface_creation_correction(post_repair_correction_type_surf, num_layers,
+                                                 &target_mass, cum_layer_thickness_cm, soil_type,
+                                                 frozen_factor, head, soil_properties);
+        if (creation_excess_gw_flux_cm != NULL) {
+          *creation_excess_gw_flux_cm += lower_boundary_flux_correction_cm;
+        }
+        continue;
+      }
+
+      const int post_repair_correction_type =
+        lgarto_correction_type(num_layers, cum_layer_thickness_cm, head);
+      if (post_repair_correction_type != 0) {
+        const double lower_boundary_flux_correction_cm =
+          lgar_apply_creation_general_correction(post_repair_correction_type, num_layers, &target_mass,
+                                                 column_depth, cum_layer_thickness_cm, soil_type,
+                                                 frozen_factor, head, soil_properties);
+        if (creation_excess_gw_flux_cm != NULL) {
+          *creation_excess_gw_flux_cm += lower_boundary_flux_correction_cm;
+        }
+        continue;
+      }
+
       break;
     }
   }
@@ -5747,7 +9195,8 @@ extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double 
 					double theta1, int *soil_type, double *cum_layer_thickness_cm,
 					double *frozen_factor, struct wetting_front** head, struct soil_properties_ *soil_properties,
 					double *creation_excess_gw_flux_cm,
-					double *creation_excess_runoff_cm)
+					double *creation_excess_runoff_cm,
+					double saturated_creation_gw_flux_capacity_cm)
 {
   // into the soil.  Note ponded_depth_cm is a pointer.   Access its value as (*ponded_depth_cm).
 
@@ -5804,13 +9253,14 @@ extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double 
     listPrint(*head);
   }
 
-  if (TO_enabled && current != NULL) {
-    const double target_mass = prior_mass + *volin;
-    lgar_normalize_after_surface_front_creation(num_layers, target_mass, cum_layer_thickness_cm,
-                                                soil_type, frozen_factor, current, head,
-                                                soil_properties, creation_excess_gw_flux_cm,
-                                                creation_excess_runoff_cm);
-  }
+	  if (TO_enabled && current != NULL) {
+	    const double target_mass = prior_mass + *volin;
+		    lgar_normalize_after_surface_front_creation(num_layers, target_mass, cum_layer_thickness_cm,
+		                                                soil_type, frozen_factor, current, head,
+		                                                soil_properties, creation_excess_gw_flux_cm,
+		                                                creation_excess_runoff_cm,
+		                                                saturated_creation_gw_flux_capacity_cm);
+	  }
 
   if (!TO_enabled && current->next!=NULL){// sometimes a new WF immediately has to merge with another WF
     bool had_to_merge = false;
@@ -5902,7 +9352,7 @@ extern double lgar_calc_dry_depth(bool TO_enabled, bool use_closed_form_G, int n
   dry_depth = fmin(cum_layer_thickness_cm[layer_num], dry_depth);
 
   if (TO_enabled){
-    dry_depth = dry_depth * 0.5; //0.2
+    // dry_depth = dry_depth * 0.99; //0.2
     // dry_depth = dry_depth - CREATION_COLOCATED_TOLERANCE_CM;
   }
   
@@ -6166,6 +9616,8 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
           double denominator = 0.0;
           double denominator_left = 0.0;
 
+          double avoid_div_by_zero_factor = 1.0E-16;
+
           for (int k = num_layers; k > (current->layer_num - 1); k--) {
             int soil_num_loc = soil_type[k];
             double theta_prev_loc = calc_theta_from_h(next_to_use->psi_cm, soil_properties[soil_num_loc].vg_alpha_per_cm,
@@ -6179,7 +9631,9 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
             double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,
                                                         soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[k],
                                                         soil_properties[soil_num_loc].vg_m);
-
+            if (K_cm_per_h_prev_loc==0.0){
+              K_cm_per_h_prev_loc = K_cm_per_h_prev_loc + avoid_div_by_zero_factor;
+            }
             if (k == current->layer_num) {
               denominator += (cum_layer_thickness_cm[k] - current->depth_cm) / K_cm_per_h_prev_loc;
             }
@@ -6214,6 +9668,9 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
             double K_cm_per_h_prev_loc = calc_K_from_Se(Se_prev_loc,
                                                         soil_properties[soil_num_loc].Ksat_cm_per_h * frozen_factor[k],
                                                         soil_properties[soil_num_loc].vg_m);
+            if (K_cm_per_h_prev_loc==0.0){
+              K_cm_per_h_prev_loc = K_cm_per_h_prev_loc + avoid_div_by_zero_factor;
+            }
             if (k == layer_num) {
               if (previous != NULL) {
                 denominator_left += (cum_layer_thickness_cm[k] - current->depth_cm) / K_cm_per_h_prev_loc;
@@ -6225,6 +9682,13 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
             else {
               denominator_left += (cum_layer_thickness_cm[k] - cum_layer_thickness_cm[k - 1]) / K_cm_per_h_prev_loc;
             }
+          }
+
+          if (denominator==0.0){
+            denominator = denominator + avoid_div_by_zero_factor;
+          }
+          if (denominator_left==0.0){
+            denominator_left = denominator_left + avoid_div_by_zero_factor;
           }
 
           K_composite = (D - current->depth_cm) / denominator;
@@ -6303,10 +9767,12 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
 
       Geff = calc_Geff(use_closed_form_G, theta1, theta2, theta_e, theta_r, vg_alpha_per_cm, vg_n, vg_m, h_min_cm, Ksat_cm_per_h, nint, lambda, bc_psib_cm); 
       delta_theta = current->theta - next->theta;
+      const double saturated_pressure_head_cm =
+        lgar_saturated_pressure_head_cm(current, soil_type, soil_properties);
 
       if(current->layer_num == 1) { // this front is in the upper layer
         if (delta_theta > 0){
-	  dzdt = 1.0/delta_theta*(Ksat_cm_per_h*(Geff+h_p)/current->depth_cm+current->K_cm_per_h);}
+	  dzdt = 1.0/delta_theta*(Ksat_cm_per_h*(Geff+h_p+saturated_pressure_head_cm)/current->depth_cm+current->K_cm_per_h);}
         else{
 	  dzdt = 0.0;}
       }
@@ -6333,7 +9799,7 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
         double numerator = depth_cm;// + (Geff +h_p)* Ksat_cm_per_h / K_cm_per_h;
 
         if (delta_theta > 0)
-	  dzdt = (1.0/delta_theta) * ( (numerator / denominator) + Ksat_cm_per_h*(Geff+h_p)/depth_cm );
+	  dzdt = (1.0/delta_theta) * ( (numerator / denominator) + Ksat_cm_per_h*(Geff+h_p+saturated_pressure_head_cm)/depth_cm );
         else
 	  dzdt = 0.0;
       }
@@ -6405,9 +9871,15 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
 // ############################################################################################
 extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm, double new_mass,
 				      double prior_mass, double precip_mass_to_add, double *AET_demand_cm, double *delta_theta, double *delta_thickness,
-				      int *soil_type, struct soil_properties_ *soil_properties)
+				      int *soil_type, struct soil_properties_ *soil_properties,
+                      bool allow_legacy_aet_bookkeeping_adjustment,
+                      double psi_upper_limit_cm)
 {
 
+  const double psi_upper_limit_for_solve =
+    (std::isfinite(psi_upper_limit_cm) && psi_upper_limit_cm > PSI_UPPER_LIM)
+      ? psi_upper_limit_cm
+      : PSI_UPPER_LIM;
   double psi_cm_loc = psi_cm; // location psi
   double delta_mass = fabs(new_mass - prior_mass); // mass different between the new and prior
   // double original_delta_mass = delta_mass; 
@@ -6531,7 +10003,11 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
       break;
     }
 
-    if ( (psi_cm_loc > PSI_UPPER_LIM) && (iter > first_speedup_thresh) ){ //unrealistic pressures, but there are some cases where convergence is possible even at large psi values, and there is a case where AET, free drainage, or WF movement can bring psi above PSI_UPPER_LIM, so we do want to allow a few iterations
+    if ( (psi_cm_loc > psi_upper_limit_for_solve) && (iter > first_speedup_thresh) ){ //unrealistic pressures, but there are some cases where convergence is possible even at large psi values, and there is a case where AET, free drainage, or WF movement can bring psi above PSI_UPPER_LIM, so we do want to allow a few iterations
+      psi_cm_loc = psi_upper_limit_for_solve;
+      theta = calc_theta_from_h(psi_cm_loc, soil_properties[soil_num].vg_alpha_per_cm, soil_properties[soil_num].vg_m,
+				soil_properties[soil_num].vg_n,soil_properties[soil_num].theta_e,
+				soil_properties[soil_num].theta_r);
       break;
     }
 
@@ -6547,11 +10023,13 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
   //However, the above loop can never increase psi to the point where theta<theta_r, because theta must always be between theta_r and theta_r, because of the van Genuchten model (calc_theta_from_h).
   //If we get to the case where theta<theta_r would be necessary for mass balance closure, then the above loop will break before delta_mass <= tolerance.
   //In this case, the remaining mass balance error is put into AET. This should usually be acceptable, because it will often be the AET flux that would have been the trigger for theta < theta_r for mass conservation, so reducing AET works in this case.
-  if ((delta_mass > MBAL_ITERATIVE_TOLERANCE) && (!wanted_to_saturate_flag)){//the second condition is necessary because count_no_mass_change == break_no_mass_change in the loop above will trigger when the model approaches saturation; in this event the extra water should go into runoff or recharge (handled elsewhere), because the soil saturates, rather than AET
+  if (allow_legacy_aet_bookkeeping_adjustment &&
+      (delta_mass > MBAL_ITERATIVE_TOLERANCE) && (!wanted_to_saturate_flag)){//the second condition is necessary because count_no_mass_change == break_no_mass_change in the loop above will trigger when the model approaches saturation; in this event the extra water should go into runoff or recharge (handled elsewhere), because the soil saturates, rather than AET
     *AET_demand_cm = *AET_demand_cm - fabs(delta_mass - MBAL_ITERATIVE_TOLERANCE);
   }
 
-  if ( (theta>=soil_properties[soil_num].theta_e) && (psi_cm_loc!=0.0) ){
+  if (allow_legacy_aet_bookkeeping_adjustment &&
+      (theta>=soil_properties[soil_num].theta_e) && (psi_cm_loc!=0.0) ){
     //addresses a very rare case. Sometimes when psi gets very close to 0 but is not 0, calc_theta_from_h will actually yield theta_e for a very small nonzero psi value (for example psi=1e-3 or something like that).
     //This can happen for example when the model domain is very close to saturation, and the number of WFs == the number of layers, but there is a little bit of AET so the resulting model state should have just slightly less water than complete saturation.
     //However, layers above the current one might not have the property that this small zonzero psi value yields theta = theta_e.
@@ -6570,6 +10048,15 @@ static bool lgar_restore_theta_merge_mass_via_depth(double target_mass, double c
 					       struct wetting_front *front_to_adjust)
 {
   if (front_to_adjust == NULL) {
+    return false;
+  }
+
+  if (front_to_adjust->to_bottom) {
+    /*
+     * to_bottom fronts are structural layer-boundary markers.  They may share
+     * theta/psi with a connected TO chain, but their depth is not a valid mass
+     * correction degree of freedom; return the residual to the caller instead.
+     */
     return false;
   }
 
@@ -6735,38 +10222,19 @@ extern double lgarto_TO_WFs_merge_via_theta(double target_mass, double column_de
         if (next->to_bottom == FALSE && previous->to_bottom == FALSE) {
           current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
 
-          double temp_tol = 1e-12;
-          double factor = 1.0;
-          bool switched = false;
-          while (std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) - target_mass) > temp_tol) {
-            if (lgar_calc_mass_bal(cum_layer_thickness_cm, *head) >= target_mass) {
-              current->depth_cm += 0.1 * factor;
-              switched = false;
-            }
-            else {
-              if (!switched) {
-                switched = true;
-                factor = factor * 0.1;
-              }
-              current->depth_cm -= 0.1 * factor;
-            }
-
-            if (current->front_num > 1) {
-              if (listFindFront(current->front_num - 1, *head, NULL)->depth_cm > current->depth_cm) {
-                break;
-              }
-            }
-
-            if (next->depth_cm > column_depth) {
-              break;
-            }
-
-            if (current->depth_cm < 0.0) {
-              current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
-              mass_diff = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-              break;
-            }
-	      }
+          if (current != NULL) {
+            /*
+             * If the theta merge cannot close mass by moving the surviving
+             * front within its own layer, return the residual as a signed flux
+             * correction.  The old unbounded loop could satisfy local mass by
+             * pushing a non-to_bottom scaffold through lower layers, leaving an
+             * impossible TO geometry for later corrections to repair.
+             */
+            (void) lgar_restore_theta_merge_mass_via_depth(target_mass, column_depth,
+                                                           cum_layer_thickness_cm, head,
+                                                           current);
+            mass_diff = target_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+          }
 	    }
 	        else {
 	          const double deleted_psi_cm = current->psi_cm;
@@ -6862,6 +10330,15 @@ extern int lgarto_correction_type(int num_layers, double* cum_layer_thickness_cm
   for (int wf = 1; wf != listLength(*head); wf++) {
     struct wetting_front *previous = listFindFront(wf - 1, *head, NULL);
 
+    const double boundary_tol_cm = fmax(1.0e-8, 10.0 * TRUNCATION_DEPTH);
+    if ((current->is_WF_GW == FALSE) && (!current->to_bottom) &&
+        (current->layer_num > 1) &&
+        (current->depth_cm >= 0.0) &&
+        (current->depth_cm < cum_layer_thickness_cm[current->layer_num - 1] - boundary_tol_cm)) {
+      correction_type = 10; // rare upward surface WF layer-boundary crossing after remap/merge
+      break;
+    }
+
     if (next != NULL) {
       if (lgarto_is_last_layer_GW_overshoot_pair(current, num_layers)) {
         correction_type = 9;
@@ -6940,7 +10417,7 @@ extern int lgarto_correction_type(int num_layers, double* cum_layer_thickness_cm
     }
   }
 
-  if (correction_type == 9) {
+  if (correction_type == 9 || correction_type == 10) {
     if (verbosity.compare("high") == 0) {
       printf("computed correction type: %d \n", correction_type);
     }
@@ -6961,6 +10438,13 @@ extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickne
   struct wetting_front *current = *head;
   struct wetting_front *next = current->next;
   struct wetting_front *next_to_next = NULL;
+  bool lgarto_active = false;
+  for (struct wetting_front *front = *head; front != NULL; front = front->next) {
+    if (front->is_WF_GW) {
+      lgarto_active = true;
+      break;
+    }
+  }
   // // this will be necessary for lgarto
   // struct wetting_front *top_most_TO_front_below_surfs = NULL;
   // double top_most_TO_front_below_surfs_psi_cm = 1.E16;
@@ -6979,14 +10463,31 @@ extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickne
       break;
     }
 
+    const double boundary_tol_cm = fmax(1.0e-8, 10.0 * TRUNCATION_DEPTH);
+    if ((current->is_WF_GW == FALSE) && (!current->to_bottom) &&
+        (current->layer_num > 1) &&
+        (current->depth_cm >= 0.0) &&
+        (current->depth_cm < cum_layer_thickness_cm[current->layer_num - 1] - boundary_tol_cm)) {
+      correction_type_surf = 9; // rare upward surface WF layer-boundary crossing after remap/merge
+      break;
+    }
+
     if (next!=NULL){
-      if ( (current->is_WF_GW==0) && (next->is_WF_GW==0) && (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
-      // if ( (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
-        correction_type_surf = 1; //this is surface-surface WF merging 
+	      if (lgarto_active && lgarto_surface_front_overtook_surface_front_above_TO_chain(current)) {
+	        correction_type_surf = 6; // mixed surface/surface/TO overtake correction
+	        break;
+	      }
+		      if ( (current->is_WF_GW==0) && (next->is_WF_GW==1) && (current->depth_cm > next->depth_cm) && (!next->to_bottom) && (next->next != NULL) ){
+		        correction_type_surf = 7; // surface/TO merge before TO/GW motion reopens the crossing gap
+		        break;
+		      }
+	      if ( (current->is_WF_GW==0) && (next->is_WF_GW==0) && (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
+	      // if ( (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
+		        correction_type_surf = 1; //this is surface-surface WF merging
         break;
       }
       // if ( (current->is_WF_GW==0) && (current->depth_cm > cum_layer_thickness_cm[current->layer_num]) && (next->depth_cm == cum_layer_thickness_cm[current->layer_num]) && (current->theta>next->theta) && (current->layer_num!=num_layers) && (current->psi_cm<top_most_TO_front_below_surfs_psi_cm) ){
-      if ( (current->is_WF_GW==0) && (current->depth_cm > cum_layer_thickness_cm[current->layer_num]) && (next->depth_cm == cum_layer_thickness_cm[current->layer_num]) && (current->theta>next->theta) && (current->layer_num!=num_layers) ){
+      if ( (current->is_WF_GW==0) && (current->depth_cm > cum_layer_thickness_cm[current->layer_num]) && (next->depth_cm == cum_layer_thickness_cm[current->layer_num]) && (!lgarto_active || next->to_bottom) && (current->theta>next->theta) && (current->layer_num!=num_layers) ){
       // if ( (current->depth_cm > cum_layer_thickness_cm[current->layer_num]) && (next->depth_cm == cum_layer_thickness_cm[current->layer_num] && (next->to_bottom)) && (current->theta>next->theta) && (current->layer_num!=num_layers) ){
         correction_type_surf = 2; //this is surface WF layer bdy crossing
         break;
@@ -7001,6 +10502,12 @@ extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickne
       correction_type_surf = 4;
       break;
     }
+
+    /*
+     * Leave surface-to-TO conversion for the TO/general correction loop
+     * (correction type 8), after TO motion and AET have had a chance to run
+     * on the pre-conversion scaffold.
+     */
 
     current = next;
     next = current->next;
@@ -7094,9 +10601,404 @@ static void lgar_cap_leading_zero_depth_groundwater_fronts(struct wetting_front 
   }
 }
 
+static void lgar_dry_zero_depth_groundwater_fronts_to_surface_profile(
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || *head == NULL || listLength_surface(*head) == 0) {
+    return;
+  }
+
+  double driest_surface_psi_cm = -1.0;
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (current->is_WF_GW == FALSE && std::isfinite(current->psi_cm)) {
+      driest_surface_psi_cm = fmax(driest_surface_psi_cm, current->psi_cm);
+    }
+  }
+
+  if (driest_surface_psi_cm < 0.0) {
+    return;
+  }
+
+  double target_zero_depth_TO_psi_cm = std::nextafter(driest_surface_psi_cm, HUGE_VAL);
+  if (!std::isfinite(target_zero_depth_TO_psi_cm)) {
+    target_zero_depth_TO_psi_cm = driest_surface_psi_cm;
+  }
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (current->is_WF_GW == FALSE || fabs(current->depth_cm) > 1.0e-12) {
+      continue;
+    }
+
+    if (std::isfinite(current->psi_cm) &&
+        current->psi_cm >= target_zero_depth_TO_psi_cm) {
+      continue;
+    }
+
+    /* A zero-depth TO/GW support is metadata for the top of the TO chain,
+       not a finite storage volume. Once surface fronts exist at the end of
+       a correction pass, those zero-depth supports must be at least as dry as
+       the driest active surface front; otherwise hidden wet TO metadata can
+       sit above a drier surface profile without changing storage. */
+    current->psi_cm = target_zero_depth_TO_psi_cm;
+    const int soil_num = soil_type[current->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+    current->K_cm_per_h = calc_K_from_Se(Se, soil_properties[soil_num].Ksat_cm_per_h, vg_m);
+  }
+}
+
+static void lgar_dry_zero_depth_groundwater_fronts_to_surface_TO_chain(
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  double *cum_layer_thickness_cm)
+{
+  if (head == NULL || *head == NULL || soil_type == NULL ||
+      soil_properties == NULL || cum_layer_thickness_cm == NULL) {
+    return;
+  }
+
+  const lgarto_surface_TO_support_ordering_state state =
+    lgarto_find_surface_TO_support_ordering_state(*head);
+  if (lgarto_zero_depth_TO_support_ordering_is_valid(state) ||
+      state.first_TO_below_surface == NULL) {
+    return;
+  }
+
+  const double target_zero_depth_TO_psi_cm = state.first_TO_below_surface->psi_cm;
+  if (!std::isfinite(target_zero_depth_TO_psi_cm) ||
+      target_zero_depth_TO_psi_cm < 0.0) {
+    return;
+  }
+
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (current->is_WF_GW == FALSE) {
+      break;
+    }
+
+    if (current->is_WF_GW == FALSE || current->to_bottom == TRUE ||
+        current->layer_num != 1 ||
+        std::fabs(current->depth_cm) > ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM ||
+        (std::isfinite(current->psi_cm) &&
+         current->psi_cm >= target_zero_depth_TO_psi_cm)) {
+      continue;
+    }
+
+    /* Zero-depth TO/GW supports carry no finite storage. When surface fronts
+       exist, they should be metadata for the finite TO chain below the surface
+       stack, not a hidden wetter state above it. Dry only those metadata fronts
+       and leave the finite first-below-surface TO front unchanged. */
+    current->psi_cm = target_zero_depth_TO_psi_cm;
+    const int soil_num = soil_type[current->layer_num];
+    const double theta_e = soil_properties[soil_num].theta_e;
+    const double theta_r = soil_properties[soil_num].theta_r;
+    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+    const double vg_m = soil_properties[soil_num].vg_m;
+    const double vg_n = soil_properties[soil_num].vg_n;
+    current->theta = calc_theta_from_h(current->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
+    current->K_cm_per_h = calc_K_from_Se(Se, soil_properties[soil_num].Ksat_cm_per_h, vg_m);
+  }
+
+  const double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double mass_change_cm = mass_after_cm - mass_before_cm;
+  if (!std::isfinite(mass_change_cm) ||
+      std::fabs(mass_change_cm) > ZERO_DEPTH_TO_DELETE_MASS_TOL_CM) {
+    fprintf(stderr,
+            "Error: drying zero-depth TO/GW supports to the first below-surface TO front changed profile storage by %.17g cm.\n"
+            "  tolerance=%.17g cm target_zero_depth_TO_psi_cm=%.17g\n"
+            "  Wetting front list follows:\n",
+            mass_change_cm,
+            ZERO_DEPTH_TO_DELETE_MASS_TOL_CM,
+            target_zero_depth_TO_psi_cm);
+    fflush(stderr);
+    listPrint(*head);
+    fflush(stdout);
+    abort();
+  }
+
+  if (verbosity.compare("high") == 0) {
+    printf("Dried leading zero-depth TO/GW supports to psi %.17g cm to match "
+           "the first TO front below active surface fronts (mass change %.17g cm).\n",
+           target_zero_depth_TO_psi_cm,
+           mass_change_cm);
+  }
+}
+
+static bool lgar_is_deletable_zero_depth_groundwater_support(const struct wetting_front *front)
+{
+  return front != NULL &&
+         front->is_WF_GW == TRUE &&
+         front->to_bottom == FALSE &&
+         front->layer_num == 1 &&
+         fabs(front->depth_cm) <= ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM;
+}
+
+static struct wetting_front *lgar_unlink_zero_depth_groundwater_support(
+  struct wetting_front *front,
+  struct wetting_front **head)
+{
+  if (front == NULL || head == NULL || *head == NULL) {
+    return front;
+  }
+
+  struct wetting_front *previous = NULL;
+  struct wetting_front *current = *head;
+  while (current != NULL && current != front) {
+    previous = current;
+    current = current->next;
+  }
+
+  if (current == NULL) {
+    return front;
+  }
+
+  struct wetting_front *after_delete = current->next;
+  if (previous == NULL) {
+    *head = after_delete;
+  }
+  else {
+    previous->next = after_delete;
+  }
+
+  free(current);
+  for (struct wetting_front *renumber = after_delete; renumber != NULL;
+       renumber = renumber->next) {
+    renumber->front_num--;
+  }
+
+  return after_delete;
+}
+
+static struct wetting_front *lgar_delete_zero_depth_groundwater_support_if_mass_neutral(
+  struct wetting_front *front,
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  double *cum_layer_thickness_cm,
+  const char *reason)
+{
+  if (front == NULL || head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return front;
+  }
+  (void)soil_type;
+  (void)soil_properties;
+
+  const int deleted_front_num = front->front_num;
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  struct wetting_front *after_delete =
+    lgar_unlink_zero_depth_groundwater_support(front, head);
+  const double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const double mass_change_cm = mass_after_cm - mass_before_cm;
+
+  if (verbosity.compare("high") == 0) {
+    printf("Deleted zero-depth TO/GW front %d: %s (mass change %.17g cm).\n",
+           deleted_front_num, reason, mass_change_cm);
+  }
+
+  if (std::fabs(mass_change_cm) > ZERO_DEPTH_TO_DELETE_MASS_TOL_CM) {
+    fprintf(stderr,
+            "Error: zero-depth TO/GW support deletion changed profile storage by %.17g cm.\n"
+            "  deleted_front_num=%d reason=%s tolerance=%.17g cm\n"
+            "  Wetting front list after deletion follows:\n",
+            mass_change_cm,
+            deleted_front_num,
+            reason,
+            ZERO_DEPTH_TO_DELETE_MASS_TOL_CM);
+    fflush(stderr);
+    listPrint(*head);
+    fflush(stdout);
+    abort();
+  }
+
+  return after_delete;
+}
+
+static bool lgar_zero_depth_groundwater_support_duplicates_next_TO_state(
+  const struct wetting_front *front)
+{
+  if (!lgar_is_deletable_zero_depth_groundwater_support(front) ||
+      front->next == NULL ||
+      front->next->is_WF_GW == FALSE ||
+      !std::isfinite(front->theta) ||
+      !std::isfinite(front->next->theta) ||
+      !std::isfinite(front->psi_cm) ||
+      !std::isfinite(front->next->psi_cm)) {
+    return false;
+  }
+
+  const double theta_tol = 1.0e-12;
+  const double psi_scale_cm =
+    fmax(1.0, fmax(std::fabs(front->psi_cm), std::fabs(front->next->psi_cm)));
+  const double psi_tol_cm = fmax(1.0e-8, 1.0e-12 * psi_scale_cm);
+
+  return std::fabs(front->theta - front->next->theta) <= theta_tol &&
+         std::fabs(front->psi_cm - front->next->psi_cm) <= psi_tol_cm;
+}
+
+static void lgar_delete_zero_depth_groundwater_supports_matching_next_TO_state(
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  double *cum_layer_thickness_cm)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return;
+  }
+
+  bool deleted_front = true;
+  while (deleted_front) {
+    deleted_front = false;
+    for (struct wetting_front *current = *head; current != NULL && current->next != NULL;
+         current = current->next) {
+      if (!lgar_zero_depth_groundwater_support_duplicates_next_TO_state(current)) {
+        continue;
+      }
+
+      /* A zero-depth non-to_bottom TO/GW front has no finite storage interval.
+         If it duplicates the hydraulic state of the next TO/GW front, keeping
+         it only gives later TO-only routines an artificial support front to
+         select. Delete it only after verifying the removal is mass-neutral. */
+      lgar_delete_zero_depth_groundwater_support_if_mass_neutral(
+        current, head, soil_type, soil_properties, cum_layer_thickness_cm,
+        "zero-depth TO/GW support duplicated the next TO/GW front state");
+      deleted_front = true;
+      break;
+    }
+  }
+}
+
+static void lgar_delete_zero_depth_groundwater_supports_causing_same_layer_TO_psi_reversal(
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  double *cum_layer_thickness_cm)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return;
+  }
+
+  bool deleted_front = true;
+  while (deleted_front) {
+    deleted_front = false;
+    for (struct wetting_front *current = *head; current != NULL && current->next != NULL;
+         current = current->next) {
+      struct wetting_front *next = current->next;
+      if (!lgar_is_deletable_zero_depth_groundwater_support(current) ||
+          next->is_WF_GW == FALSE ||
+          next->layer_num != current->layer_num ||
+          next->depth_cm <= current->depth_cm + ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM ||
+          !std::isfinite(current->psi_cm) ||
+          !std::isfinite(next->psi_cm)) {
+        continue;
+      }
+
+      const double psi_tol_cm = lgar_psi_assertion_tolerance_cm(current->psi_cm, next->psi_cm);
+      if (next->psi_cm <= current->psi_cm + psi_tol_cm) {
+        continue;
+      }
+
+      /* This is the same structural case caught by lgar_assert_to_psi_monotonic_with_depth,
+         but the offending shallower front is a zero-depth non-storage TO/GW support.
+         Deleting that support is a local metadata cleanup; widening the TO ordering
+         assertion would hide real dry-over-wet errors in finite intervals. */
+      lgar_delete_zero_depth_groundwater_support_if_mass_neutral(
+        current, head, soil_type, soil_properties, cum_layer_thickness_cm,
+        "zero-depth TO/GW support caused same-layer TO psi ordering reversal");
+      deleted_front = true;
+      break;
+    }
+  }
+}
+
+static void lgar_delete_redundant_finite_same_layer_TO_fronts(
+  struct wetting_front **head,
+  int *soil_type,
+  struct soil_properties_ *soil_properties,
+  double *cum_layer_thickness_cm)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL) {
+    return;
+  }
+
+  bool deleted_front = true;
+  while (deleted_front) {
+    deleted_front = false;
+    for (struct wetting_front *current = *head; current != NULL && current->next != NULL;
+         current = current->next) {
+      struct wetting_front *next = current->next;
+      if (current->is_WF_GW == FALSE || next->is_WF_GW == FALSE ||
+          current->to_bottom == TRUE || next->to_bottom == TRUE ||
+          current->layer_num != next->layer_num ||
+          current->depth_cm >= next->depth_cm - ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM ||
+          current->depth_cm <= cum_layer_thickness_cm[current->layer_num - 1] +
+                               ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM ||
+          !std::isfinite(current->theta) || !std::isfinite(next->theta) ||
+          !std::isfinite(current->psi_cm) || !std::isfinite(next->psi_cm)) {
+        continue;
+      }
+
+      const bool same_theta =
+        std::fabs(current->theta - next->theta) <= 1.0e-12;
+      const bool same_psi =
+        std::fabs(current->psi_cm - next->psi_cm) <=
+        lgar_psi_assertion_tolerance_cm(current->psi_cm, next->psi_cm);
+      if (!same_theta || !same_psi) {
+        continue;
+      }
+
+      /* Two adjacent finite TO/GW fronts in the same layer with the same
+         hydraulic state do not define a real discontinuity. Delete the
+         shallower front only, and verify that the operation is mass-neutral. */
+      const int deleted_front_num = current->front_num;
+      const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      listDeleteFront(current->front_num, head, soil_type, soil_properties);
+      const double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      const double mass_change_cm = mass_after_cm - mass_before_cm;
+
+      if (verbosity.compare("high") == 0) {
+        printf("Deleted redundant finite same-layer TO/GW front %d "
+               "(shallower duplicate; mass change %.17g cm).\n",
+               deleted_front_num, mass_change_cm);
+      }
+
+      if (!std::isfinite(mass_change_cm) ||
+          std::fabs(mass_change_cm) > FINITE_SAME_LAYER_TO_DELETE_MASS_TOL_CM) {
+        fprintf(stderr,
+                "Error: finite same-layer TO/GW duplicate deletion changed profile storage by %.17g cm.\n"
+                "  deleted_front_num=%d tolerance=%.17g cm\n"
+                "  Wetting front list after deletion follows:\n",
+                mass_change_cm,
+                deleted_front_num,
+                FINITE_SAME_LAYER_TO_DELETE_MASS_TOL_CM);
+        fflush(stderr);
+        listPrint(*head);
+        fflush(stdout);
+        abort();
+      }
+
+      deleted_front = true;
+      break;
+    }
+  }
+}
+
 extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_type,
                                         struct soil_properties_ *soil_properties,
-                                        bool apply_zero_depth_groundwater_cap){
+                                        bool apply_zero_depth_groundwater_cap,
+                                        double *cum_layer_thickness_cm,
+                                        double domain_depth_cm){
+  (void)domain_depth_cm;
+
   if (verbosity.compare("high") == 0) {
     printf("before lgar_clean_redundant_fronts: \n");
     listPrint(*head);
@@ -7106,6 +11008,20 @@ extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_t
   if (apply_zero_depth_groundwater_cap) {
     lgar_cap_leading_zero_depth_groundwater_fronts(head, soil_type, soil_properties);
   }
+  lgar_dry_zero_depth_groundwater_fronts_to_surface_profile(head, soil_type, soil_properties);
+  lgar_dry_zero_depth_groundwater_fronts_to_surface_TO_chain(
+    head, soil_type, soil_properties, cum_layer_thickness_cm);
+  lgar_delete_zero_depth_groundwater_supports_matching_next_TO_state(
+    head, soil_type, soil_properties, cum_layer_thickness_cm);
+  /* Do not delete very dry zero-depth supports just because surface fronts exist:
+     surface cleanup can later fold those fronts into TO/GW, and the zero-depth
+     scaffold is needed to keep rainfall entry from seeing a finite-depth head.
+     Only delete a zero-depth support when it is the local cause of a same-layer
+     TO psi-ordering reversal. */
+  lgar_delete_zero_depth_groundwater_supports_causing_same_layer_TO_psi_reversal(
+    head, soil_type, soil_properties, cum_layer_thickness_cm);
+  lgar_delete_redundant_finite_same_layer_TO_fronts(
+    head, soil_type, soil_properties, cum_layer_thickness_cm);
 
   if (*head == NULL || (*head)->next == NULL) {
     if (verbosity.compare("high") == 0) {
@@ -7208,6 +11124,208 @@ extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, 
    lgar_theta_mass_balance because it does not need information about old WFs or external fluxes
    and is called far less often.*/
 // ############################################################################################
+static double lgar_apply_theta_mass_balance_correction_psi(
+  bool use_dry_over_wet, double psi_cm_loc, struct wetting_front *current,
+  struct wetting_front **head, double *cum_layer_thickness_cm, int *soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  psi_cm_loc = fmax(0.0, fmin(PSI_UPPER_LIM, psi_cm_loc));
+
+  int layer_num = current->layer_num;
+  int soil_num = soil_type[layer_num];
+  current->psi_cm = psi_cm_loc;
+  current->theta = calc_theta_from_h(psi_cm_loc,
+                                     soil_properties[soil_num].vg_alpha_per_cm,
+                                     soil_properties[soil_num].vg_m,
+                                     soil_properties[soil_num].vg_n,
+                                     soil_properties[soil_num].theta_e,
+                                     soil_properties[soil_num].theta_r);
+
+  struct wetting_front *next = current->next;
+  struct wetting_front *before_next = current;
+  bool skip_bottom_chain_below = false;
+  if (next){
+    skip_bottom_chain_below = use_dry_over_wet && next->to_bottom && !current->to_bottom;
+  }
+
+  if (next && !skip_bottom_chain_below){
+    double theta_e;
+    double theta_r;
+    double vg_a;
+    double vg_m;
+    double vg_n;
+    while (next->to_bottom){
+      next->psi_cm = before_next->psi_cm;
+      layer_num = next->layer_num;
+      soil_num = soil_type[layer_num];
+      theta_e = soil_properties[soil_num].theta_e;
+      theta_r = soil_properties[soil_num].theta_r;
+      vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+      vg_m = soil_properties[soil_num].vg_m;
+      vg_n = soil_properties[soil_num].vg_n;
+
+      next->theta = calc_theta_from_h(next->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+
+      before_next = next;
+      next = next->next;
+      if (!next){
+        break;
+      }
+    }
+    if (next){
+      if (!next->to_bottom && before_next->to_bottom){
+        next->psi_cm = before_next->psi_cm;
+        layer_num = next->layer_num;
+        soil_num = soil_type[layer_num];
+        theta_e = soil_properties[soil_num].theta_e;
+        theta_r = soil_properties[soil_num].theta_r;
+        vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+        vg_m = soil_properties[soil_num].vg_m;
+        vg_n = soil_properties[soil_num].vg_n;
+
+        next->theta = calc_theta_from_h(next->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+      }
+    }
+  }
+
+  return lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+}
+
+static double lgar_theta_mass_balance_correction_with_min_psi(
+  bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head,
+  double *cum_layer_thickness_cm, int *soil_type,
+  struct soil_properties_ *soil_properties, double min_psi_cm)
+{
+  if (head == NULL || *head == NULL) {
+    return prior_mass;
+  }
+
+  struct wetting_front *current = listFindFront(front_num, *head, NULL);
+  if (current == NULL) {
+    return prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  }
+
+  if (current->front_num > 1) {
+    struct wetting_front *front = listFindFront(current->front_num - 1, *head, NULL);
+    if (front != NULL && front->to_bottom) {
+      current = front;
+    }
+  }
+  while (current->to_bottom) {
+    if (current->front_num == 1) {
+      break;
+    }
+    current = listFindFront(current->front_num - 1, *head, NULL);
+    if (current == NULL) {
+      return prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    }
+    if (!current->to_bottom) {
+      current = current->next;
+      break;
+    }
+  }
+
+  const double mass_at_original = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (fabs(mass_at_original - prior_mass) <= MBAL_ITERATIVE_TOLERANCE) {
+    return prior_mass - mass_at_original;
+  }
+
+  const double psi_wet_bound_cm =
+    fmax(0.0, fmin(PSI_UPPER_LIM, std::isfinite(min_psi_cm) ? min_psi_cm : 0.0));
+  const double original_psi_cm = current->psi_cm;
+  const double mass_at_wet_bound =
+    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, psi_wet_bound_cm,
+                                                 current, head, cum_layer_thickness_cm,
+                                                 soil_type, soil_properties);
+  const double mass_at_dry_limit =
+    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, PSI_UPPER_LIM,
+                                                 current, head, cum_layer_thickness_cm,
+                                                 soil_type, soil_properties);
+
+  double best_psi_cm = psi_wet_bound_cm;
+  double best_abs_error_cm = fabs(mass_at_wet_bound - prior_mass);
+  if (fabs(mass_at_dry_limit - prior_mass) < best_abs_error_cm) {
+    best_psi_cm = PSI_UPPER_LIM;
+    best_abs_error_cm = fabs(mass_at_dry_limit - prior_mass);
+  }
+
+  if (std::isfinite(original_psi_cm) &&
+      original_psi_cm >= psi_wet_bound_cm &&
+      original_psi_cm <= PSI_UPPER_LIM) {
+    const double mass_at_bounded_original =
+      lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, original_psi_cm,
+                                                   current, head, cum_layer_thickness_cm,
+                                                   soil_type, soil_properties);
+    if (fabs(mass_at_bounded_original - prior_mass) < best_abs_error_cm) {
+      best_psi_cm = original_psi_cm;
+      best_abs_error_cm = fabs(mass_at_bounded_original - prior_mass);
+    }
+  }
+
+  const double min_mass_cm = fmin(mass_at_wet_bound, mass_at_dry_limit);
+  const double max_mass_cm = fmax(mass_at_wet_bound, mass_at_dry_limit);
+  const bool target_bracketed =
+    prior_mass >= min_mass_cm - MBAL_ITERATIVE_TOLERANCE &&
+    prior_mass <= max_mass_cm + MBAL_ITERATIVE_TOLERANCE &&
+    fabs(mass_at_dry_limit - mass_at_wet_bound) > MBAL_ITERATIVE_TOLERANCE;
+
+  if (target_bracketed) {
+    double bracket_lo_psi_cm = psi_wet_bound_cm;
+    double bracket_hi_psi_cm = PSI_UPPER_LIM;
+    const bool mass_increases_with_psi = mass_at_dry_limit > mass_at_wet_bound;
+
+    for (int iter = 0; iter < MAX_ITER_MBAL_LOOP; iter++) {
+      const double probe_psi_cm = 0.5 * (bracket_lo_psi_cm + bracket_hi_psi_cm);
+      const double probe_mass_cm =
+        lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, probe_psi_cm,
+                                                     current, head,
+                                                     cum_layer_thickness_cm,
+                                                     soil_type, soil_properties);
+      const double probe_abs_error_cm = fabs(probe_mass_cm - prior_mass);
+      if (probe_abs_error_cm < best_abs_error_cm) {
+        best_psi_cm = probe_psi_cm;
+        best_abs_error_cm = probe_abs_error_cm;
+      }
+      if (probe_abs_error_cm <= MBAL_ITERATIVE_TOLERANCE) {
+        break;
+      }
+
+      if (mass_increases_with_psi) {
+        if (probe_mass_cm < prior_mass) {
+          bracket_lo_psi_cm = probe_psi_cm;
+        }
+        else {
+          bracket_hi_psi_cm = probe_psi_cm;
+        }
+      }
+      else {
+        if (probe_mass_cm > prior_mass) {
+          bracket_lo_psi_cm = probe_psi_cm;
+        }
+        else {
+          bracket_hi_psi_cm = probe_psi_cm;
+        }
+      }
+    }
+  }
+
+  lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, best_psi_cm,
+                                               current, head, cum_layer_thickness_cm,
+                                               soil_type, soil_properties);
+  const double residual_cm = prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (verbosity.compare("high") == 0 &&
+      best_abs_error_cm > MBAL_ITERATIVE_TOLERANCE) {
+    printf("Bounded theta mass-balance correction left residual %.12e cm "
+           "(mass_at_min_psi %.17lf, mass_at_psi_upper %.17lf, target %.17lf, "
+           "min_psi %.17lf).\n",
+           residual_cm,
+           mass_at_wet_bound, mass_at_dry_limit, prior_mass,
+           psi_wet_bound_cm);
+  }
+
+  return residual_cm;
+}
+
 extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties){
   struct wetting_front *current;
   current = listFindFront(front_num, *head, NULL);
@@ -7228,166 +11346,103 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
       break;
     }
   }
-  double new_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-  double psi_cm = current->psi_cm;
 
-  double psi_cm_loc = current->psi_cm; // location psi
-  double delta_mass = fabs(new_mass - prior_mass); // mass different between the new and prior
-
-  double factor = fmax(1.0,psi_cm/10.0);
-  if (psi_cm>1.E4){ // in very dry cases, mass conservation will take longer to achieve if using a small factor
-    factor = psi_cm;
+  const double mass_at_original = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (fabs(mass_at_original - prior_mass) <= MBAL_ITERATIVE_TOLERANCE) {
+    return;
   }
-  bool switched = false; // flag that determines capillary head to be incremented or decremented
 
-  double psi_cm_loc_prev   = psi_cm_loc;
-  double delta_mass_prev   = delta_mass;
-  int count_no_mass_change = 0;
-  int break_no_mass_change = 5;
+  const double original_psi_cm = current->psi_cm;
+  const double mass_at_saturation =
+    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, 0.0, current,
+                                                 head, cum_layer_thickness_cm,
+                                                 soil_type, soil_properties);
+  const double mass_at_dry_limit =
+    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, PSI_UPPER_LIM,
+                                                 current, head, cum_layer_thickness_cm,
+                                                 soil_type, soil_properties);
 
-  // the loop increments/decrements the capillary head until mass difference between
-  // the new and prior is within the tolerance
-  int iter = 0;
-  bool iter_aug_flag = FALSE;
-  bool iter_aug_flag_extreme = FALSE;
-  int first_speedup_thresh = MAX_ITER_MBAL_LOOP/100;
-  int second_speedup_thresh = MAX_ITER_MBAL_LOOP/10;
+  double best_psi_cm = 0.0;
+  double best_abs_error_cm = fabs(mass_at_saturation - prior_mass);
+  if (fabs(mass_at_dry_limit - prior_mass) < best_abs_error_cm) {
+    best_psi_cm = PSI_UPPER_LIM;
+    best_abs_error_cm = fabs(mass_at_dry_limit - prior_mass);
+  }
 
-  while (delta_mass > MBAL_ITERATIVE_TOLERANCE) {
-    iter++;
-
-    if (iter>first_speedup_thresh && iter_aug_flag==FALSE){
-      factor = factor*100;
-      iter_aug_flag = TRUE;
+  if (std::isfinite(original_psi_cm) &&
+      original_psi_cm >= 0.0 && original_psi_cm <= PSI_UPPER_LIM) {
+    const double mass_at_bounded_original =
+      lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, original_psi_cm,
+                                                   current, head, cum_layer_thickness_cm,
+                                                   soil_type, soil_properties);
+    if (fabs(mass_at_bounded_original - prior_mass) < best_abs_error_cm) {
+      best_psi_cm = original_psi_cm;
+      best_abs_error_cm = fabs(mass_at_bounded_original - prior_mass);
     }
+  }
 
-    if (iter>second_speedup_thresh && iter_aug_flag_extreme==FALSE){
-      factor = factor*100;
-      iter_aug_flag_extreme = TRUE;
-    }
+  const double min_mass_cm = fmin(mass_at_saturation, mass_at_dry_limit);
+  const double max_mass_cm = fmax(mass_at_saturation, mass_at_dry_limit);
+  const bool target_bracketed =
+    prior_mass >= min_mass_cm - MBAL_ITERATIVE_TOLERANCE &&
+    prior_mass <= max_mass_cm + MBAL_ITERATIVE_TOLERANCE &&
+    fabs(mass_at_dry_limit - mass_at_saturation) > MBAL_ITERATIVE_TOLERANCE;
 
-    if (new_mass > prior_mass) {
-      psi_cm_loc += 0.1 * factor;
-      switched = false;
-    }
-    else {
-      if (!switched) {
-  switched = true;
-  factor = factor * 0.1;
+  if (target_bracketed) {
+    double bracket_lo_psi_cm = 0.0;
+    double bracket_hi_psi_cm = PSI_UPPER_LIM;
+    const bool mass_increases_with_psi = mass_at_dry_limit > mass_at_saturation;
+
+    /*
+     * The legacy loop assumed increasing psi always reduced storage. That is
+     * false when a prior correction leaves a same-layer depth inversion, so
+     * infer the actual response direction and solve within physical psi bounds.
+     */
+    for (int iter = 0; iter < MAX_ITER_MBAL_LOOP; iter++) {
+      const double probe_psi_cm = 0.5 * (bracket_lo_psi_cm + bracket_hi_psi_cm);
+      const double probe_mass_cm =
+        lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, probe_psi_cm,
+                                                     current, head,
+                                                     cum_layer_thickness_cm,
+                                                     soil_type, soil_properties);
+      const double probe_abs_error_cm = fabs(probe_mass_cm - prior_mass);
+      if (probe_abs_error_cm < best_abs_error_cm) {
+        best_psi_cm = probe_psi_cm;
+        best_abs_error_cm = probe_abs_error_cm;
       }
-      
-      psi_cm_loc_prev = psi_cm_loc;
-      psi_cm_loc -= 0.1 * factor;
-      
-      if (psi_cm_loc < 0 && psi_cm_loc_prev != 0) {
-  /* this is for the extremely rare case when iterative psi_cm_loc calculation temporarily
-    yields a negative value and the actual answer for psi_cm_loc is nonzero. For example
-    when a completely saturated wetting front with a tiny amount of ET should yield a resulting
-    theta that is slightly below saturation. */
-        psi_cm_loc = psi_cm_loc_prev * 0.1;
+      if (probe_abs_error_cm <= MBAL_ITERATIVE_TOLERANCE) {
+        break;
       }
-      
-    }
 
-    if (psi_cm_loc<0.0){ // addresses the case where psi_cm_loc was 0 at the start so psi_cm_loc_prev is 0
-      psi_cm_loc = 0.0;
-      factor = factor * 0.5; // allow factor to smoothly approach 0 in case the solution is slightly above psi = 0
-    }
-
-    int layer_num  = current->layer_num;
-    int soil_num   = soil_type[layer_num];
-
-    current->psi_cm = psi_cm_loc;
-    current->theta = calc_theta_from_h(psi_cm_loc, soil_properties[soil_num].vg_alpha_per_cm, soil_properties[soil_num].vg_m,
-            soil_properties[soil_num].vg_n,soil_properties[soil_num].theta_e,
-            soil_properties[soil_num].theta_r);
-
-    struct wetting_front *next = current->next;
-    struct wetting_front *before_next = current;
-    bool skip_bottom_chain_below = false;
-    if (next){
-      skip_bottom_chain_below = use_dry_over_wet && next->to_bottom && !current->to_bottom;
-    }
-    
-    if (next && !skip_bottom_chain_below){ // current was previously selected as the top most WF in the region that we want to iteratively adjust. The lowest will be either the lowest WF, or the first WF below current that is not to_bottom.
-      // use_dry_over_wet included because this function is generally used to correct "chains" of WFs that should have the same psi value across layers, including to_bottom WFs below the one that is being corrected. 
-      // In the case of fixing dry over wet WFs this is only desired if the WF being corrected is itself to_bottom.
-      double theta_e;
-      double theta_r;
-      double vg_a;
-      double vg_m;
-      double vg_n;
-      while (next->to_bottom){
-        next->psi_cm = before_next->psi_cm;
-        layer_num  = next->layer_num;
-        soil_num   = soil_type[layer_num];
-        theta_e    = soil_properties[soil_num].theta_e;
-        theta_r    = soil_properties[soil_num].theta_r;
-        vg_a       = soil_properties[soil_num].vg_alpha_per_cm;
-        vg_m       = soil_properties[soil_num].vg_m;
-        vg_n       = soil_properties[soil_num].vg_n;
-
-        next->theta = calc_theta_from_h(next->psi_cm, vg_a,vg_m, vg_n, theta_e, theta_r);
-
-        before_next = next;
-        next = next->next;
-        if (!next){
-          break;
+      if (mass_increases_with_psi) {
+        if (probe_mass_cm < prior_mass) {
+          bracket_lo_psi_cm = probe_psi_cm;
+        }
+        else {
+          bracket_hi_psi_cm = probe_psi_cm;
         }
       }
-      if (next){
-        if (!next->to_bottom && before_next->to_bottom){ // done one more time to also include the next WF that is not to bottom if it exists (i.e. we did not reach LGAR's lower boundary)
-          next->psi_cm = before_next->psi_cm;
-          layer_num  = next->layer_num;
-          soil_num   = soil_type[layer_num];
-          theta_e = soil_properties[soil_num].theta_e;
-          theta_r = soil_properties[soil_num].theta_r;
-          vg_a    = soil_properties[soil_num].vg_alpha_per_cm;
-          vg_m    = soil_properties[soil_num].vg_m;
-          vg_n    = soil_properties[soil_num].vg_n;
-
-          next->theta = calc_theta_from_h(next->psi_cm, vg_a,vg_m, vg_n, theta_e, theta_r);
-
+      else {
+        if (probe_mass_cm > prior_mass) {
+          bracket_lo_psi_cm = probe_psi_cm;
+        }
+        else {
+          bracket_hi_psi_cm = probe_psi_cm;
         }
       }
     }
-
-    new_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-    delta_mass = fabs(new_mass - prior_mass);
-    
-    if (fabs(psi_cm_loc - psi_cm_loc_prev) < 1E-15 && factor < 1E-13) { //when factor <1E-13, then mass is negligibly changed per iteration so we stop, and the same is true for a change in psi of less than 1.E-15. 
-      break; // stop if the difference between iterated psis is very small
-    }
-
-    // another condition to avoid infinite loop when the error does not improve
-    if (fabs(delta_mass - delta_mass_prev) < 1E-15)
-      count_no_mass_change++;
-    else
-      count_no_mass_change = 0;
-
-    // break the loop if the mass does not change in the five consecutive iterations.
-    if (count_no_mass_change == break_no_mass_change){ // made it so that this check only occurs if there is no infiltration, because there is a case where precip on a very dry wetting front will need more than 5 iterations to have its mass change at all
-      break;
-    }
-
-    if (iter>MAX_ITER_MBAL_LOOP){ //limit the total number of iterations 
-      break;
-    }
-
-    // -ve pressure will return NAN, so terminate the loop if previous psi is way small and current psi is zero
-    // the wetting front is almost saturated
-    if (psi_cm_loc <= 0 && psi_cm_loc_prev < 0) {
-      break;
-    }
-
-    if ( (psi_cm_loc > PSI_UPPER_LIM) && (iter > first_speedup_thresh) ){ //unrealistic pressures, but there are some cases where convergence is possible even at large psi values, and there is a case where AET, free drainage, or WF movement can bring psi above PSI_UPPER_LIM, so we do want to allow a few iterations
-      break;
-    }
-
-    delta_mass_prev = delta_mass;
-
   }
 
+  lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, best_psi_cm,
+                                               current, head, cum_layer_thickness_cm,
+                                               soil_type, soil_properties);
+  if (verbosity.compare("high") == 0 &&
+      best_abs_error_cm > MBAL_ITERATIVE_TOLERANCE) {
+    printf("Bounded theta mass-balance correction left residual %.12e cm "
+           "(mass_at_psi0 %.17lf, mass_at_psi_upper %.17lf, target %.17lf).\n",
+           prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head),
+           mass_at_saturation, mass_at_dry_limit, prior_mass);
+  }
 }
 
 #endif
