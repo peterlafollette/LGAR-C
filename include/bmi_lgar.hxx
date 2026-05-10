@@ -88,7 +88,9 @@ public:
     this->calib_var_names[9]  = "b";
     this->calib_var_names[10] = "frac_to_CR";
     this->calib_var_names[11] = "spf_factor";
-
+    this->calib_var_names[12] = "a_slow";
+    this->calib_var_names[13] = "b_slow";
+    this->calib_var_names[14] = "frac_slow";
 
   };
   
@@ -153,7 +155,7 @@ private:
   struct model_state* state;
   static const int input_var_name_count  = 3;
   static const int output_var_name_count = 15;
-  static const int calib_var_name_count  = 12;
+  static const int calib_var_name_count  = 15;
   
   std::string input_var_names[input_var_name_count];
   std::string output_var_names[output_var_name_count];
