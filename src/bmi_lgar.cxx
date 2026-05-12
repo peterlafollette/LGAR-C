@@ -115,7 +115,7 @@ static double lgar_effective_groundwater_depth_cm(const lgar_bmi_parameters *par
 }
 
 static void lgar_update_mobile_groundwater_depth(lgar_bmi_parameters *params,
-                                                 double lower_boundary_flux_cm,
+                                                 double groundwater_storage_exchange_cm,
                                                  double reservoir_discharge_cm)
 {
   if (params == NULL || !params->mobile_groundwater_level) {
@@ -132,8 +132,8 @@ static void lgar_update_mobile_groundwater_depth(lgar_bmi_parameters *params,
     current_depth_cm = lgar_fixed_soil_depth_cm(params);
   }
 
-  if (!std::isfinite(lower_boundary_flux_cm)) {
-    lower_boundary_flux_cm = 0.0;
+  if (!std::isfinite(groundwater_storage_exchange_cm)) {
+    groundwater_storage_exchange_cm = 0.0;
   }
   if (!std::isfinite(reservoir_discharge_cm)) {
     reservoir_discharge_cm = 0.0;
@@ -142,7 +142,7 @@ static void lgar_update_mobile_groundwater_depth(lgar_bmi_parameters *params,
   // Depth is a diagnostic/proxy for existing groundwater-reservoir storage.
   // It is not added as a separate mass-balance storage term.
   const double net_groundwater_storage_gain_cm =
-    lower_boundary_flux_cm - reservoir_discharge_cm;
+    groundwater_storage_exchange_cm - reservoir_discharge_cm;
   const double updated_depth_cm =
     current_depth_cm - net_groundwater_storage_gain_cm / specific_yield;
 
@@ -1740,8 +1740,11 @@ Update()
                                               precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + lower_boundary_flux_for_CR/subtimestep_h,
                                               &state->lgar_mass_balance.CR_fast_storage_cm,
                                               &state->lgar_mass_balance.CR_slow_storage_cm);
+    const double mobile_groundwater_storage_input_cm =
+      lower_boundary_flux_for_mobile_groundwater_subtimestep_cm +
+      volpref_flow_to_CR_subtimestep_cm;
     lgar_update_mobile_groundwater_depth(&state->lgar_bmi_params,
-                                         lower_boundary_flux_for_mobile_groundwater_subtimestep_cm,
+                                         mobile_groundwater_storage_input_cm,
                                          volQ_CR_subtimestep_cm);
     if (state->lgar_bmi_params.mobile_groundwater_level &&
         state->lgar_bmi_params.TO_enabled) {
