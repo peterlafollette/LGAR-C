@@ -40,7 +40,16 @@ int main(int argc, char *argv[])
 
   model.Initialize(argv[1]);
   model_calib.Initialize(argv[1]);
-  
+
+  struct model_state *default_state = model.get_model();
+  if (default_state->lgar_bmi_params.mobile_groundwater_level) {
+    throw std::runtime_error("mobile_groundwater_level should default to false.");
+  }
+  if (std::fabs(default_state->lgar_bmi_params.groundwater_depth_cm -
+                default_state->lgar_bmi_params.soil_depth_cm) > 1.0e-12) {
+    throw std::runtime_error("Default groundwater depth should initialize to the fixed soil depth.");
+  }
+
   // The following variables and names are benchmark values and names, any (unintended/inconsistent) change to the bmi or model will lead to test failure.
   std::cout<<"\n**************** TEST VALUES ************************************\n";
   int num_layers         = 3;       // total number of layers

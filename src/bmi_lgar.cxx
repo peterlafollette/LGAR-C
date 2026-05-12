@@ -83,6 +83,219 @@ string verbosity="none";
 #define LGARTO_EVENT_SPLIT_MAX_PER_FORCING 1000
 #endif
 
+#ifndef LGARTO_MOBILE_GROUNDWATER_SPECIFIC_YIELD
+#define LGARTO_MOBILE_GROUNDWATER_SPECIFIC_YIELD ((double)1.0)
+#endif
+
+static double lgar_fixed_soil_depth_cm(const lgar_bmi_parameters *params)
+{
+  if (params == NULL) {
+    return 0.0;
+  }
+
+  if (params->num_layers > 0 && params->cum_layer_thickness_cm != NULL) {
+    return params->cum_layer_thickness_cm[params->num_layers];
+  }
+
+  return params->soil_depth_cm;
+}
+
+static double lgar_effective_groundwater_depth_cm(const lgar_bmi_parameters *params)
+{
+  const double fixed_depth_cm = lgar_fixed_soil_depth_cm(params);
+  if (params == NULL || !params->mobile_groundwater_level) {
+    return fixed_depth_cm;
+  }
+
+  if (!std::isfinite(params->groundwater_depth_cm) || params->groundwater_depth_cm < 0.0) {
+    return fixed_depth_cm;
+  }
+
+  return params->groundwater_depth_cm;
+}
+
+static void lgar_update_mobile_groundwater_depth(lgar_bmi_parameters *params,
+                                                 double lower_boundary_flux_cm,
+                                                 double reservoir_discharge_cm)
+{
+  if (params == NULL || !params->mobile_groundwater_level) {
+    return;
+  }
+
+  const double specific_yield = LGARTO_MOBILE_GROUNDWATER_SPECIFIC_YIELD;
+  if (!std::isfinite(specific_yield) || specific_yield <= 0.0) {
+    return;
+  }
+
+  double current_depth_cm = lgar_effective_groundwater_depth_cm(params);
+  if (!std::isfinite(current_depth_cm)) {
+    current_depth_cm = lgar_fixed_soil_depth_cm(params);
+  }
+
+  if (!std::isfinite(lower_boundary_flux_cm)) {
+    lower_boundary_flux_cm = 0.0;
+  }
+  if (!std::isfinite(reservoir_discharge_cm)) {
+    reservoir_discharge_cm = 0.0;
+  }
+
+  // Depth is a diagnostic/proxy for existing groundwater-reservoir storage.
+  // It is not added as a separate mass-balance storage term.
+  const double net_groundwater_storage_gain_cm =
+    lower_boundary_flux_cm - reservoir_discharge_cm;
+  const double updated_depth_cm =
+    current_depth_cm - net_groundwater_storage_gain_cm / specific_yield;
+
+  if (std::isfinite(updated_depth_cm)) {
+    params->groundwater_depth_cm = fmax(0.0, updated_depth_cm);
+  }
+}
+
+static double lgar_CR_capillary_supply_scale(const model_state *state,
+                                             double upward_demand_cm)
+{
+  if (state == NULL || upward_demand_cm <= SMALL_EPS ||
+      !state->lgar_bmi_params.TO_enabled ||
+      !state->lgar_bmi_params.mobile_groundwater_level ||
+      !state->lgar_bmi_params.lower_bdy_flux_to_CR) {
+    return 1.0;
+  }
+
+  const double threshold_cm =
+    state->lgar_bmi_params.CR_capillary_supply_threshold_cm;
+  if (!std::isfinite(threshold_cm) || threshold_cm <= 0.0) {
+    return 1.0;
+  }
+
+  const double CR_storage_cm =
+    fmax(state->lgar_mass_balance.CR_fast_storage_cm, 0.0) +
+    fmax(state->lgar_mass_balance.CR_slow_storage_cm, 0.0);
+  if (CR_storage_cm <= SMALL_EPS) {
+    return 0.0;
+  }
+
+  double scale = fmin(1.0, CR_storage_cm / threshold_cm);
+  scale = fmin(scale, CR_storage_cm / upward_demand_cm);
+  return fmax(0.0, fmin(1.0, scale));
+}
+
+static double lgar_project_upward_TO_flux_demand_cm(const model_state *state,
+                                                    double subtimestep_h)
+{
+  if (state == NULL || state->head == NULL || subtimestep_h <= 0.0) {
+    return 0.0;
+  }
+
+  double upward_demand_cm = 0.0;
+  const int wetting_front_count = listLength(state->head);
+  for (int wf = wetting_front_count - 1; wf >= 1; wf--) {
+    const wetting_front *current = listFindFront(wf, state->head, NULL);
+    if (current == NULL || !current->is_WF_GW || current->to_bottom ||
+        current->dzdt_cm_per_h >= 0.0) {
+      continue;
+    }
+
+    const wetting_front *next_to_use = current->next;
+    while (next_to_use != NULL && !next_to_use->is_WF_GW) {
+      next_to_use = next_to_use->next;
+    }
+
+    if (next_to_use == NULL ||
+        current->layer_num < 1 ||
+        current->layer_num > state->lgar_bmi_params.num_layers) {
+      continue;
+    }
+
+    double delta_depth_cm = current->dzdt_cm_per_h * subtimestep_h;
+    if (current->depth_cm + delta_depth_cm < 0.0) {
+      delta_depth_cm = -current->depth_cm;
+    }
+    if (delta_depth_cm >= 0.0) {
+      continue;
+    }
+
+    double delta_theta = 0.0;
+    if (current->layer_num == next_to_use->layer_num) {
+      delta_theta = next_to_use->theta - current->theta;
+    }
+    else {
+      const int soil_num_current =
+        state->lgar_bmi_params.layer_soil_type[current->layer_num];
+      const double theta_e_current =
+        state->soil_properties[soil_num_current].theta_e;
+      const double theta_r_current =
+        state->soil_properties[soil_num_current].theta_r;
+      const double vg_a_current =
+        state->soil_properties[soil_num_current].vg_alpha_per_cm;
+      const double vg_m_current =
+        state->soil_properties[soil_num_current].vg_m;
+      const double vg_n_current =
+        state->soil_properties[soil_num_current].vg_n;
+      const double equiv_next_theta =
+        calc_theta_from_h(next_to_use->psi_cm, vg_a_current, vg_m_current,
+                          vg_n_current, theta_e_current, theta_r_current);
+      delta_theta = equiv_next_theta - current->theta;
+    }
+
+    const double projected_flux_cm = delta_depth_cm * delta_theta;
+    if (std::isfinite(projected_flux_cm) && projected_flux_cm < 0.0) {
+      upward_demand_cm += -projected_flux_cm;
+    }
+  }
+
+  return upward_demand_cm;
+}
+
+static void lgar_limit_upward_TO_dzdt_by_CR_supply(model_state *state,
+                                                   double subtimestep_h)
+{
+  const double upward_demand_cm =
+    lgar_project_upward_TO_flux_demand_cm(state, subtimestep_h);
+  const double supply_scale =
+    lgar_CR_capillary_supply_scale(state, upward_demand_cm);
+
+  if (supply_scale >= 1.0 - SMALL_EPS) {
+    return;
+  }
+
+  for (wetting_front *current = state->head; current != NULL; current = current->next) {
+    if (current->is_WF_GW && !current->to_bottom &&
+        current->dzdt_cm_per_h < 0.0) {
+      current->dzdt_cm_per_h =
+        (supply_scale <= SMALL_EPS) ? 0.0 : current->dzdt_cm_per_h * supply_scale;
+    }
+  }
+
+  if (verbosity.compare("high") == 0) {
+    printf("Limited upward TO dzdt by CR capillary supply: "
+           "upward_demand_cm=%.12e scale=%.12e CR_storage_cm=%.12e "
+           "threshold_cm=%.12e.\n",
+           upward_demand_cm,
+           supply_scale,
+           fmax(state->lgar_mass_balance.CR_fast_storage_cm, 0.0) +
+             fmax(state->lgar_mass_balance.CR_slow_storage_cm, 0.0),
+           state->lgar_bmi_params.CR_capillary_supply_threshold_cm);
+  }
+}
+
+static double lgar_limit_cached_negative_lower_boundary_flux_by_CR_supply(
+    const model_state *state,
+    double lower_boundary_flux_cm)
+{
+  if (lower_boundary_flux_cm >= 0.0) {
+    return lower_boundary_flux_cm;
+  }
+
+  const double upward_demand_cm = -lower_boundary_flux_cm;
+  const double supply_scale =
+    lgar_CR_capillary_supply_scale(state, upward_demand_cm);
+  if (supply_scale >= 1.0 - SMALL_EPS) {
+    return lower_boundary_flux_cm;
+  }
+
+  return (supply_scale <= SMALL_EPS) ? 0.0 : lower_boundary_flux_cm * supply_scale;
+}
+
 static double lgar_max_abs_mobile_dzdt_for_flux_cache(const wetting_front *head)
 {
   double max_abs_dzdt = 0.0;
@@ -627,6 +840,7 @@ Update()
   double volrunoff_subtimestep_cm;
   double volrech_subtimestep_cm;
   double lower_boundary_flux_for_cache_subtimestep_cm = 0.0;
+  double lower_boundary_flux_for_mobile_groundwater_subtimestep_cm = 0.0;
   double precip_previous_subtimestep_cm;
   double volCRstart_subtimestep_cm;
   double volCRend_subtimestep_cm = volCRend_timestep_cm;
@@ -641,6 +855,10 @@ Update()
   double a_slow = state->lgar_bmi_params.a_slow;
   double b_slow = state->lgar_bmi_params.b_slow;
   double frac_slow = state->lgar_bmi_params.frac_slow;
+  double CR_fast_discharge_threshold_cm =
+    state->lgar_bmi_params.CR_fast_discharge_threshold_cm;
+  double CR_slow_discharge_threshold_cm =
+    state->lgar_bmi_params.CR_slow_discharge_threshold_cm;
   double spf_factor = state->lgar_bmi_params.spf_factor;
   bool use_closed_form_G = state->lgar_bmi_params.use_closed_form_G; 
   bool adaptive_timestep = state->lgar_bmi_params.adaptive_timestep;
@@ -1087,18 +1305,22 @@ Update()
 	      if(create_surficial_front) {
 	        trace_branch = "create_surficial_front";
 
-	        double temp_pd = 0.0; // necessary to assign zero precip due to the creation of new wetting front; AET will still be taken out of the layers
+        double temp_pd = 0.0; // necessary to assign zero precip due to the creation of new wetting front; AET will still be taken out of the layers
 
         // move the wetting fronts without adding any water; this is done to close the mass balance
         // and also to merge / cross if necessary 
+        lgar_limit_upward_TO_dzdt_by_CR_supply(state, subtimestep_h);
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
 	              &state->head, state->state_previous, state->soil_properties,
-	              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
-	              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
-	              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
-	              state->lgar_bmi_params.mbal_tol);
+		              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+		              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+		              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
+		              state->lgar_bmi_params.mbal_tol,
+		              state->lgar_bmi_params.TO_enabled
+		                ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
+		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params));
 
 	        // if (temp_pd != 0.0){ //if temp_pd != 0.0, that means that some water left the model through the lower model bdy. For LGARTO preparation, this has been refactored such that temp_rch handles this now.
 	        //   // volrech_subtimestep_cm = temp_pd;
@@ -1155,8 +1377,11 @@ Update()
 		        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
 		            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
 		            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties,
-	              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm,
-	              trace_surface_creation_gw_capacity_cm);
+		              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm,
+		              trace_surface_creation_gw_capacity_cm,
+		              state->lgar_bmi_params.TO_enabled
+		                ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
+		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params));
           creation_excess_gw_flux_subtimestep_cm += creation_excess_gw_flux_cm;
           creation_excess_runoff_subtimestep_cm += creation_excess_runoff_cm;
 
@@ -1191,11 +1416,12 @@ Update()
           // available for infiltration. LGARTO's TO drainage happens later in the
           // substep, so add a read-only positive projection here to avoid routing
           // water to runoff just before TO motion creates room.
-	          trace_projected_TO_storage_release_cm =
-	            lgarto_project_TO_motion_lower_boundary_flux_cm(subtimestep_h, num_layers,
-	                                                            state->lgar_bmi_params.cum_layer_thickness_cm,
-	                                                            state->lgar_bmi_params.layer_soil_type,
-	                                                            state->head, state->soil_properties);
+          trace_projected_TO_storage_release_cm =
+            lgarto_project_TO_motion_lower_boundary_flux_cm(subtimestep_h, num_layers,
+                                                            state->lgar_bmi_params.cum_layer_thickness_cm,
+                                                            state->lgar_bmi_params.layer_soil_type,
+                                                            state->head, state->soil_properties,
+                                                            lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params));
 	          insertion_storage_release_subtimestep_cm += trace_projected_TO_storage_release_cm;
 	        }
 	        trace_insertion_storage_release_cm = insertion_storage_release_subtimestep_cm;
@@ -1243,14 +1469,18 @@ Update()
         double volin_subtimestep_cm_temp = volin_subtimestep_cm;  /* passing this for mass balance only, the method modifies it
                     and returns percolated value, so we need to keep its original
                     value stored to copy it back*/
+        lgar_limit_upward_TO_dzdt_by_CR_supply(state, subtimestep_h);
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, cached_lower_boundary_flux_correction_cm,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
 	              &state->head, state->state_previous, state->soil_properties,
-	              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
-	              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
-	              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
-	              state->lgar_bmi_params.mbal_tol);
+		              state->lgar_bmi_params.TO_enabled ? surf_AET_vec.data() : nullptr,
+		              PET_subtimestep_cm_per_h, wilting_point_psi_cm, field_capacity_psi_cm,
+		              state->lgar_bmi_params.root_zone_depth_cm, surf_frac_rz,
+		              state->lgar_bmi_params.mbal_tol,
+		              state->lgar_bmi_params.TO_enabled
+		                ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
+		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params));
 
         // this is the volume of water leaving through the bottom
         volrech_subtimestep_cm = volin_subtimestep_cm;
@@ -1291,7 +1521,8 @@ Update()
       }
       lgar_dzdt_calc(use_closed_form_G, nint, num_layers, ponded_depth_subtimestep_cm, subtimestep_h, state->lgar_bmi_params.layer_soil_type,
         state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
-        state->head, state->soil_properties, switch_caching, state->lgar_bmi_params.cache_count, new_front);
+        state->head, state->soil_properties, switch_caching, state->lgar_bmi_params.cache_count, new_front,
+        lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params));
 
       if (switch_caching){
         state->lgar_bmi_params.cache_count = 1;
@@ -1311,7 +1542,8 @@ Update()
             subtimestep_h, num_layers,
             state->lgar_bmi_params.cum_layer_thickness_cm,
             state->lgar_bmi_params.layer_soil_type,
-            state->head, state->soil_properties);
+            state->head, state->soil_properties,
+            lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params));
         const double creation_residual_to_lower_boundary_cm =
           fmin(creation_excess_runoff_subtimestep_cm,
                trace_surface_creation_post_creation_TO_release_cm);
@@ -1349,13 +1581,22 @@ Update()
 	      const double lower_boundary_flux_subtimestep_cm =
 	        temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
 	      lower_boundary_flux_for_cache_subtimestep_cm = lower_boundary_flux_subtimestep_cm;
+      lower_boundary_flux_for_mobile_groundwater_subtimestep_cm =
+        lower_boundary_flux_subtimestep_cm;
 	      volrech_subtimestep_cm = 0.0;
+      double lower_boundary_CR_exchange_cm = 0.0;
       lgar_partition_lower_boundary_flux_for_CR(
         state->lgar_bmi_params.lower_bdy_flux_to_CR,
         lower_boundary_flux_subtimestep_cm,
         &volrech_subtimestep_cm,
 	        &lower_boundary_flux_for_CR,
-	        &state->lgar_mass_balance.CR_fast_storage_cm);
+	        &state->lgar_mass_balance.CR_fast_storage_cm,
+	        &state->lgar_mass_balance.CR_slow_storage_cm,
+        &lower_boundary_CR_exchange_cm);
+      if (state->lgar_bmi_params.lower_bdy_flux_to_CR) {
+        lower_boundary_flux_for_mobile_groundwater_subtimestep_cm =
+          lower_boundary_CR_exchange_cm;
+      }
 
 	      const double runoff_before_creation_excess_cm = volrunoff_subtimestep_cm;
 	      volrunoff_subtimestep_cm += creation_excess_runoff_subtimestep_cm;
@@ -1421,13 +1662,25 @@ Update()
       state->lgar_mass_balance.accumulated_PET_cm += PET_subtimestep_cm;
 
       lower_boundary_flux_for_cache_subtimestep_cm = state->lgar_mass_balance.previous_lower_boundary_flux_cm;
+      lower_boundary_flux_for_cache_subtimestep_cm =
+        lgar_limit_cached_negative_lower_boundary_flux_by_CR_supply(
+          state, lower_boundary_flux_for_cache_subtimestep_cm);
+      lower_boundary_flux_for_mobile_groundwater_subtimestep_cm =
+        lower_boundary_flux_for_cache_subtimestep_cm;
+      double lower_boundary_CR_exchange_cm = 0.0;
       lgar_partition_lower_boundary_flux_for_CR(
         state->lgar_bmi_params.lower_bdy_flux_to_CR,
         lower_boundary_flux_for_cache_subtimestep_cm,
         &volrech_subtimestep_cm,
         &lower_boundary_flux_for_CR,
-        &state->lgar_mass_balance.CR_fast_storage_cm);
-	      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += state->lgar_mass_balance.previous_lower_boundary_flux_cm;
+        &state->lgar_mass_balance.CR_fast_storage_cm,
+        &state->lgar_mass_balance.CR_slow_storage_cm,
+        &lower_boundary_CR_exchange_cm);
+      if (state->lgar_bmi_params.lower_bdy_flux_to_CR) {
+        lower_boundary_flux_for_mobile_groundwater_subtimestep_cm =
+          lower_boundary_CR_exchange_cm;
+      }
+	      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += lower_boundary_flux_for_cache_subtimestep_cm;
 
 	      const lgarto_infiltration_limit_trace_row trace_row = {
 	        state->lgar_bmi_params.timesteps,
@@ -1480,7 +1733,86 @@ Update()
     double vollgarto_domain_to_CR_subtimestep_cm = lower_boundary_flux_for_CR;
     double volin_CR_subtimestep_cm =
       volpref_flow_to_CR_subtimestep_cm + vollgarto_domain_to_CR_subtimestep_cm;
-    double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow, frac_slow, precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + lower_boundary_flux_for_CR/subtimestep_h, &state->lgar_mass_balance.CR_fast_storage_cm, &state->lgar_mass_balance.CR_slow_storage_cm);
+    double volQ_CR_subtimestep_cm = calc_CR_Q(subtimestep_h, a, a_slow, b, b_slow,
+                                              CR_fast_discharge_threshold_cm,
+                                              CR_slow_discharge_threshold_cm,
+                                              frac_slow,
+                                              precip_for_CR_subtimestep_cm_per_h + ponded_flux_for_CR + lower_boundary_flux_for_CR/subtimestep_h,
+                                              &state->lgar_mass_balance.CR_fast_storage_cm,
+                                              &state->lgar_mass_balance.CR_slow_storage_cm);
+    lgar_update_mobile_groundwater_depth(&state->lgar_bmi_params,
+                                         lower_boundary_flux_for_mobile_groundwater_subtimestep_cm,
+                                         volQ_CR_subtimestep_cm);
+    if (state->lgar_bmi_params.mobile_groundwater_level &&
+        state->lgar_bmi_params.TO_enabled) {
+      for (int repair_iter = 0; repair_iter < MAX_NUM_WETTING_FRONTS; repair_iter++) {
+        const double mobile_groundwater_submergence_flux_cm =
+          lgarto_submerge_wetting_fronts_below_groundwater(
+            lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params),
+            num_layers,
+            state->lgar_bmi_params.cum_layer_thickness_cm,
+            state->lgar_bmi_params.layer_soil_type,
+            state->lgar_bmi_params.frozen_factor,
+            &state->head,
+            state->soil_properties);
+
+        if (fabs(mobile_groundwater_submergence_flux_cm) <= SMALL_EPS) {
+          break;
+        }
+
+        lower_boundary_flux_for_cache_subtimestep_cm +=
+          mobile_groundwater_submergence_flux_cm;
+
+        double mobile_groundwater_storage_exchange_cm =
+          mobile_groundwater_submergence_flux_cm;
+
+        if (state->lgar_bmi_params.lower_bdy_flux_to_CR &&
+            mobile_groundwater_submergence_flux_cm > 0.0) {
+          // This repair is discovered after CR discharge was computed for the
+          // substep, so add it to storage for subsequent discharge timing.
+          const double slow_input_cm =
+            mobile_groundwater_submergence_flux_cm * frac_slow;
+          const double fast_input_cm =
+            mobile_groundwater_submergence_flux_cm - slow_input_cm;
+          state->lgar_mass_balance.CR_fast_storage_cm += fast_input_cm;
+          state->lgar_mass_balance.CR_slow_storage_cm += slow_input_cm;
+          lower_boundary_flux_for_CR += mobile_groundwater_submergence_flux_cm;
+          vollgarto_domain_to_CR_subtimestep_cm +=
+            mobile_groundwater_submergence_flux_cm;
+          volin_CR_subtimestep_cm += mobile_groundwater_submergence_flux_cm;
+        }
+        else if (state->lgar_bmi_params.lower_bdy_flux_to_CR &&
+                 mobile_groundwater_submergence_flux_cm < 0.0) {
+          double repair_percolation_cm = 0.0;
+          double repair_CR_input_cm = 0.0;
+          double repair_CR_exchange_cm = 0.0;
+          lgar_partition_lower_boundary_flux_for_CR(
+            true,
+            mobile_groundwater_submergence_flux_cm,
+            &repair_percolation_cm,
+            &repair_CR_input_cm,
+            &state->lgar_mass_balance.CR_fast_storage_cm,
+            &state->lgar_mass_balance.CR_slow_storage_cm,
+            &repair_CR_exchange_cm);
+          mobile_groundwater_storage_exchange_cm = repair_CR_exchange_cm;
+          volrech_subtimestep_cm += repair_percolation_cm;
+          lower_boundary_flux_for_CR += repair_CR_input_cm;
+          vollgarto_domain_to_CR_subtimestep_cm += repair_CR_input_cm;
+          volin_CR_subtimestep_cm += repair_CR_input_cm;
+        }
+        else {
+          volrech_subtimestep_cm += mobile_groundwater_submergence_flux_cm;
+        }
+
+        lgar_update_mobile_groundwater_depth(&state->lgar_bmi_params,
+                                             mobile_groundwater_storage_exchange_cm,
+                                             0.0);
+        volend_subtimestep_cm =
+          lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm,
+                             state->head);
+        volend_timestep_cm = volend_subtimestep_cm;
+      }
+    }
     state->lgar_mass_balance.volrunoff_CR_cm += volQ_CR_subtimestep_cm;
     volQ_CR_timestep_cm += volQ_CR_subtimestep_cm;
     volpref_flow_to_CR_timestep_cm += volpref_flow_to_CR_subtimestep_cm;

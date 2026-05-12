@@ -19,6 +19,7 @@ typedef struct {
   int front_num;
   double psi_cm;          // INTERNAL units (cm) after dividing by 10
   double dzdt_cm_per_h;   // INTERNAL units (cm/h), stored directly in file
+  bool is_WF_GW;          // true for TO/GW wetting fronts, false for surface wetting fronts
 } WFRecord;
 
 static int cmp_record_by_front_num(const void *a, const void *b)
@@ -52,10 +53,11 @@ static bool read_next_data_line(FILE *fp, char *buf, size_t buflen)
 
 /*
   Parses a state line like:
-    [(180.000000,0.197519,1,1,20000.000000,0.000010)|(...)]
+    [(180.000000,0.197519,1,1,20000.000000,0.000010,1)|(...)]
   Using FILE units:
     depth and psi are written as *10 in the file and converted back to internal cm by /10.
     dzdt is written/read directly in cm/h.
+    is_WF_GW is optional for backward compatibility: 1 means TO/GW, 0 means surface.
   This parser REQUIRES dzdt to be present. It will fail on old 5-field files.
 */
 static int parse_state_line_to_records(const char *line_in, WFRecord **recs_out, int *n_out)
@@ -89,12 +91,20 @@ static int parse_state_line_to_records(const char *line_in, WFRecord **recs_out,
 
     double depth_file, theta, psi_file, dzdt_cm_per_h;
     int layer_num, front_num;
+    int is_WF_GW_int = 0;
 
-    int matched = sscanf(tok, " ( %lf , %lf , %d , %d , %lf , %lf ) ",
+    int matched = sscanf(tok, " ( %lf , %lf , %d , %d , %lf , %lf , %d ) ",
                          &depth_file, &theta, &layer_num, &front_num,
-                         &psi_file, &dzdt_cm_per_h);
+                         &psi_file, &dzdt_cm_per_h, &is_WF_GW_int);
 
-    if (matched != 6) {
+    if (matched != 7) {
+      matched = sscanf(tok, " ( %lf , %lf , %d , %d , %lf , %lf ) ",
+                       &depth_file, &theta, &layer_num, &front_num,
+                       &psi_file, &dzdt_cm_per_h);
+      is_WF_GW_int = 0;
+    }
+
+    if (matched != 6 && matched != 7) {
       free(recs);
       free(line);
       return 4;
@@ -117,6 +127,7 @@ static int parse_state_line_to_records(const char *line_in, WFRecord **recs_out,
     recs[n].front_num      = front_num;
     recs[n].psi_cm         = psi_file / 10.0;     // undo writer scaling
     recs[n].dzdt_cm_per_h  = dzdt_cm_per_h;       // stored directly
+    recs[n].is_WF_GW       = is_WF_GW_int != 0;
     n++;
   }
 
@@ -176,7 +187,7 @@ extern void InitializeWettingFrontsFromCSV(
   if (perr != 0 || !recs || nrecs <= 0) {
     fprintf(stderr, "ERROR: failed to parse state line in %s (err=%d). "
                     "Expected tuples of the form "
-                    "(depth_x10,theta,layer_num,front_num,psi_x10,dzdt_cm_per_h)\n",
+                    "(depth_x10,theta,layer_num,front_num,psi_x10,dzdt_cm_per_h[,is_WF_GW])\n",
             data_layers_csv_path, perr);
     exit(1);
   }
@@ -225,6 +236,7 @@ extern void InitializeWettingFrontsFromCSV(
     // Trust file theta, psi, and dzdt
     current->psi_cm = r.psi_cm;
     current->dzdt_cm_per_h = r.dzdt_cm_per_h;
+    current->is_WF_GW = r.is_WF_GW;
 
     // Compute K from theta
     int soil = layer_soil_type[r.layer_num];
@@ -260,6 +272,8 @@ typedef struct {
   double volon_timestep_cm;
   bool runoff_in_prev_step;
   double precip_previous_timestep_cm;
+  bool has_groundwater_depth_cm;
+  double groundwater_depth_cm;
 } nonvadoseRestartState;
 
 static bool parse_bool_01(const char *s, bool *out)
@@ -285,6 +299,8 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
   bool got_volon = false;
   bool got_runoff = false;
   bool got_precip_prev = false;
+  rst->has_groundwater_depth_cm = false;
+  rst->groundwater_depth_cm = 0.0;
 
   char *saveptr = NULL;
   for (char *tok = strtok_r(line, ",\r\n", &saveptr);
@@ -325,6 +341,10 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
     else if (strcmp(key, "precip_previous_timestep_cm") == 0) {
       rst->precip_previous_timestep_cm = strtod(val, NULL);
       got_precip_prev = true;
+    }
+    else if (strcmp(key, "groundwater_depth_cm") == 0) {
+      rst->groundwater_depth_cm = strtod(val, NULL);
+      rst->has_groundwater_depth_cm = true;
     }
   }
 
@@ -402,6 +422,9 @@ extern void InitializenonvadoseStateFromCSV(
   state->lgar_mass_balance.volon_timestep_cm = rst.volon_timestep_cm;
   state->lgar_bmi_params.runoff_in_prev_step = rst.runoff_in_prev_step;
   state->lgar_bmi_params.precip_previous_timestep_cm = rst.precip_previous_timestep_cm;
+  if (rst.has_groundwater_depth_cm) {
+    state->lgar_bmi_params.groundwater_depth_cm = rst.groundwater_depth_cm;
+  }
 
   // Keep the "current total CR volume" field consistent with the restored storages.
   state->lgar_mass_balance.volCRend_cm =

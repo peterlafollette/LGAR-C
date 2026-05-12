@@ -107,8 +107,14 @@ int main(int argc, char *argv[])
 
     // write heading (variable names)
     fprintf(outdata_fptr,"Time,");
-    fprintf(outnonvadose_fptr,
-        "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm\n");
+    if (model_state.get_model()->lgar_bmi_params.mobile_groundwater_level) {
+      fprintf(outnonvadose_fptr,
+          "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm,groundwater_depth_cm\n");
+    }
+    else {
+      fprintf(outnonvadose_fptr,
+          "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm\n");
+    }
     for (int j = 0; j < num_output_var; j++) {
       fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
       if (j == num_output_var-1)
@@ -288,9 +294,9 @@ extern void write_state(FILE *out, struct wetting_front* head){
   while(current != NULL)
   {
     if (current == head)
-      fprintf(out,"(%lf,%lf,%d,%d,%lf,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h);
+      fprintf(out,"(%lf,%lf,%d,%d,%lf,%lf,%d)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h,current->is_WF_GW ? 1 : 0);
     else
-      fprintf(out,"|(%lf,%lf,%d,%d,%lf,%lf)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h);
+      fprintf(out,"|(%lf,%lf,%d,%d,%lf,%lf,%d)",current->depth_cm*10., current->theta, current->layer_num,current->front_num, current->psi_cm*10.,current->dzdt_cm_per_h,current->is_WF_GW ? 1 : 0);
   current = current->next;
   }
   fprintf(out, "]\n");
@@ -305,12 +311,17 @@ extern void write_non_vadose_state(FILE *out, struct model_state* state)
           "CR_slow_storage_cm=%0.17g,"
           "volon_timestep_cm=%0.17g,"
           "runoff_in_prev_step=%d,"
-          "precip_previous_timestep_cm=%0.17g\n",
+          "precip_previous_timestep_cm=%0.17g",
           state->lgar_mass_balance.CR_fast_storage_cm,
           state->lgar_mass_balance.CR_slow_storage_cm,
           state->lgar_mass_balance.volon_timestep_cm,
           state->lgar_bmi_params.runoff_in_prev_step ? 1 : 0,
           state->lgar_bmi_params.precip_previous_timestep_cm);
+  if (state->lgar_bmi_params.mobile_groundwater_level) {
+    fprintf(out, ",groundwater_depth_cm=%0.17g",
+            state->lgar_bmi_params.groundwater_depth_cm);
+  }
+  fprintf(out, "\n");
 }
 
 extern void write_giuh_runoff_queue_state(
