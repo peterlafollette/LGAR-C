@@ -267,8 +267,7 @@ extern void InitializeWettingFrontsFromCSV(
         r.depth_cm > layer_bottom_cm + 1.0e-8) {
       fprintf(stderr,
               "ERROR: restart front_num=%d has depth_cm=%.17g outside layer %d "
-              "bounds [%.17g, %.17g] cm. Regenerate old x10/mm restart files "
-              "with the current cm-unit writer before loading.\n",
+              "bounds [%.17g, %.17g] cm.\n",
               r.front_num, r.depth_cm, r.layer_num,
               layer_top_cm, layer_bottom_cm);
       free(recs);
