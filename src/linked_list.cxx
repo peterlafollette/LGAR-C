@@ -81,6 +81,7 @@ extern struct wetting_front* listCopy(struct wetting_front* current, struct wett
     wf->layer_num = current->layer_num;
     wf->front_num = current->front_num;
     wf->to_bottom = current->to_bottom;
+    wf->is_root_zone = current->is_root_zone;
     wf->dzdt_cm_per_h = current->dzdt_cm_per_h;
     wf->next = listCopy(current->next, NULL);
 
@@ -94,7 +95,7 @@ extern struct wetting_front* listCopy(struct wetting_front* current, struct wett
 /*#######################################################*/
 /* listInsertFirst - adds a list entry to start of list  */
 /*#######################################################*/
-extern void listInsertFirst(double depth, double theta, int front_num, int layer_num, bool bottom_flag, struct wetting_front** head)
+extern void listInsertFirst(double depth, double theta, int front_num, int layer_num, bool bottom_flag, struct wetting_front** head, bool root_zone_flag)
 {
 
   //create a link
@@ -105,6 +106,7 @@ extern void listInsertFirst(double depth, double theta, int front_num, int layer
   link->front_num = front_num;
   link->layer_num = layer_num;
   link->to_bottom = bottom_flag;
+  link->is_root_zone = root_zone_flag;
   link->dzdt_cm_per_h = (double)0.0;
   
   //point it to old first wetting_front
@@ -299,7 +301,7 @@ extern struct wetting_front* listDeleteFront(int front_num, struct wetting_front
 /* new front number by 1.                                             */
 /*####################################################################*/
 extern struct wetting_front* listInsertFront(double depth, double theta, int new_front_num,
-                                             int layer_num, bool bottom_flag, struct wetting_front** head)
+                                             int layer_num, bool bottom_flag, struct wetting_front** head, bool root_zone_flag)
 {
   //start from the first link
   struct wetting_front* current = NULL;
@@ -316,6 +318,7 @@ extern struct wetting_front* listInsertFront(double depth, double theta, int new
       link->front_num = new_front_num;
       link->layer_num = layer_num;
       link->to_bottom = bottom_flag;
+      link->is_root_zone = root_zone_flag;
       link->dzdt_cm_per_h = (double)(0.0);
       link->next = NULL;
       *head=link;
@@ -338,12 +341,13 @@ extern struct wetting_front* listInsertFront(double depth, double theta, int new
       link->front_num = new_front_num;
       link->layer_num = layer_num;
       link->to_bottom = bottom_flag;
+      link->is_root_zone = root_zone_flag;
       link->dzdt_cm_per_h = (double)(0.0);
       link->next = previous->next ;
       previous->next = link;
 
-      while(link->next != NULL) { // increment all front numbers
-	current = link->next;
+      current = link->next;
+      while(current != NULL) { // increment all front numbers
 	current->front_num++;
 	previous = current;
 	current = current->next;
@@ -384,6 +388,7 @@ extern struct wetting_front* listInsertFrontAtDepth(int num_layers, double *cum_
     link->depth_cm = depth;
     link->theta = theta;
     link->to_bottom = FALSE;
+    link->is_root_zone = false;
 
     layer_found_flag = listFindLayer(link,num_layers,cum_layer_thickness, &el_layer, &extends_to_bottom_flag);
 
@@ -409,6 +414,7 @@ extern struct wetting_front* listInsertFrontAtDepth(int num_layers, double *cum_
       link->depth_cm = depth;
       link->theta = theta;
       link->to_bottom = FALSE;
+      link->is_root_zone = false;
 
       layer_found_flag = listFindLayer(link,num_layers,cum_layer_thickness, &el_layer, &extends_to_bottom_flag);
 
@@ -438,6 +444,7 @@ extern struct wetting_front* listInsertFrontAtDepth(int num_layers, double *cum_
 	  link->depth_cm = depth;
 	  link->theta = theta;
 	  link->to_bottom = FALSE;
+	  link->is_root_zone = false;
 
 	  layer_found_flag = listFindLayer(link,num_layers,cum_layer_thickness,
 					   &el_layer, &extends_to_bottom_flag);
@@ -542,6 +549,10 @@ extern void listSortFrontsByDepth(struct wetting_front *head)
 	tempKey = current->front_num;
 	current->front_num = next->front_num;
 	next->front_num = tempKey;
+
+	bool tempBool = current->is_root_zone;
+	current->is_root_zone = next->is_root_zone;
+	next->is_root_zone = tempBool;
       }
 
       current = current->next;

@@ -325,6 +325,10 @@ Update()
     state->lgar_mass_balance.cache_fluxes = FALSE;
   }
 
+  if (state->lgar_bmi_params.root_zone_enabled && wetting_front_root_zone(state->head) > 0) {
+    state->lgar_mass_balance.cache_fluxes = FALSE;
+  }
+
   if (caching_at_start && !state->lgar_mass_balance.cache_fluxes){
     switch_caching = TRUE;//if you switch from cached to not, you need to add the "missing" PET back into the mass balance and AET calculation 
   }
@@ -446,10 +450,9 @@ Update()
         min_storage += state->soil_properties[soil_num_min_check].theta_r * (state->lgar_bmi_params.cum_layer_thickness_cm[k]-state->lgar_bmi_params.cum_layer_thickness_cm[k-1]);
       }
 
-      int wf_free_drainage_demand = wetting_front_free_drainage(state->head);
-
-      double min_water_possible_for_FD_WF = calc_min_water_possible_for_free_drainage_wetting_front(wf_free_drainage_demand,  &state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties);
-      double storage_in_FD_WF = calc_storage_in_free_drainage_wetting_front(wf_free_drainage_demand, &state->head);
+      int wf_infiltration_demand = wetting_front_free_drainage(state->head);
+      int wf_aet_demand = wf_infiltration_demand;
+      int wf_free_drainage_demand = wf_infiltration_demand;
 
       double mass_correction_for_cached_free_drainage_fluxes = 0.0;
 
@@ -463,18 +466,6 @@ Update()
       if (state->lgar_bmi_params.free_drainage_enabled){
         struct wetting_front *front = listFindFront(listLength(state->head), state->head, NULL);
         free_drainage_subtimestep_cm += subtimestep_h*front->K_cm_per_h;
-        int iter_mass_check_FD = 0;
-        while ( (mass_used_to_check_impossible_storages - free_drainage_subtimestep_cm < min_storage) || (storage_in_FD_WF - free_drainage_subtimestep_cm < min_water_possible_for_FD_WF) ){
-          free_drainage_subtimestep_cm *= 0.5; //give it a chance to merely become smaller before setting to 0
-          if (iter_mass_check_FD > 5){
-            free_drainage_subtimestep_cm = 0.0;
-            break;
-          }
-          iter_mass_check_FD ++;
-        }
-        if (free_drainage_subtimestep_cm<1.E-7){
-          free_drainage_subtimestep_cm = 0.0;
-        }
         if (front->psi_cm>1.E6){
           free_drainage_subtimestep_cm = 0.0;
         }
@@ -504,8 +495,60 @@ Update()
                                       state->head, state->soil_properties);
       }
 
+      if (state->lgar_bmi_params.root_zone_enabled && AET_subtimestep_cm > 0.0 && wetting_front_root_zone(state->head) == 0
+	  && listLength(state->head) == num_layers) {
+	struct wetting_front *root_zone_front = lgar_ensure_root_zone_wetting_front(state->lgar_bmi_params.root_zone_depth_cm,
+										    num_layers,
+										    state->lgar_bmi_params.cum_layer_thickness_cm,
+										    state->lgar_bmi_params.layer_soil_type,
+										    state->lgar_bmi_params.frozen_factor,
+										    &state->head, state->soil_properties);
+	if (root_zone_front != NULL) {
+	  if(state->state_previous != NULL ){
+	    listDelete(state->state_previous);
+	    state->state_previous = NULL;
+	  }
+	  state->state_previous = listCopy(state->head);
+	  volstart_subtimestep_cm = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
+	  mass_used_to_check_impossible_storages = volstart_subtimestep_cm;
+	}
+      }
+
+      wf_infiltration_demand = wetting_front_free_drainage(state->head);
+      wf_aet_demand = wf_infiltration_demand;
+      wf_free_drainage_demand = wf_infiltration_demand;
+
+      int root_zone_front_num = wetting_front_root_zone(state->head);
+      bool root_zone_extracting_aet = root_zone_front_num > 0 && root_zone_front_num == wf_aet_demand;
+      bool root_zone_routing_free_drainage_below = root_zone_front_num > 0;
+      if (root_zone_extracting_aet) {
+	wf_aet_demand = root_zone_front_num;
+      }
+      if (root_zone_routing_free_drainage_below) {
+	wf_free_drainage_demand = listLength(state->head);
+      }
+
+      double min_water_possible_for_AET_WF = calc_min_water_possible_for_free_drainage_wetting_front(wf_aet_demand,  &state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties);
+      double storage_in_AET_WF = calc_storage_in_free_drainage_wetting_front(wf_aet_demand, &state->head);
+
+      double min_water_possible_for_FD_WF = 0.0;
+      double storage_in_FD_WF = 0.0;
+      if (root_zone_routing_free_drainage_below && wf_free_drainage_demand != wf_infiltration_demand) {
+	min_water_possible_for_FD_WF = calc_min_water_possible_for_deepest_to_bottom_stack(wf_free_drainage_demand,
+											  state->lgar_bmi_params.cum_layer_thickness_cm,
+											  state->lgar_bmi_params.layer_soil_type,
+											  state->head, state->soil_properties);
+	storage_in_FD_WF = calc_storage_in_deepest_to_bottom_stack(wf_free_drainage_demand,
+								   state->lgar_bmi_params.cum_layer_thickness_cm,
+								   state->head);
+      }
+      else {
+	min_water_possible_for_FD_WF = calc_min_water_possible_for_free_drainage_wetting_front(wf_free_drainage_demand,  &state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties);
+	storage_in_FD_WF = calc_storage_in_free_drainage_wetting_front(wf_free_drainage_demand, &state->head);
+      }
+
       int iter_mass_check_AET = 0;
-      while ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm < min_storage) || (storage_in_FD_WF - AET_subtimestep_cm < min_water_possible_for_FD_WF) ){
+      while ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm < min_storage) || (storage_in_AET_WF - AET_subtimestep_cm < min_water_possible_for_AET_WF) ){
         AET_subtimestep_cm *= 0.5; //give it a chance to merely become smaller before setting to 0
         if (iter_mass_check_AET > 5){
           AET_subtimestep_cm = 0.0;
@@ -514,8 +557,24 @@ Update()
         iter_mass_check_AET ++;
       }
 
+      int iter_mass_check_FD = 0;
+      while ( (mass_used_to_check_impossible_storages - free_drainage_subtimestep_cm < min_storage) || (storage_in_FD_WF - free_drainage_subtimestep_cm < min_water_possible_for_FD_WF) ){
+	free_drainage_subtimestep_cm *= 0.5; //give it a chance to merely become smaller before setting to 0
+	if (iter_mass_check_FD > 5){
+	  free_drainage_subtimestep_cm = 0.0;
+	  break;
+	}
+	iter_mass_check_FD ++;
+      }
+      if (free_drainage_subtimestep_cm<1.E-7){
+	free_drainage_subtimestep_cm = 0.0;
+      }
+
       int iter_mass_check_AET_and_FD = 0;
-      while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_storage) || ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_water_possible_for_FD_WF) ){ 
+      bool aet_and_free_drainage_share_storage = wf_aet_demand == wf_free_drainage_demand
+	&& !root_zone_routing_free_drainage_below;
+      while ( ( (mass_used_to_check_impossible_storages - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_storage)
+	      || (aet_and_free_drainage_share_storage && ( (storage_in_FD_WF - AET_subtimestep_cm - free_drainage_subtimestep_cm - mass_correction_for_cached_free_drainage_fluxes) < min_water_possible_for_FD_WF) ) ){
         // both should also be checked at the same because while individually these might not make an impossible storage, together they might
         AET_subtimestep_cm *= 0.5;
         free_drainage_subtimestep_cm *= 0.5;
@@ -548,10 +607,13 @@ Update()
       // checks on creatign a new surficial front
       // 1. check current and previous timestep precipitation
       // bool create_surficial_front = (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0);
-      bool create_surficial_front = (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0 && volon_timestep_cm == 0) || ( (precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0) && (listLength(state->head)==num_layers) );
+      bool root_zone_is_top_front = state->head != NULL && state->head->is_root_zone;
+      bool create_surficial_front = (precip_previous_subtimestep_cm == 0.0 && precip_subtimestep_cm > 0.0 && volon_timestep_cm == 0)
+	|| ((precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0) && (listLength(state->head)==num_layers))
+	|| (root_zone_is_top_front && (precip_subtimestep_cm > 0.0 || volon_timestep_cm > 0));
       
       // 2. check soil top wetting front condition (saturated/unsaturated), and surface ponded water
-      if (is_top_wf_saturated || volon_timestep_cm > 0.0)
+      if (is_top_wf_saturated || (volon_timestep_cm > 0.0 && !root_zone_is_top_front))
         create_surficial_front = false;
 
       if (verbosity.compare("high") == 0 || verbosity.compare("low") == 0) {
@@ -571,7 +633,9 @@ Update()
         // move the wetting fronts without adding any water; this is done to close the mass balance
         // and also to merge / cross if necessary 
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &lateral_flow_subtimestep_cm,
-              lateral_flow_psi_threshold_cm, lateral_flow_factor, &temp_pd, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
+              lateral_flow_psi_threshold_cm, lateral_flow_factor, &temp_pd,
+              wf_infiltration_demand, wf_aet_demand, wf_free_drainage_demand,
+              volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
               &state->head, state->state_previous, state->soil_properties);
@@ -586,6 +650,15 @@ Update()
         dry_depth = lgar_calc_dry_depth(use_closed_form_G, nint, subtimestep_h, &delta_theta, state->lgar_bmi_params.layer_soil_type,
                 state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
                 state->head, state->soil_properties);
+
+	int root_zone_front_num_for_creation = wetting_front_root_zone(state->head);
+	if (root_zone_front_num_for_creation > 0) {
+	  struct wetting_front *root_zone_front = listFindFront(root_zone_front_num_for_creation, state->head, NULL);
+	  if (root_zone_front != NULL && root_zone_front->layer_num == 1 && dry_depth >= root_zone_front->depth_cm) {
+	    double root_zone_gap_cm = fmin(1.0e-6, 0.5 * root_zone_front->depth_cm);
+	    dry_depth = fmax(root_zone_gap_cm, root_zone_front->depth_cm - root_zone_gap_cm);
+	  }
+	}
 
         if (verbosity.compare("high") == 0) {
           printf("State before moving creating new WF...\n");
@@ -622,7 +695,7 @@ Update()
       if (ponded_depth_subtimestep_cm > 0 && !create_surficial_front) {
         volrunoff_subtimestep_cm = lgar_insert_water(use_closed_form_G, nint, subtimestep_h, AET_subtimestep_cm, free_drainage_subtimestep_cm, &ponded_depth_subtimestep_cm,
                 &volin_subtimestep_cm, precip_subtimestep_cm_per_h,
-                wf_free_drainage_demand, num_layers,
+                wf_infiltration_demand, num_layers,
                 ponded_depth_max_cm, state->lgar_bmi_params.layer_soil_type,
                 state->lgar_bmi_params.cum_layer_thickness_cm,
                 state->lgar_bmi_params.frozen_factor, state->head,
@@ -661,7 +734,9 @@ Update()
                     and returns percolated value, so we need to keep its original
                     value stored to copy it back*/
         temp_rch = lgar_move_wetting_fronts(subtimestep_h, &free_drainage_subtimestep_cm, &lateral_flow_subtimestep_cm,
-              lateral_flow_psi_threshold_cm, lateral_flow_factor, &volin_subtimestep_cm, wf_free_drainage_demand, volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
+              lateral_flow_psi_threshold_cm, lateral_flow_factor, &volin_subtimestep_cm,
+              wf_infiltration_demand, wf_aet_demand, wf_free_drainage_demand,
+              volend_subtimestep_cm, mass_correction_for_cached_free_drainage_fluxes,
               num_layers, &AET_subtimestep_cm, state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.frozen_factor,
               &state->head, state->state_previous, state->soil_properties);

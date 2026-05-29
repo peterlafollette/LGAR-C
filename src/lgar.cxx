@@ -285,6 +285,8 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   state->lgar_bmi_params.lateral_flow_enabled  = false;
   state->lgar_bmi_params.lateral_flow_psi_threshold_cm = 0.0;
   state->lgar_bmi_params.lateral_flow_factor   = 0.0;
+  state->lgar_bmi_params.root_zone_enabled      = false;
+  state->lgar_bmi_params.root_zone_depth_cm     = 0.0;
   // setting mass balance tolerance to be large by default; this can be specified in the config file
   state->lgar_bmi_params.mbal_tol = 1.E1;
   
@@ -309,6 +311,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_giuh_ordinates_set        = false;
   bool is_soil_z_set                = false;
   bool is_ponded_depth_max_cm_set   = false;
+  bool is_root_zone_depth_set       = false;
 
   string soil_params_file;
 
@@ -461,6 +464,23 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       if (verbosity.compare("high") == 0) {
 	std::cerr<<"Field capacity Psi [cm] : "<<state->lgar_bmi_params.field_capacity_psi_cm<<"\n";
+	std::cerr<<"          *****         \n";
+      }
+
+      continue;
+    }
+    else if (param_key == "root_zone_depth") {
+      state->lgar_bmi_params.root_zone_depth_cm = stod(param_value);
+
+      if (param_unit == "[m]" || param_unit == "[meter]" || param_unit == "[meters]")
+	state->lgar_bmi_params.root_zone_depth_cm *= 100.0;
+      else if (param_unit == "[mm]")
+	state->lgar_bmi_params.root_zone_depth_cm *= 0.1;
+
+      is_root_zone_depth_set = true;
+
+      if (verbosity.compare("high") == 0) {
+	std::cerr<<"Root zone depth [cm] : "<<state->lgar_bmi_params.root_zone_depth_cm<<"\n";
 	std::cerr<<"          *****         \n";
       }
 
@@ -939,6 +959,27 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     throw runtime_error(errMsg.str());
   }
 
+  if (is_root_zone_depth_set) {
+    if (state->lgar_bmi_params.root_zone_depth_cm <= 0.0) {
+      stringstream errMsg;
+      errMsg << "The configuration file \'" << config_file <<"\' sets root_zone_depth <= 0. It must be positive when specified. \n";
+      throw runtime_error(errMsg.str());
+    }
+    if (state->lgar_bmi_params.root_zone_depth_cm >= state->lgar_bmi_params.soil_depth_cm) {
+      stringstream errMsg;
+      errMsg << "The configuration file \'" << config_file <<"\' sets root_zone_depth at or below the modeled vadose-zone bottom. It must be inside the modeled soil column. \n";
+      throw runtime_error(errMsg.str());
+    }
+    for (int layer = 1; layer < state->lgar_bmi_params.num_layers; layer++) {
+      if (fabs(state->lgar_bmi_params.root_zone_depth_cm - state->lgar_bmi_params.cum_layer_thickness_cm[layer]) <= 1.0e-10) {
+	stringstream errMsg;
+	errMsg << "The configuration file \'" << config_file <<"\' sets root_zone_depth exactly on a soil-layer boundary. The root-zone chain currently requires the terminal root-zone front to have finite thickness inside a layer. \n";
+	throw runtime_error(errMsg.str());
+      }
+    }
+    state->lgar_bmi_params.root_zone_enabled = true;
+  }
+
   if (! ( (is_a_set == is_b_set) && (is_frac_to_CR_set == is_b_set)) ){
     //in this case, it must be either the case that all of these have been set (the user wants a nonlinear reservoir), or that none of these are set (the user does not want this).
     //it can not be the case that only one or two of these three have been set.
@@ -1310,6 +1351,150 @@ extern int wetting_front_free_drainage(struct wetting_front* head) {
 
 // ############################################################################################
 /*
+  Finds the stationary root-zone wetting front if one has been created.
+*/
+// ############################################################################################
+extern int wetting_front_root_zone(struct wetting_front* head) {
+  int deepest_root_zone_front_num = 0;
+
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (current->is_root_zone)
+      deepest_root_zone_front_num = current->front_num;
+  }
+
+  return deepest_root_zone_front_num;
+}
+
+// ############################################################################################
+/*
+  Creates a stationary root-zone wetting-front chain ending at root_zone_depth_cm when the
+  profile still has exactly one wetting front per layer. Full layers above the configured depth
+  reuse their existing to-bottom fronts as root-zone fronts; the terminal front is inserted inside
+  the layer that contains root_zone_depth_cm. The whole root-zone chain is initialized to the
+  current one-front-per-layer psi so storage is unchanged at creation.
+*/
+// ############################################################################################
+static int lgar_layer_containing_strict_depth(double depth_cm, int num_layers, double *cum_layer_thickness_cm)
+{
+  const double depth_tolerance_cm = 1.0e-10;
+
+  if (depth_cm <= 0.0 || depth_cm >= cum_layer_thickness_cm[num_layers])
+    return 0;
+
+  for (int layer = 1; layer <= num_layers; layer++) {
+    if (fabs(depth_cm - cum_layer_thickness_cm[layer]) <= depth_tolerance_cm)
+      return 0;
+    if (depth_cm < cum_layer_thickness_cm[layer])
+      return layer;
+  }
+
+  return 0;
+}
+
+static void lgar_set_front_hydraulics_from_psi(struct wetting_front *front, double psi_cm,
+					       int *soil_type, double *frozen_factor,
+					       struct soil_properties_ *soil_properties)
+{
+  if (front == NULL)
+    return;
+
+  int layer_num = front->layer_num;
+  int soil_num = soil_type[layer_num];
+  front->psi_cm = psi_cm;
+  front->theta = calc_theta_from_h(psi_cm, soil_properties[soil_num].vg_alpha_per_cm,
+				   soil_properties[soil_num].vg_m,
+				   soil_properties[soil_num].vg_n,
+				   soil_properties[soil_num].theta_e,
+				   soil_properties[soil_num].theta_r);
+  double Se = calc_Se_from_theta(front->theta, soil_properties[soil_num].theta_e,
+				 soil_properties[soil_num].theta_r);
+  front->K_cm_per_h = calc_K_from_Se(Se, frozen_factor[layer_num] * soil_properties[soil_num].Ksat_cm_per_h,
+				     soil_properties[soil_num].vg_m);
+}
+
+extern struct wetting_front* lgar_ensure_root_zone_wetting_front(double root_zone_depth_cm, int num_layers,
+								 double *cum_layer_thickness_cm, int *soil_type,
+								 double *frozen_factor, struct wetting_front** head,
+								 struct soil_properties_ *soil_properties)
+{
+  if (root_zone_depth_cm <= 0.0 || head == NULL || *head == NULL)
+    return NULL;
+
+  int existing_root_zone_front = wetting_front_root_zone(*head);
+  if (existing_root_zone_front > 0) {
+    for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+      if (current->is_root_zone) {
+	current->dzdt_cm_per_h = 0.0;
+	if (current->front_num == existing_root_zone_front && !current->to_bottom)
+	  current->depth_cm = root_zone_depth_cm;
+      }
+    }
+    return listFindFront(existing_root_zone_front, *head, NULL);
+  }
+
+  if (listLength(*head) != num_layers)
+    return NULL;
+
+  int root_zone_layer = lgar_layer_containing_strict_depth(root_zone_depth_cm, num_layers,
+							  cum_layer_thickness_cm);
+  if (root_zone_layer <= 0)
+    return NULL;
+
+  double root_zone_psi_cm = (*head)->psi_cm;
+
+  for (int layer = 1; layer <= num_layers; layer++) {
+    struct wetting_front *front = listFindFront(layer, *head, NULL);
+    if (front == NULL || front->layer_num != layer || !front->to_bottom)
+      return NULL;
+  }
+
+  for (struct wetting_front *current = *head; current != NULL; current = current->next) {
+    if (current->layer_num < root_zone_layer) {
+      current->is_root_zone = true;
+      current->dzdt_cm_per_h = 0.0;
+      lgar_set_front_hydraulics_from_psi(current, root_zone_psi_cm, soil_type, frozen_factor, soil_properties);
+    }
+  }
+
+  struct wetting_front *layer_bottom_front = listFindFront(root_zone_layer, *head, NULL);
+  if (layer_bottom_front == NULL)
+    return NULL;
+
+  int root_zone_soil_num = soil_type[root_zone_layer];
+  double root_zone_theta = calc_theta_from_h(root_zone_psi_cm, soil_properties[root_zone_soil_num].vg_alpha_per_cm,
+					     soil_properties[root_zone_soil_num].vg_m,
+					     soil_properties[root_zone_soil_num].vg_n,
+					     soil_properties[root_zone_soil_num].theta_e,
+					     soil_properties[root_zone_soil_num].theta_r);
+
+  struct wetting_front *root_zone_front = NULL;
+  if (root_zone_layer == 1) {
+    listInsertFirst(root_zone_depth_cm, root_zone_theta, 1, root_zone_layer, false, head, true);
+    root_zone_front = *head;
+  }
+  else {
+    root_zone_front = listInsertFront(root_zone_depth_cm, root_zone_theta, layer_bottom_front->front_num,
+				      root_zone_layer, false, head, true);
+  }
+
+  if (root_zone_front == NULL)
+    return NULL;
+
+  root_zone_front->is_root_zone = true;
+  root_zone_front->dzdt_cm_per_h = 0.0;
+  lgar_set_front_hydraulics_from_psi(root_zone_front, root_zone_psi_cm, soil_type, frozen_factor,
+				     soil_properties);
+
+  if (verbosity.compare("high") == 0) {
+    printf("Root-zone wetting-front chain created to %.10f cm\n", root_zone_depth_cm);
+    listPrint(*head);
+  }
+
+  return root_zone_front;
+}
+
+// ############################################################################################
+/*
   Compute the lateral flow amount assigned to each wetting front for the current subtimestep.
   A wetting front's candidate lateral flow is K(theta) times a factor, scaled by
   the fraction of the soil column represented by that front. Non-deepest to_bottom fronts do not
@@ -1465,16 +1650,82 @@ static bool lgar_front_changed_by_lateral_stack(const struct wetting_front *fron
     && lateral_stack_changed_by_front[front->front_num] != 0;
 }
 
-static double lgar_apply_lateral_flux_to_deepest_to_bottom_stack(double requested_lateral_flux_cm, int stack_end_front_num,
-								 int num_layers, double *cum_layer_thickness_cm,
-								 int *soil_type, double *frozen_factor,
-								 struct wetting_front** head,
-								 struct wetting_front* state_previous,
-								 struct soil_properties_ *soil_properties,
-								 double *lateral_flow_subtimestep_cm,
-								 std::vector<int> *lateral_stack_changed_by_front)
+static double lgar_root_zone_support_top_cm(int root_zone_front_num, struct wetting_front* head,
+					    double *cum_layer_thickness_cm)
 {
-  if (requested_lateral_flux_cm <= 0.0 || head == NULL || *head == NULL)
+  struct wetting_front *root_zone_front = listFindFront(root_zone_front_num, head, NULL);
+  if (root_zone_front == NULL)
+    return 0.0;
+
+  double support_top_cm = cum_layer_thickness_cm[root_zone_front->layer_num - 1];
+  if (root_zone_front_num > 1) {
+    struct wetting_front *above_front = listFindFront(root_zone_front_num - 1, head, NULL);
+    if (above_front != NULL && !above_front->to_bottom && above_front->layer_num == root_zone_front->layer_num)
+      support_top_cm = above_front->depth_cm;
+  }
+
+  return support_top_cm;
+}
+
+static double lgar_root_zone_support_thickness_cm(int root_zone_front_num, struct wetting_front* head,
+						  double *cum_layer_thickness_cm)
+{
+  struct wetting_front *root_zone_front = listFindFront(root_zone_front_num, head, NULL);
+  if (root_zone_front == NULL)
+    return 0.0;
+
+  double support_top_cm = lgar_root_zone_support_top_cm(root_zone_front_num, head, cum_layer_thickness_cm);
+  return fmax(0.0, root_zone_front->depth_cm - support_top_cm);
+}
+
+static double lgar_calc_root_zone_capillary_rise(double timestep_h, int root_zone_front_num,
+						 struct wetting_front* head,
+						 double *cum_layer_thickness_cm)
+{
+  if (timestep_h <= 0.0 || head == NULL || root_zone_front_num <= 0)
+    return 0.0;
+
+  struct wetting_front *root_zone_front = listFindFront(root_zone_front_num, head, NULL);
+  if (root_zone_front == NULL || !root_zone_front->is_root_zone || root_zone_front->next == NULL)
+    return 0.0;
+
+  struct wetting_front *below_front = root_zone_front->next;
+  if (root_zone_front->layer_num != below_front->layer_num)
+    return 0.0;
+  if (root_zone_front->theta >= below_front->theta || root_zone_front->psi_cm <= below_front->psi_cm)
+    return 0.0;
+
+  double separation_cm = below_front->depth_cm - root_zone_front->depth_cm;
+  if (separation_cm <= 0.0 || root_zone_front->K_cm_per_h <= 0.0 || below_front->K_cm_per_h <= 0.0)
+    return 0.0;
+
+  double capillary_gradient = (root_zone_front->psi_cm - below_front->psi_cm) / separation_cm - 1.0;
+  if (capillary_gradient <= 0.0)
+    return 0.0;
+
+  double K_harmonic_cm_per_h = 2.0 * root_zone_front->K_cm_per_h * below_front->K_cm_per_h
+    / (root_zone_front->K_cm_per_h + below_front->K_cm_per_h);
+  double requested_capillary_rise_cm = timestep_h * K_harmonic_cm_per_h * capillary_gradient;
+
+  double root_zone_support_thickness_cm = lgar_root_zone_support_thickness_cm(root_zone_front_num, head,
+									      cum_layer_thickness_cm);
+  if (root_zone_support_thickness_cm <= 0.0)
+    return 0.0;
+  double root_zone_capacity_cm = (below_front->theta - root_zone_front->theta)
+    / (1.0 / root_zone_support_thickness_cm + 1.0 / separation_cm);
+  return fmax(0.0, fmin(requested_capillary_rise_cm, root_zone_capacity_cm));
+}
+
+static double lgar_apply_flux_to_deepest_to_bottom_stack(double requested_flux_cm, int stack_end_front_num,
+							 int num_layers, double *cum_layer_thickness_cm,
+							 int *soil_type, double *frozen_factor,
+							 struct wetting_front** head,
+							 struct wetting_front* state_previous,
+							 struct soil_properties_ *soil_properties,
+							 double *applied_flux_subtimestep_cm,
+							 std::vector<int> *stack_changed_by_front)
+{
+  if (requested_flux_cm <= 0.0 || head == NULL || *head == NULL)
     return 0.0;
 
   struct wetting_front *stack_end = listFindFront(stack_end_front_num, *head, NULL);
@@ -1484,7 +1735,7 @@ static double lgar_apply_lateral_flux_to_deepest_to_bottom_stack(double requeste
   int stack_start_front_num = stack_end_front_num;
   while (stack_start_front_num > 1) {
     struct wetting_front *previous_front = listFindFront(stack_start_front_num - 1, *head, NULL);
-    if (previous_front == NULL || !previous_front->to_bottom)
+    if (previous_front == NULL || !previous_front->to_bottom || previous_front->is_root_zone)
       break;
     stack_start_front_num--;
   }
@@ -1494,11 +1745,11 @@ static double lgar_apply_lateral_flux_to_deepest_to_bottom_stack(double requeste
 
   double minimum_stack_mass_cm = lgar_to_bottom_stack_mass_for_psi(PSI_UPPER_LIM, stack_start_front_num, stack_end_front_num,
 								  cum_layer_thickness_cm, soil_type, *head, soil_properties);
-  double applied_lateral_flux_cm = fmin(requested_lateral_flux_cm, fmax(prior_stack_mass_cm - minimum_stack_mass_cm, 0.0));
-  if (applied_lateral_flux_cm <= 0.0)
+  double applied_flux_cm = fmin(requested_flux_cm, fmax(prior_stack_mass_cm - minimum_stack_mass_cm, 0.0));
+  if (applied_flux_cm <= 0.0)
     return 0.0;
 
-  double target_stack_mass_cm = prior_stack_mass_cm - applied_lateral_flux_cm;
+  double target_stack_mass_cm = prior_stack_mass_cm - applied_flux_cm;
   double psi_low_cm = 0.0;
   double psi_high_cm = PSI_UPPER_LIM;
 
@@ -1529,15 +1780,15 @@ static double lgar_apply_lateral_flux_to_deepest_to_bottom_stack(double requeste
     front->K_cm_per_h = calc_K_from_Se(Se, frozen_factor[layer_num] * soil_properties[soil_num].Ksat_cm_per_h,
 				       soil_properties[soil_num].vg_m);
 
-    if (lateral_stack_changed_by_front != NULL && front->front_num >= 0
-	&& front->front_num < (int)lateral_stack_changed_by_front->size())
-      (*lateral_stack_changed_by_front)[front->front_num] = 1;
+    if (stack_changed_by_front != NULL && front->front_num >= 0
+	&& front->front_num < (int)stack_changed_by_front->size())
+      (*stack_changed_by_front)[front->front_num] = 1;
   }
 
-  if (lateral_flow_subtimestep_cm != NULL)
-    *lateral_flow_subtimestep_cm += applied_lateral_flux_cm;
+  if (applied_flux_subtimestep_cm != NULL)
+    *applied_flux_subtimestep_cm += applied_flux_cm;
 
-  return applied_lateral_flux_cm;
+  return applied_flux_cm;
 }
 
 // #######################################################################################################
@@ -1554,7 +1805,8 @@ static double lgar_apply_lateral_flux_to_deepest_to_bottom_stack(double requeste
 */
 // #######################################################################################################
 extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_subtimestep_cm, double *lateral_flow_subtimestep_cm,
-				     double lateral_flow_psi_threshold_cm, double lateral_flow_factor, double *volin_cm, int wf_free_drainage_demand,
+				     double lateral_flow_psi_threshold_cm, double lateral_flow_factor, double *volin_cm,
+				     int wf_infiltration_demand, int wf_aet_demand, int wf_free_drainage_demand,
 				     double old_mass, double mass_correction_for_cached_free_drainage_fluxes, int num_layers, double *AET_demand_cm, double *cum_layer_thickness_cm,
 				     int *soil_type, double *frozen_factor, struct wetting_front** head,
 				     struct wetting_front* state_previous, struct soil_properties_ *soil_properties)
@@ -1586,6 +1838,9 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 				    lateral_flow_factor, cum_layer_thickness_cm,
 				    state_previous, lateral_flux_cm_by_front);
 
+  int root_zone_front_num = wetting_front_root_zone(*head);
+  bool root_zone_free_drainage_stack_handled = false;
+
   current = *head;
 
   int last_wetting_front_index = number_of_wetting_fronts;
@@ -1597,6 +1852,61 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
   *volin_cm = 0.0; // assuming that all the water can fit in, if not then re-assign the left over water at the end. now handled from the returned value from this function
   double free_drainage_demand = *free_drainage_subtimestep_cm;
+  struct wetting_front *capillary_reference_state = state_previous != NULL ? state_previous : *head;
+  double root_zone_capillary_rise_demand = lgar_calc_root_zone_capillary_rise(timestep_h, root_zone_front_num,
+									      capillary_reference_state,
+									      cum_layer_thickness_cm);
+  double root_zone_capillary_rise_cm = 0.0;
+  double root_zone_capillary_mass_balance_cm = 0.0;
+
+  if (root_zone_front_num > 0 && wf_free_drainage_demand == number_of_wetting_fronts
+      && wf_free_drainage_demand != wf_infiltration_demand) {
+    double requested_free_drainage_cm = free_drainage_demand + mass_correction_for_cached_free_drainage_fluxes;
+    double requested_below_root_flux_cm = requested_free_drainage_cm + root_zone_capillary_rise_demand;
+    double applied_below_root_flux_cm = lgar_apply_flux_to_deepest_to_bottom_stack(requested_below_root_flux_cm,
+											 wf_free_drainage_demand,
+											 num_layers, cum_layer_thickness_cm,
+											 soil_type, frozen_factor, head,
+											 state_previous, soil_properties,
+											 NULL,
+											 &lateral_stack_changed_by_front);
+    double applied_free_drainage_cm = fmin(requested_free_drainage_cm, applied_below_root_flux_cm);
+    root_zone_capillary_rise_cm = fmin(root_zone_capillary_rise_demand,
+				       fmax(applied_below_root_flux_cm - applied_free_drainage_cm, 0.0));
+    root_zone_capillary_mass_balance_cm = root_zone_capillary_rise_cm;
+    if (root_zone_capillary_rise_cm > 0.0) {
+      struct wetting_front *root_zone_front = listFindFront(root_zone_front_num, *head, NULL);
+      double root_zone_support_thickness_cm = lgar_root_zone_support_thickness_cm(root_zone_front_num, *head,
+										  cum_layer_thickness_cm);
+      if (root_zone_front != NULL && root_zone_support_thickness_cm > 0.0) {
+	double layer_top_cm = cum_layer_thickness_cm[root_zone_front->layer_num - 1];
+	double root_zone_layer_thickness_cm = fmax(0.0, root_zone_front->depth_cm - layer_top_cm);
+	if (root_zone_layer_thickness_cm > 0.0)
+	  root_zone_capillary_mass_balance_cm *= root_zone_layer_thickness_cm / root_zone_support_thickness_cm;
+      }
+    }
+    if (root_zone_capillary_rise_cm > 0.0 && root_zone_front_num >= 0
+	&& root_zone_front_num < (int)lateral_stack_changed_by_front.size())
+      lateral_stack_changed_by_front[root_zone_front_num] = 1;
+
+    if (applied_free_drainage_cm < requested_free_drainage_cm) {
+      free_drainage_demand = fmin(free_drainage_demand, applied_free_drainage_cm);
+      *free_drainage_subtimestep_cm = free_drainage_demand;
+    }
+    root_zone_free_drainage_stack_handled = true;
+
+    if (verbosity.compare("high") == 0 && applied_free_drainage_cm > 0.0) {
+      printf("Applied free drainage below root-zone WF %d stack mass balance: %.10e cm\n",
+	     root_zone_front_num, applied_free_drainage_cm);
+    }
+    if (verbosity.compare("high") == 0 && root_zone_capillary_rise_cm > 0.0) {
+      printf("Applied capillary rise into root-zone WF %d from below-root stack: %.10e cm\n",
+	     root_zone_front_num, root_zone_capillary_rise_cm);
+    }
+  }
+
+  double free_drainage_demand_for_fronts = root_zone_free_drainage_stack_handled ? 0.0 : free_drainage_demand;
+  double cached_free_drainage_for_fronts = root_zone_free_drainage_stack_handled ? 0.0 : mass_correction_for_cached_free_drainage_fluxes;
 
   /* ************************************************************ */
   // main loop advancing all wetting fronts and doing the mass balance
@@ -1750,8 +2060,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 
       // double free_drainage_demand = 0;
 
-      if (wf_free_drainage_demand == wf)
-	prior_mass += precip_mass_to_add - (free_drainage_demand + mass_correction_for_cached_free_drainage_fluxes + actual_ET_demand);
+	      if (wf_infiltration_demand == wf)
+		prior_mass += precip_mass_to_add;
+	      if (wf_free_drainage_demand == wf)
+		prior_mass -= free_drainage_demand_for_fronts + cached_free_drainage_for_fronts;
+	      if (root_zone_front_num == wf)
+		prior_mass += root_zone_capillary_mass_balance_cm;
+	      if (wf_aet_demand == wf)
+		prior_mass -= actual_ET_demand;
 
       double applied_lateral_flux_cm = lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf], &prior_mass, lateral_flow_subtimestep_cm);
       if (applied_lateral_flux_cm > 0.0 && verbosity.compare("high") == 0) {
@@ -1785,7 +2101,7 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     // so the storage change equals the lateral flux counted in the mass balance.
     /*************************************************************************************/
     if (wf == number_of_wetting_fronts && current->to_bottom && current->layer_num == num_layers && number_of_wetting_fronts > num_layers) {
-      double applied_lateral_flux_cm = lgar_apply_lateral_flux_to_deepest_to_bottom_stack(lateral_flux_cm_by_front[wf], wf,
+      double applied_lateral_flux_cm = lgar_apply_flux_to_deepest_to_bottom_stack(lateral_flux_cm_by_front[wf], wf,
 											  num_layers, cum_layer_thickness_cm,
 											  soil_type, frozen_factor, head,
 											  state_previous, soil_properties,
@@ -1818,8 +2134,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	double next_reference_theta = lgar_front_changed_by_lateral_stack(next, lateral_stack_changed_by_front) ? next->theta : next_old->theta;
 	double prior_mass = current_old->depth_cm * (current_old->theta -  next_reference_theta);
 
-	if (wf_free_drainage_demand == wf)
-	  prior_mass += precip_mass_to_add - (free_drainage_demand + mass_correction_for_cached_free_drainage_fluxes + actual_ET_demand);
+		if (wf_infiltration_demand == wf)
+		  prior_mass += precip_mass_to_add;
+		if (wf_free_drainage_demand == wf)
+		  prior_mass -= free_drainage_demand_for_fronts + cached_free_drainage_for_fronts;
+		if (root_zone_front_num == wf)
+		  prior_mass += root_zone_capillary_mass_balance_cm;
+		if (wf_aet_demand == wf)
+		  prior_mass -= actual_ET_demand;
 
 	double applied_lateral_flux_cm = lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf], &prior_mass, lateral_flow_subtimestep_cm);
 	if (applied_lateral_flux_cm > 0.0 && verbosity.compare("high") == 0) {
@@ -1836,32 +2158,44 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	  current->depth_cm = column_depth + TRUNCATION_DEPTH; //we want WFs to exceed the lower boundary in the event that they must be partially truncated and then WFs above this one will correctly have their moisture corrected, but also want WFs to not exceed the lower boundary much
   }
 
-	if (current->dzdt_cm_per_h == 0.0 && current->to_bottom == FALSE) // a new front was just created, so don't update it.
+	if (current->dzdt_cm_per_h == 0.0 && current->to_bottom == FALSE && !current->is_root_zone) // a new front was just created, so don't update it.
 	  current->theta = current->theta;
 	else {
-      if ((prior_mass/current->depth_cm + next->theta)<theta_r){
-        if (verbosity.compare("high") == 0) {
-          printf("Deleting WF (%d) that will go below theta_r (before)...\n", current->front_num);
-          listPrint(*head);
-        }
-
-        //the idea here is that in some cases, the reduction in theta via WF movement or AET will be intense enough such that theta goes below theta_r.
-        //it requires a fairly unusual soil, which I encountered during random parameter sampling.
-        double mass_before_theta_went_below_theta_r = lgar_calc_mass_bal(cum_layer_thickness_cm, *head) - current->depth_cm*(current->theta - (prior_mass/current->depth_cm + next->theta));
-        current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
-        current = next;
-        double mass_after_theta_went_below_theta_r = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-        *AET_demand_cm = *AET_demand_cm - fabs(mass_before_theta_went_below_theta_r - mass_after_theta_went_below_theta_r);
-        actual_ET_demand = *AET_demand_cm;
-        if (verbosity.compare("high") == 0) {
-          printf("Deleting WF that will go below theta_r (after)...\n");
-          listPrint(*head);
-        }
-      }
-      else {//This is the case where theta>theta_r, which will be almost all of the time 
+	  double theta_candidate = prior_mass/current->depth_cm + next->theta;
+	  if (theta_candidate<theta_r){
+	    if (current->is_root_zone) {
+	      double minimum_prior_mass = current->depth_cm * (theta_r - next->theta);
+	      double aet_reduction = fmax(minimum_prior_mass - prior_mass, 0.0);
+	      aet_reduction = fmin(aet_reduction, fmax(*AET_demand_cm, 0.0));
+	      *AET_demand_cm = fmax(0.0, *AET_demand_cm - aet_reduction);
+	      actual_ET_demand = *AET_demand_cm;
+	      prior_mass += aet_reduction;
 	      current->theta = fmax(theta_r, fmin(theta_e, prior_mass/current->depth_cm + next->theta));
-      }
-    }
+	    }
+	    else {
+	      if (verbosity.compare("high") == 0) {
+		printf("Deleting WF (%d) that will go below theta_r (before)...\n", current->front_num);
+		listPrint(*head);
+	      }
+
+	      //the idea here is that in some cases, the reduction in theta via WF movement or AET will be intense enough such that theta goes below theta_r.
+	      //it requires a fairly unusual soil, which I encountered during random parameter sampling.
+	      double mass_before_theta_went_below_theta_r = lgar_calc_mass_bal(cum_layer_thickness_cm, *head) - current->depth_cm*(current->theta - (prior_mass/current->depth_cm + next->theta));
+	      current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
+	      current = next;
+	      double mass_after_theta_went_below_theta_r = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+	      *AET_demand_cm = *AET_demand_cm - fabs(mass_before_theta_went_below_theta_r - mass_after_theta_went_below_theta_r);
+	      actual_ET_demand = *AET_demand_cm;
+	      if (verbosity.compare("high") == 0) {
+		printf("Deleting WF that will go below theta_r (after)...\n");
+		listPrint(*head);
+	      }
+	    }
+	  }
+	  else {//This is the case where theta>theta_r, which will be almost all of the time 
+	    current->theta = fmax(theta_r, fmin(theta_e, theta_candidate));
+	  }
+	}
 
       }
       else {
@@ -1943,8 +2277,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	// double free_drainage_demand = 0;
   
 
-	if (wf_free_drainage_demand == wf)
-	  prior_mass += precip_mass_to_add - (free_drainage_demand + mass_correction_for_cached_free_drainage_fluxes + actual_ET_demand);
+		if (wf_infiltration_demand == wf)
+		  prior_mass += precip_mass_to_add;
+		if (wf_free_drainage_demand == wf)
+		  prior_mass -= free_drainage_demand_for_fronts + cached_free_drainage_for_fronts;
+		if (root_zone_front_num == wf)
+		  prior_mass += root_zone_capillary_mass_balance_cm;
+		if (wf_aet_demand == wf)
+		  prior_mass -= actual_ET_demand;
 
 	double applied_lateral_flux_cm = lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf], &prior_mass, lateral_flow_subtimestep_cm);
 	if (applied_lateral_flux_cm > 0.0 && verbosity.compare("high") == 0) {
@@ -2139,6 +2479,10 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       *AET_demand_cm = *AET_demand_cm - mass_change;
     }
 
+    if (correction_type_surf==5){
+      lgar_merge_root_zone_wetting_fronts(cum_layer_thickness_cm, soil_type, frozen_factor, head, soil_properties);
+    }
+
     correction_type_surf =  lgarto_correction_type_surf(num_layers, cum_layer_thickness_cm, head);
     if (verbosity.compare("high") == 0) {
       printf("correction_type_surf at end of iteration in while loop: %d \n", correction_type_surf);
@@ -2204,6 +2548,27 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 */
 // ############################################################################################
 
+static void lgar_update_front_hydraulics(struct wetting_front *front, int *soil_type, double *frozen_factor,
+					 struct soil_properties_ *soil_properties)
+{
+  if (front == NULL)
+    return;
+
+  int layer_num = front->layer_num;
+  int soil_num = soil_type[layer_num];
+  double theta_e = soil_properties[soil_num].theta_e;
+  double theta_r = soil_properties[soil_num].theta_r;
+  double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+  double vg_m = soil_properties[soil_num].vg_m;
+  double vg_n = soil_properties[soil_num].vg_n;
+  double Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[layer_num];
+
+  front->theta = fmax(theta_r, fmin(front->theta, theta_e));
+  double Se = calc_Se_from_theta(front->theta, theta_e, theta_r);
+  front->psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+  front->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+}
+
 static bool lgar_wetting_fronts_can_merge(struct wetting_front *current)
 {
   const double theta_tolerance = 1.0e-12;
@@ -2214,6 +2579,8 @@ static bool lgar_wetting_fronts_can_merge(struct wetting_front *current)
   struct wetting_front *next = current->next;
   struct wetting_front *next_to_next = next->next;
 
+  if (current->is_root_zone || next->is_root_zone)
+    return false;
   if (current->depth_cm <= next->depth_cm)
     return false;
   if (current->layer_num != next->layer_num)
@@ -2236,6 +2603,95 @@ static bool lgar_wetting_fronts_can_merge(struct wetting_front *current)
   return isfinite(merged_depth_cm) && merged_depth_cm > 0.0;
 }
 
+static bool lgar_root_zone_overtake_needs_merge(struct wetting_front *current)
+{
+  const double depth_tolerance = 1.0e-12;
+
+  if (current == NULL || current->next == NULL || current->next->next == NULL)
+    return false;
+
+  struct wetting_front *root_zone_front = current->next;
+
+  if (current->is_root_zone || !root_zone_front->is_root_zone)
+    return false;
+  if (current->layer_num != root_zone_front->layer_num)
+    return false;
+  if (current->to_bottom || root_zone_front->to_bottom)
+    return false;
+
+  return current->depth_cm + depth_tolerance >= root_zone_front->depth_cm;
+}
+
+extern void lgar_merge_root_zone_wetting_fronts(double *cum_layer_thickness_cm, int *soil_type,
+						double *frozen_factor, struct wetting_front** head,
+						struct soil_properties_ *soil_properties)
+{
+  const double theta_tolerance = 1.0e-12;
+
+  if (head == NULL || *head == NULL)
+    return;
+
+  if (verbosity.compare("high") == 0) {
+    printf("State before root-zone wetting front merge...\n");
+    listPrint(*head);
+  }
+
+  struct wetting_front *current = *head;
+
+  for (int wf=1; wf != listLength(*head); wf++) {
+    if (!lgar_root_zone_overtake_needs_merge(current)) {
+      current = current->next;
+      continue;
+    }
+
+    struct wetting_front *root_zone_front = current->next;
+    struct wetting_front *below_front = root_zone_front->next;
+
+    int layer_num = root_zone_front->layer_num;
+    int soil_num = soil_type[layer_num];
+    double theta_e = soil_properties[soil_num].theta_e;
+    double theta_r = soil_properties[soil_num].theta_r;
+    double layer_top_cm = cum_layer_thickness_cm[layer_num-1];
+    double incoming_support_depth_cm = current->depth_cm - layer_top_cm;
+    double root_zone_support_depth_cm = root_zone_front->depth_cm - layer_top_cm;
+
+    if (root_zone_support_depth_cm <= 0.0 || below_front == NULL)
+      return;
+
+    double merged_mass_this_layer = incoming_support_depth_cm * (current->theta - root_zone_front->theta)
+      + root_zone_support_depth_cm * (root_zone_front->theta - below_front->theta);
+    double theta_at_root_zone_depth = below_front->theta + merged_mass_this_layer / root_zone_support_depth_cm;
+
+    current->depth_cm = root_zone_front->depth_cm;
+    current->theta = fmax(theta_r, fmin(theta_at_root_zone_depth, theta_e));
+    current->layer_num = root_zone_front->layer_num;
+    current->to_bottom = false;
+
+    if (theta_at_root_zone_depth > below_front->theta + theta_tolerance) {
+      current->is_root_zone = false;
+      if (theta_at_root_zone_depth > theta_e && theta_e > below_front->theta + theta_tolerance) {
+	current->theta = theta_e;
+	current->depth_cm = layer_top_cm + merged_mass_this_layer / (theta_e - below_front->theta);
+      }
+    }
+    else {
+      current->is_root_zone = true;
+      current->dzdt_cm_per_h = 0.0;
+    }
+
+    lgar_update_front_hydraulics(current, soil_type, frozen_factor, soil_properties);
+
+    listDeleteFront(root_zone_front->front_num, head, soil_type, soil_properties);
+
+    if (verbosity.compare("high") == 0) {
+      printf("State after root-zone wetting front merge...\n");
+      listPrint(*head);
+    }
+
+    break;
+  }
+}
+
 extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, struct wetting_front** head,
 				      struct soil_properties_ *soil_properties)
 {
@@ -2251,12 +2707,6 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
     printf("Merging wetting fronts... \n");
   }
 
-  // local variables
-  double theta_e,theta_r;
-  double vg_a, vg_m, vg_n;
-  double Se, Ksat_cm_per_h;
-  int layer_num, soil_num;
-    
   for (int wf=1; wf != listLength(*head); wf++) {
     
     if (verbosity.compare("high") == 0) {
@@ -2279,19 +2729,7 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
       double current_mass_this_layer = current->depth_cm * (current->theta - next->theta) + next->depth_cm*(next->theta - next_to_next->theta);
       current->depth_cm = current_mass_this_layer / (current->theta - next_to_next->theta);
 
-      layer_num = current->layer_num;
-      soil_num  = soil_type[layer_num];
-      theta_e   = soil_properties[soil_num].theta_e;
-      theta_r   = soil_properties[soil_num].theta_r;
-      vg_a      = soil_properties[soil_num].vg_alpha_per_cm;
-      vg_m      = soil_properties[soil_num].vg_m;
-      vg_n      = soil_properties[soil_num].vg_n;
-      Se        = calc_Se_from_theta(current->theta,theta_e,theta_r);
-
-      Ksat_cm_per_h  = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[current->layer_num];
-
-      current->psi_cm     = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
-      current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
+      lgar_update_front_hydraulics(current, soil_type, frozen_factor, soil_properties);
       
       if (verbosity.compare("high") == 0) {
         printf ("Deleting wetting front (before)... \n");
@@ -2372,6 +2810,7 @@ extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers,
         printf("Boundary Crossing | ******* Wetting Front = %d ****** \n", wf);
       }
 
+      bool crossing_consumes_root_zone_boundary = next->is_root_zone && !current->is_root_zone;
       double current_theta = fmin(theta_e, current->theta);
       double overshot_depth = current->depth_cm - next->depth_cm;
       int soil_num_next = soil_type[layer_num+1];
@@ -2406,6 +2845,8 @@ extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers,
       next->depth_cm = depth_new;
       next->layer_num = layer_num + 1;
       next->dzdt_cm_per_h = current->dzdt_cm_per_h;
+      if (crossing_consumes_root_zone_boundary)
+	next->is_root_zone = false;
       current->dzdt_cm_per_h = 0;
       current->to_bottom = TRUE;
       next->to_bottom = FALSE;
@@ -2648,7 +3089,7 @@ extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cu
       // and are within the same layer
       /***************************************************/
 
-      if ( (current->theta <= next->theta) && (current->layer_num == next->layer_num) ) {
+      if ( (current->theta <= next->theta) && (current->layer_num == next->layer_num) && !current->is_root_zone ) {
 
         double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         current = listDeleteFront(current->front_num, head, soil_type, soil_properties); //current will be the WF directly after the one that got deleted
@@ -2689,7 +3130,7 @@ extern bool lgar_check_dry_over_wet_wetting_fronts(struct wetting_front* head)
   for (int l=1; l <= length; l++) {
     if (next != NULL) {
       
-      if ( (current->theta <= next->theta) && (current->layer_num == next->layer_num) )
+      if ( (current->theta <= next->theta) && (current->layer_num == next->layer_num) && !current->is_root_zone )
 	return true;
       
       current = current->next;
@@ -3172,6 +3613,12 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
     layer_num    = current->layer_num;    // what layer the front is in
     K_cm_per_h   = current->K_cm_per_h;   // K(theta)
 
+    if (current->is_root_zone) {
+      current->dzdt_cm_per_h = 0.0;
+      current = current->next;
+      continue;
+    }
+
     if (K_cm_per_h < 0) {
       printf("K is negative (layer_num, wf_num, K): %d %d %lf \n", layer_num, current->front_num, K_cm_per_h);
       listPrint(head);
@@ -3503,6 +3950,10 @@ extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickne
   for (int wf = 1; wf != (listLength(*head)); wf++) {
 
     if (next!=NULL){
+      if (lgar_root_zone_overtake_needs_merge(current)){
+        correction_type_surf = 5; // moving WF overtook the stationary root-zone WF
+        break;
+      }
       // if ( (current->is_WF_GW==0) && (next->is_WF_GW==0) && (current->theta>next->theta) && (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && (!next->to_bottom) ){
       if (lgar_wetting_fronts_can_merge(current)){
         correction_type_surf = 1; //this is surface-surface WF merging 
@@ -3548,7 +3999,8 @@ extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_t
   current = *head;
   next = current->next;
   for (int wf = 1; wf != (listLength(*head)); wf++) {
-    if ( ((current->layer_num==next->layer_num) && (fabs(current->theta - next->theta)<THRESHOLD_NO_MOISTURE_DIFF)) ){ // here, we only delete wetting fronts if they are very close in moisture. 
+    if ( ((current->layer_num==next->layer_num) && (fabs(current->theta - next->theta)<THRESHOLD_NO_MOISTURE_DIFF)
+	  && !current->is_root_zone && !next->is_root_zone) ){ // here, we only delete wetting fronts if they are very close in moisture.
                                                                                                                        // Theta can become extremely sensitive with respect to psi for small psi. This approach avoids errors due to that sensitivity. 
       current = listDeleteFront(current->front_num, head, soil_type, soil_properties); 
       break;
@@ -3619,6 +4071,42 @@ extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, 
     current = current->next;
   }
   return storage;
+}
+
+static int lgar_deepest_to_bottom_stack_start_front_num(int stack_end_front_num, struct wetting_front* head)
+{
+  int stack_start_front_num = stack_end_front_num;
+  while (stack_start_front_num > 1) {
+    struct wetting_front *previous_front = listFindFront(stack_start_front_num - 1, head, NULL);
+    if (previous_front == NULL || !previous_front->to_bottom || previous_front->is_root_zone)
+      break;
+    stack_start_front_num--;
+  }
+
+  return stack_start_front_num;
+}
+
+extern double calc_storage_in_deepest_to_bottom_stack(int stack_end_front_num, double *cum_layer_thickness_cm, struct wetting_front* head)
+{
+  struct wetting_front *stack_end = listFindFront(stack_end_front_num, head, NULL);
+  if (stack_end == NULL || !stack_end->to_bottom)
+    return 0.0;
+
+  int stack_start_front_num = lgar_deepest_to_bottom_stack_start_front_num(stack_end_front_num, head);
+  return lgar_to_bottom_stack_mass_from_profile(stack_start_front_num, stack_end_front_num, cum_layer_thickness_cm, head);
+}
+
+extern double calc_min_water_possible_for_deepest_to_bottom_stack(int stack_end_front_num, double *cum_layer_thickness_cm,
+								  int *soil_type, struct wetting_front* head,
+								  struct soil_properties_ *soil_properties)
+{
+  struct wetting_front *stack_end = listFindFront(stack_end_front_num, head, NULL);
+  if (stack_end == NULL || !stack_end->to_bottom)
+    return 0.0;
+
+  int stack_start_front_num = lgar_deepest_to_bottom_stack_start_front_num(stack_end_front_num, head);
+  return lgar_to_bottom_stack_mass_for_psi(PSI_UPPER_LIM, stack_start_front_num, stack_end_front_num,
+					   cum_layer_thickness_cm, soil_type, head, soil_properties);
 }
 
 // ############################################################################################

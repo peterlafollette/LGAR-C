@@ -1,5 +1,6 @@
 # Tests
 - Unit test: Checks basic BMI functionality and runs model for one timestep (1 hour) to compare results against a benchmark.
+- Root-zone unit test: Checks that AET creates a stationary root-zone wetting front when there is exactly one wetting front per layer, and that free drainage is taken from the wetting-front chain below it.
 - Synthetic tests: There are three synthetic examples for testing and to demonstrate the usage of the model. The example simulates 12 hours of rainfall, infiltration, soil saturation, surface ponding, and surface runoff. The examples use different soil hydraulic properties and different precipitation intensities without PET to simulate precipitation partitioning into infiltration and runoff. These simulate precipitation partitionind due to a short rainfall pulse that infiltrates entirely, followed by a longer precipitation pulse that generates runoff.
 
 ## Unittest
@@ -42,4 +43,3 @@ run `./run_synthetic.sh OPTION` (for synthetic test; OPTION = 1 or 2 - these num
   $\textcolor{green}{\text{| All BMI Tests passed: YES} }$ \
   $\textcolor{green}{\text{| LASAM Calibration test = YES} }$ \
   $\textcolor{green}{\text{| ************************************************************} }$
-

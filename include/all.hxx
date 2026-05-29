@@ -51,6 +51,7 @@ struct wetting_front
   int    layer_num;        // the layer containing this wetting front.
   int    front_num;        // the wetting front number (might be irrelevant), but useful to debug
   bool   to_bottom;        // TRUE iff this wetting front is in contact with the layer bottom
+  bool   is_root_zone;     // TRUE iff this is the stationary root-zone extraction front
   double dzdt_cm_per_h;    // use to store the calculated wetting front speed
   struct wetting_front *next;  // pointer to the next wetting front.
 };
@@ -130,6 +131,8 @@ struct lgar_bmi_parameters
   double *frozen_factor;                 // frozen factor added to the hydraulic conductivity due to coupling to soil freeze-thaw
   double  wilting_point_psi_cm;          // wilting point (the amount of water not available for plants or not accessible by plants)
   double  field_capacity_psi_cm;          // field capacity represented as a capillary head. Note that both wilting point and field capacity are specified for the whole model domain with single values
+  bool    root_zone_enabled = false;       // if true, AET can create/use a stationary root-zone front
+  double  root_zone_depth_cm = 0.0;        // depth of the stationary root-zone front [cm]
   bool   use_closed_form_G = false;      /* true if closed form of capillary drive calculation is desired, false if numeric integral
 					    for capillary drive calculation is desired */
   bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
@@ -302,8 +305,8 @@ extern struct wetting_front*    listDeleteFirst(struct wetting_front** head);
 extern struct wetting_front*    listFindFront(int i, struct wetting_front* head, struct wetting_front* head_old);
 extern struct wetting_front*    listDeleteFront(int front_num, struct wetting_front** head, int *soil_type, struct soil_properties_ *soil_properties);
 extern void                     listSortFrontsByDepth(struct wetting_front *head);
-extern void                     listInsertFirst(double d, double t, int f, int l, bool b, struct wetting_front** head);
-extern struct wetting_front*    listInsertFront(double d, double t, int f, int l, bool b, struct wetting_front** head);
+extern void                     listInsertFirst(double d, double t, int f, int l, bool b, struct wetting_front** head, bool root_zone=false);
+extern struct wetting_front*    listInsertFront(double d, double t, int f, int l, bool b, struct wetting_front** head, bool root_zone=false);
 extern struct wetting_front*    listInsertFrontAtDepth(int numlay, double *tvec,double d, double t, struct wetting_front* head);
 extern void                     listReverseOrder(struct wetting_front** head_ref);
 extern bool                     listFindLayer(struct wetting_front* link, int num_layers, double *cum_layer_thickness_cm,
@@ -360,7 +363,7 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 
 // the subroutine moves wetting fronts, merges wetting fronts, and does the mass balance correction if needed
 extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_subtimestep_cm, double *lateral_flow_subtimestep_cm, double lateral_flow_psi_threshold_cm,
-				     double lateral_flow_factor, double *ponded_depth_cm, int wf_free_drainage_demand,
+				     double lateral_flow_factor, double *ponded_depth_cm, int wf_infiltration_demand, int wf_aet_demand, int wf_free_drainage_demand,
 				     double old_mass, double mass_correction_for_cached_free_drainage_fluxes, int number_of_layers, double *actual_ET_demand,
 				     double *cum_layer_thickness_cm, int *soil_type_by_layer, double *frozen_factor,
 				     struct wetting_front** head, struct wetting_front* state_previous, struct soil_properties_ *soil_properties);
@@ -368,6 +371,11 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 // the subroutine merges the wetting fronts; called from lgar_move_wetting_fronts
 extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, struct wetting_front** head,
 				      struct soil_properties_ *soil_properties);
+
+// merges a moving wetting front with an overtaken root-zone wetting front
+extern void lgar_merge_root_zone_wetting_fronts(double *cum_layer_thickness_cm, int *soil_type,
+						double *frozen_factor, struct wetting_front** head,
+						struct soil_properties_ *soil_properties);
 
 // the subroutine lets wetting fronts cross soil layer boundaries; called from lgar_move_wetting_fronts
 extern void lgar_wetting_fronts_cross_layer_boundary(int num_layers, double* cum_layer_thickness_cm,
@@ -390,6 +398,15 @@ extern bool lgar_check_dry_over_wet_wetting_fronts(struct wetting_front* head);
 // finds free drainage wetting front (the deepest wetting front with psi value closer to zero; saturated in terms of psi)
 extern int wetting_front_free_drainage(struct wetting_front* head);
 
+// finds the stationary root-zone front, if present
+extern int wetting_front_root_zone(struct wetting_front* head);
+
+// creates the stationary root-zone wetting front when the profile has exactly one wetting front per layer
+extern struct wetting_front* lgar_ensure_root_zone_wetting_front(double root_zone_depth_cm, int num_layers,
+								 double *cum_layer_thickness_cm, int *soil_type,
+								 double *frozen_factor, struct wetting_front** head,
+								 struct soil_properties_ *soil_properties);
+
 // computes updated theta (soil moisture content) after moving down a wetting front; called for each wetting front to ensure mass is conserved
 extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm, double new_mass,
 				      double prior_mass, double precip_mass_to_add, double *AET_demand_cm, double *delta_theta, double *layer_thickness_cm,
@@ -401,6 +418,12 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
 extern double calc_min_water_possible_for_free_drainage_wetting_front(int wf_free_drainage, struct wetting_front** head, int *soil_type, struct soil_properties_ *soil_properties);
 
 extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, struct wetting_front** head);
+
+extern double calc_storage_in_deepest_to_bottom_stack(int stack_end_front_num, double *cum_layer_thickness_cm, struct wetting_front* head);
+
+extern double calc_min_water_possible_for_deepest_to_bottom_stack(int stack_end_front_num, double *cum_layer_thickness_cm,
+								 int *soil_type, struct wetting_front* head,
+								 struct soil_properties_ *soil_properties);
 
 /********************************************************************/
 // Bmi functions
