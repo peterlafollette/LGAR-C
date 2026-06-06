@@ -42,4 +42,3 @@ run `./run_synthetic.sh OPTION` (for synthetic test; OPTION = 1 or 2 - these num
   $\textcolor{green}{\text{| All BMI Tests passed: YES} }$ \
   $\textcolor{green}{\text{| LASAM Calibration test = YES} }$ \
   $\textcolor{green}{\text{| ************************************************************} }$
-

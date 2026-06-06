@@ -55,7 +55,7 @@ int main(int argc, char *argv[])
   std::string var_name_wf     = "soil_moisture_wetting_fronts";
   std::string var_name_thickness_wf = "soil_depth_wetting_fronts";
 
-  int num_output_var = 13;
+  int num_output_var = 14;
   std::vector<std::string> output_var_names(num_output_var);
   std::vector<double> output_var_data(num_output_var);
 
@@ -71,7 +71,8 @@ int main(int argc, char *argv[])
   output_var_names[9]  = "conceptual_reservoir_to_stream_discharge";
   output_var_names[10] = "preferential_flow_to_conceptual_reservoir";
   output_var_names[11] = "lgarto_domain_to_conceptual_reservoir";
-  output_var_names[12] = "mass_balance";
+  output_var_names[12] = "lateral_flow";
+  output_var_names[13] = "mass_balance";
 
 
   // total number of timesteps
@@ -109,7 +110,7 @@ int main(int argc, char *argv[])
     fprintf(outdata_fptr,"Time,");
     if (model_state.get_model()->lgar_bmi_params.mobile_groundwater_level) {
       fprintf(outnonvadose_fptr,
-          "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm,groundwater_depth_cm\n");
+          "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm,groundwater_depth_cm,explicit_gw_storage_cm\n");
     }
     else {
       fprintf(outnonvadose_fptr,
@@ -318,8 +319,15 @@ extern void write_non_vadose_state(FILE *out, struct model_state* state)
           state->lgar_bmi_params.runoff_in_prev_step ? 1 : 0,
           state->lgar_bmi_params.precip_previous_timestep_cm);
   if (state->lgar_bmi_params.mobile_groundwater_level) {
-    fprintf(out, ",groundwater_depth_cm=%0.17g",
-            state->lgar_bmi_params.groundwater_depth_cm);
+    const double explicit_gw_storage_cm =
+        lgarto_explicit_groundwater_storage_cm(state->lgar_bmi_params.num_layers,
+                                               state->lgar_bmi_params.cum_layer_thickness_cm,
+                                               state->lgar_bmi_params.layer_soil_type,
+                                               state->head,
+                                               state->soil_properties);
+    fprintf(out, ",groundwater_depth_cm=%0.17g,explicit_gw_storage_cm=%0.17g",
+            state->lgar_bmi_params.groundwater_depth_cm,
+            explicit_gw_storage_cm);
   }
   fprintf(out, "\n");
 }

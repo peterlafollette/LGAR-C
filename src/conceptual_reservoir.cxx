@@ -2,6 +2,7 @@
 #define CR_CXX_INCLUDE
 
 #include "../include/all.hxx"
+#include <cmath>
 
 static double calc_single_CR_Q(double subtimestep_h,
                                double a,
@@ -83,6 +84,33 @@ extern double calc_CR_Q(
                                      CR_slow_storage_cm);
 
     return Q_fast + Q_slow;
+}
+
+extern double lgar_cap_CR_input_by_available_storage(
+    double raw_CR_input_cm,
+    double available_storage_cm,
+    double same_substep_drainage_cm,
+    double *accepted_CR_input_cm)
+{
+    if (!std::isfinite(raw_CR_input_cm) || raw_CR_input_cm <= 0.0) {
+        if (accepted_CR_input_cm != NULL) {
+            *accepted_CR_input_cm = 0.0;
+        }
+        return 0.0;
+    }
+
+    const double available_cm =
+        std::isfinite(available_storage_cm) ? fmax(available_storage_cm, 0.0) : 0.0;
+    const double drainage_allowance_cm =
+        std::isfinite(same_substep_drainage_cm) ? fmax(same_substep_drainage_cm, 0.0) : 0.0;
+    const double accepted_cm =
+        fmin(raw_CR_input_cm, available_cm + drainage_allowance_cm);
+    const double rejected_cm = fmax(0.0, raw_CR_input_cm - accepted_cm);
+
+    if (accepted_CR_input_cm != NULL) {
+        *accepted_CR_input_cm = accepted_cm;
+    }
+    return rejected_cm;
 }
 
 extern void lgar_partition_lower_boundary_flux_for_CR(
