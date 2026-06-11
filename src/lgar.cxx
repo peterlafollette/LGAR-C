@@ -3519,13 +3519,15 @@ static void lgar_calc_surface_lateral_fluxes_by_front(double timestep_h,
 
 static double lgar_apply_lateral_flux_to_prior_mass(double requested_lateral_flux_cm,
                                                     double *prior_mass,
+                                                    double minimum_prior_mass_cm,
                                                     double *lateral_flow_subtimestep_cm)
 {
   if (prior_mass == NULL || requested_lateral_flux_cm <= 0.0) {
     return 0.0;
   }
 
-  const double available_mass_cm = fmax(0.0, *prior_mass);
+  const double available_mass_cm =
+    fmax(0.0, *prior_mass - fmax(0.0, minimum_prior_mass_cm));
   const double applied_lateral_flux_cm =
     fmin(requested_lateral_flux_cm, available_mass_cm);
   *prior_mass -= applied_lateral_flux_cm;
@@ -3534,6 +3536,34 @@ static double lgar_apply_lateral_flux_to_prior_mass(double requested_lateral_flu
   }
 
   return applied_lateral_flux_cm;
+}
+
+static double lgar_prior_mass_for_psi(double psi_cm,
+                                      int layer_num,
+                                      double *delta_theta,
+                                      double *delta_thickness,
+                                      int *soil_type,
+                                      struct soil_properties_ *soil_properties)
+{
+  if (layer_num < 1 || delta_theta == NULL || delta_thickness == NULL ||
+      soil_type == NULL || soil_properties == NULL) {
+    return 0.0;
+  }
+
+  double prior_mass = 0.0;
+  for (int k = 1; k <= layer_num; k++) {
+    const int soil_num = soil_type[k];
+    const double theta =
+      calc_theta_from_h(psi_cm,
+                        soil_properties[soil_num].vg_alpha_per_cm,
+                        soil_properties[soil_num].vg_m,
+                        soil_properties[soil_num].vg_n,
+                        soil_properties[soil_num].theta_e,
+                        soil_properties[soil_num].theta_r);
+    prior_mass += delta_thickness[k] * (theta - delta_theta[k]);
+  }
+
+  return prior_mass;
 }
 
 static double lgar_apply_lateral_flux_to_TO_front_by_depth(double requested_lateral_flux_cm,
@@ -3995,8 +4025,13 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       }
 
       if (wf < (int) lateral_flux_cm_by_front.size()) {
+        const double minimum_prior_mass_cm =
+          lgar_prior_mass_for_psi(PSI_UPPER_LIM, layer_num,
+                                  delta_thetas, delta_thickness,
+                                  soil_type, soil_properties);
         (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],
                                                      &prior_mass,
+                                                     minimum_prior_mass_cm,
                                                      lateral_flow_subtimestep_cm);
       }
 
@@ -4058,8 +4093,18 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	}
 
 	if (wf < (int) lateral_flux_cm_by_front.size()) {
+	  double depth_after_movement_cm =
+	    current->depth_cm + current->dzdt_cm_per_h * timestep_h;
+	  if (depth_after_movement_cm > column_depth) {
+	    depth_after_movement_cm = column_depth + TRUNCATION_DEPTH;
+	  }
+	  const double minimum_theta =
+	    calc_theta_from_h(PSI_UPPER_LIM, vg_a, vg_m, vg_n, theta_e, theta_r);
+	  const double minimum_prior_mass_cm =
+	    depth_after_movement_cm * (minimum_theta - next->theta);
 	  (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],
 	                                               &prior_mass,
+	                                               minimum_prior_mass_cm,
 	                                               lateral_flow_subtimestep_cm);
 	}
 
@@ -4091,14 +4136,34 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         current = listDeleteFront(current->front_num, head, soil_type, soil_properties);
         current = next;
         double mass_after_theta_went_below_theta_r = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-        const double reduced_aet_cm =
+        double removal_correction_cm =
           fabs(mass_before_theta_went_below_theta_r - mass_after_theta_went_below_theta_r);
-        *AET_demand_cm = *AET_demand_cm - reduced_aet_cm;
+        const double free_drainage_reduction_cm =
+          fmin(removal_correction_cm, fmax(0.0, free_drainage_demand));
+        free_drainage_demand -= free_drainage_reduction_cm;
+        if (free_drainage_subtimestep_cm != NULL) {
+          *free_drainage_subtimestep_cm -= free_drainage_reduction_cm;
+        }
+        removal_correction_cm -= free_drainage_reduction_cm;
+
+        const double aet_reduction_cm =
+          fmin(removal_correction_cm, fmax(0.0, *AET_demand_cm));
+        *AET_demand_cm -= aet_reduction_cm;
         if (use_TO_surface_AET) {
-          actual_ET_demand -= reduced_aet_cm;
+          actual_ET_demand = fmax(0.0, actual_ET_demand - aet_reduction_cm);
         }
         else {
           actual_ET_demand = *AET_demand_cm;
+        }
+        removal_correction_cm -= aet_reduction_cm;
+        if (removal_correction_cm > MBAL_ITERATIVE_TOLERANCE) {
+          const double lower_boundary_flux_correction_cm = -removal_correction_cm;
+          lgarto_assert_gw_flux_mass_balance_correction_within_debug_threshold(
+            lower_boundary_flux_correction_cm,
+            "lgar_move_wetting_fronts",
+            "theta_r deletion correction residual after free-drainage/AET cap",
+            *head);
+          bottom_boundary_flux_cm += lower_boundary_flux_correction_cm;
         }
         if (verbosity.compare("high") == 0) {
           printf("Deleting WF that will go below theta_r (after)...\n");
@@ -4210,8 +4275,13 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 		  prior_mass += precip_mass_to_add - (free_drainage_demand + cached_lower_boundary_flux_correction_cm + actual_ET_demand);
 	}
   if (wf < (int) lateral_flux_cm_by_front.size()) {
+    const double minimum_prior_mass_cm =
+      lgar_prior_mass_for_psi(theta_mass_balance_psi_upper_limit_cm, layer_num,
+                              delta_thetas, delta_thickness,
+                              soil_type, soil_properties);
     (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],
                                                  &prior_mass,
+                                                 minimum_prior_mass_cm,
                                                  lateral_flow_subtimestep_cm);
   }
   // theta mass balance computes new theta that conserves the mass; new theta is assigned to the current wetting front
@@ -13495,6 +13565,10 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
       theta = calc_theta_from_h(psi_cm_loc, soil_properties[soil_num].vg_alpha_per_cm, soil_properties[soil_num].vg_m,
 				soil_properties[soil_num].vg_n,soil_properties[soil_num].theta_e,
 				soil_properties[soil_num].theta_r);
+      new_mass = lgar_prior_mass_for_psi(psi_cm_loc, layer_num, delta_theta,
+                                         delta_thickness, soil_type,
+                                         soil_properties);
+      delta_mass = fabs(new_mass - prior_mass);
       break;
     }
 
