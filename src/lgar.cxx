@@ -2784,7 +2784,7 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
     bool bottom_flag;
     double Ksat_cm_per_h;
     struct wetting_front *current;
-    const int number_of_WFs_per_layer = 16;
+    const int number_of_WFs_per_layer = 16; //16
     bool switch_to_next_layer_flag = false;
     double prior_psi_cm = cum_layer_thickness_cm[num_layers];
     double new_wf_depth;
@@ -3517,6 +3517,21 @@ static void lgar_calc_surface_lateral_fluxes_by_front(double timestep_h,
   }
 }
 
+/*
+  Return the driest capillary head that a lateral/interflow removal is allowed
+  to create.  Lateral flow is activated at the configured psi threshold; cap the
+  removable mass so one lateral-flow extraction cannot dry the affected front
+  more than 1 cm past that threshold.
+*/
+static double lgar_lateral_flow_psi_cap_cm(double lateral_flow_psi_threshold_cm)
+{
+  const double lateral_flow_psi_cap_buffer_cm = 1.0e-3;
+  return fmax(0.0,
+              fmin(lateral_flow_psi_threshold_cm + 1.0 -
+                     lateral_flow_psi_cap_buffer_cm,
+                   PSI_UPPER_LIM));
+}
+
 static double lgar_apply_lateral_flux_to_prior_mass(double requested_lateral_flux_cm,
                                                     double *prior_mass,
                                                     double minimum_prior_mass_cm,
@@ -3710,6 +3725,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
                                             soil_type,
                                             soil_properties,
                                             lateral_flux_cm_by_front);
+  const double lateral_flow_psi_cap_cm =
+    lgar_lateral_flow_psi_cap_cm(lateral_flow_psi_threshold_cm);
   auto lateral_flow_for_mass_balance_cm = [&]() -> double {
     return lateral_flow_subtimestep_cm == NULL ? 0.0 : *lateral_flow_subtimestep_cm;
   };
@@ -4025,8 +4042,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       }
 
       if (wf < (int) lateral_flux_cm_by_front.size()) {
+        const double lateral_flow_minimum_psi_cm =
+          lateral_flux_cm_by_front[wf] > 0.0
+            ? lateral_flow_psi_cap_cm
+            : PSI_UPPER_LIM;
         const double minimum_prior_mass_cm =
-          lgar_prior_mass_for_psi(PSI_UPPER_LIM, layer_num,
+          lgar_prior_mass_for_psi(lateral_flow_minimum_psi_cm, layer_num,
                                   delta_thetas, delta_thickness,
                                   soil_type, soil_properties);
         (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],
@@ -4098,8 +4119,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	  if (depth_after_movement_cm > column_depth) {
 	    depth_after_movement_cm = column_depth + TRUNCATION_DEPTH;
 	  }
+	  const double lateral_flow_minimum_psi_cm =
+	    lateral_flux_cm_by_front[wf] > 0.0
+	      ? lateral_flow_psi_cap_cm
+	      : PSI_UPPER_LIM;
 	  const double minimum_theta =
-	    calc_theta_from_h(PSI_UPPER_LIM, vg_a, vg_m, vg_n, theta_e, theta_r);
+	    calc_theta_from_h(lateral_flow_minimum_psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
 	  const double minimum_prior_mass_cm =
 	    depth_after_movement_cm * (minimum_theta - next->theta);
 	  (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],
@@ -4275,8 +4300,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 		  prior_mass += precip_mass_to_add - (free_drainage_demand + cached_lower_boundary_flux_correction_cm + actual_ET_demand);
 	}
   if (wf < (int) lateral_flux_cm_by_front.size()) {
+    const double lateral_flow_minimum_psi_cm =
+      lateral_flux_cm_by_front[wf] > 0.0
+        ? lateral_flow_psi_cap_cm
+        : theta_mass_balance_psi_upper_limit_cm;
     const double minimum_prior_mass_cm =
-      lgar_prior_mass_for_psi(theta_mass_balance_psi_upper_limit_cm, layer_num,
+      lgar_prior_mass_for_psi(lateral_flow_minimum_psi_cm, layer_num,
                               delta_thetas, delta_thickness,
                               soil_type, soil_properties);
     (void) lgar_apply_lateral_flux_to_prior_mass(lateral_flux_cm_by_front[wf],

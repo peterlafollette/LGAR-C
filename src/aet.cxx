@@ -259,7 +259,7 @@ static bool insert_zero_depth_to_population_front(double root_zone_depth_cm,
     return false;
   }
 
-  const double psi_increment_cm = 0.25 * root_zone_depth_cm;
+  const double psi_increment_cm = 0.25 * root_zone_depth_cm; //initial factor of 0.25
   const double new_psi_cm = current->psi_cm + psi_increment_cm;
   const int layer_num = 1;
   const int soil_num = soil_type[layer_num];
