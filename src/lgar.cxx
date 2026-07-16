@@ -860,7 +860,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     //state->soil_properties = (struct soil_properties_*) malloc((state->lgar_bmi_params.num_layers+1)*sizeof(struct soil_properties_));
 
 
-    state->soil_properties = new soil_properties_[state->lgar_bmi_params.num_soil_types+1];
+    state->soil_properties = new soil_properties_[state->lgar_bmi_params.num_soil_types + state->lgar_bmi_params.num_layers + 1];
     int num_soil_types = state->lgar_bmi_params.num_soil_types;
     double wilting_point_psi_cm = state->lgar_bmi_params.wilting_point_psi_cm;
     int num_soils_in_file = lgar_read_vG_param_file(soil_params_file.c_str(), num_soil_types,
@@ -897,6 +897,16 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 		 <<" "<<state->soil_properties[soil].soil_name<<"\n";
       }
       std::cerr<<"          *****         \n";
+    }
+
+    // Give calibrating layers private records so duplicate textural classes do not conflict.
+    if (state->lgar_bmi_params.calib_params_flag && !state->lgar_bmi_params.is_invalid_soil_type) {
+      for (int layer=1; layer<=state->lgar_bmi_params.num_layers; layer++) {
+        int source = state->lgar_bmi_params.layer_soil_type[layer];
+        int target = state->lgar_bmi_params.num_soil_types + layer;
+        state->soil_properties[target] = state->soil_properties[source];
+        state->lgar_bmi_params.layer_soil_type[layer] = target;
+      }
     }
   }
   else {
