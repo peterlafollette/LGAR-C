@@ -484,6 +484,15 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 						     double groundwater_depth_cm = -1.0,
 						     bool mobile_groundwater_level = false);
 
+// Event-time limiter used by BMI Update and focused interflow regression tests.
+extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
+  double proposed_subtimestep_h,
+  const struct model_state *state,
+  int *repeat_front_num,
+  int *repeat_next_front_num,
+  int *repeat_layer_num,
+  int *repeat_count);
+
 // the subroutine merges the wetting fronts; called from lgar_move_wetting_fronts
 extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, struct wetting_front** head,
 				      struct soil_properties_ *soil_properties);
@@ -533,7 +542,8 @@ extern void lgarto_cleanup_after_surface_TO_merging_in_layer_below_top(bool merg
 								       struct wetting_front **head);
 
 // updates psi globally from theta after TO corrections that modify theta directly
-extern void lgar_global_psi_update(int *soil_type, struct soil_properties_ *soil_properties,
+extern void lgar_global_psi_update(double *cum_layer_thickness_cm,
+				   int *soil_type, struct soil_properties_ *soil_properties,
 				   struct wetting_front **head);
 
 // aborts if any wetting front persists below the vadose-zone lower boundary
@@ -543,6 +553,9 @@ extern void lgar_assert_wetting_fronts_within_vadose_zone(double domain_depth_cm
 // aborts if any wetting front keeps a negative depth past the end of a substep/timestep
 extern void lgar_assert_wetting_fronts_nonnegative_depth(struct wetting_front *head);
 
+// aborts if adjacent wetting fronts are not ordered by nondecreasing depth
+extern void lgar_assert_wetting_front_depth_order(struct wetting_front *head);
+
 // aborts at the end of a substep if a wetting-front editing routine needed a large GW-flux mass-balance correction
 extern void lgarto_abort_if_deferred_gw_flux_mass_balance_correction_exceeded(struct wetting_front *head);
 
@@ -551,6 +564,11 @@ extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head);
 
 // aborts if leading zero-depth TO supports are wetter than the first TO front below active surface fronts
 extern void lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(struct wetting_front *head);
+
+// aborts in TO mode if the only remaining surface fronts are a partial to_bottom scaffold
+extern void lgar_assert_surface_fronts_not_partial_to_bottom_scaffold(bool TO_enabled,
+                                                                      int num_layers,
+                                                                      struct wetting_front *head);
 
 // aborts if the to_bottom scaffold does not contain exactly one boundary front per soil layer
 extern void lgar_assert_to_bottom_scaffold(int num_layers,
@@ -575,12 +593,13 @@ extern void lgar_assert_boundary_psi_continuity(struct wetting_front *head);
 
 // updates theta globally from psi after TO surface-flux extraction changes psi continuity
 extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_WFs_cm,
-				     double target_mass_after_fluxes_cm,
-				     double *cum_layer_thickness_cm,
-				     int *soil_type,
-				     struct soil_properties_ *soil_properties,
-				     struct wetting_front **head,
-				     double mass_balance_tolerance_cm = 1.0e-3);
+					     double target_mass_after_fluxes_cm,
+					     double *cum_layer_thickness_cm,
+					     int *soil_type,
+					     struct soil_properties_ *soil_properties,
+					     struct wetting_front **head,
+					     double mass_balance_tolerance_cm = 1.0e-3,
+					     bool mobile_groundwater_level = false);
 
 // fixes any negative TO depths created by merging or upward crossing
 extern bool lgarto_correct_negative_depths(struct wetting_front **head);
@@ -611,7 +630,8 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
 							 double *cum_layer_thickness_cm,
 							 int *soil_type,
 							 struct soil_properties_ *soil_properties,
-							 struct wetting_front **head);
+							 struct wetting_front **head,
+							 bool mobile_groundwater_level = false);
 
 /* the subroutine allows the deepest wetting front to partially leave the model through the lower boundary if necessary;
    called from lgar_move_wetting_fronts. Currently, fluxes from the lower boundary will always be 0 and this fraction of a

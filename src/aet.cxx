@@ -4,6 +4,15 @@
 #include "../include/all.hxx"
 
 static constexpr double ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM = 1.0e-10;
+/*
+  No-surface TO AET needs a small zero-depth TO scaffold so extraction can be
+  distributed through the root zone instead of acting on one coarse support.
+  This is a resolution knob: larger values create/maintain more TO fronts near
+  the root zone, which gives a smoother AET profile but can feed dense dry TO
+  packets after those supports move downward.  Smaller values coarsen that AET
+  support population and reduce runtime/front-count pressure in stability runs.
+*/
+static constexpr int TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS = 2;
 
 //################################################################################
 /* authors : Fred Ogden and Ahmad Jan and Peter La Follette
@@ -104,6 +113,20 @@ static bool is_redundant_to_front_pair_for_aet_cleanup(const wetting_front *curr
          fabs(current->theta - next->theta) < redundant_TO_theta_tol;
 }
 
+static bool is_mobile_groundwater_storage_support_for_aet_cleanup(const wetting_front *previous,
+                                                                  const wetting_front *current)
+{
+  const double mobile_support_depth_tol_cm = 1.0e-8;
+  const double mobile_support_psi_tol_cm = 1.0e-8;
+
+  return previous != NULL && current != NULL &&
+         previous->is_WF_GW == TRUE && current->is_WF_GW == TRUE &&
+         previous->to_bottom == FALSE && current->to_bottom == FALSE &&
+         previous->layer_num == current->layer_num &&
+         fabs(previous->depth_cm - current->depth_cm) <= mobile_support_depth_tol_cm &&
+         fabs(current->psi_cm) <= mobile_support_psi_tol_cm;
+}
+
 static bool redundant_to_front_deletion_is_mass_neutral_for_aet(int deleted_front_num,
                                                                double mass_before_cm,
                                                                double *cum_layer_thickness_cm,
@@ -138,9 +161,11 @@ static void remove_mass_neutral_redundant_to_fronts_before_aet(double *cum_layer
     return;
   }
 
+  wetting_front *previous = NULL;
   for (wetting_front *current = *head; current != NULL && current->next != NULL; ) {
     wetting_front *next = current->next;
     if (!is_redundant_to_front_pair_for_aet_cleanup(current, next)) {
+      previous = current;
       current = next;
       continue;
     }
@@ -149,6 +174,15 @@ static void remove_mass_neutral_redundant_to_fronts_before_aet(double *cum_layer
     // They can have identical hydraulic state to the next front, but removing
     // them here changes how AET partitions the root-zone TO span.
     if (is_zero_depth_to_support_front(current)) {
+      previous = current;
+      current = next;
+      continue;
+    }
+
+    // Mobile-GW CR storage needs its colocated non-to_bottom psi=0 support
+    // even when ordinary profile storage says it is redundant with the front below.
+    if (is_mobile_groundwater_storage_support_for_aet_cleanup(previous, current)) {
+      previous = current;
       current = next;
       continue;
     }
@@ -316,7 +350,8 @@ static int count_mobile_to_fronts_in_root_zone(const wetting_front *head,
 static bool has_sparse_no_surface_to_population(const wetting_front *head,
                                                 double root_zone_depth_cm)
 {
-  return count_mobile_to_fronts_in_root_zone(head, 0.0, root_zone_depth_cm) < 2;
+  return count_mobile_to_fronts_in_root_zone(head, 0.0, root_zone_depth_cm) <
+         TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS;
 }
 
 static bool find_root_zone_to_population_candidate(const wetting_front *head,
@@ -757,9 +792,11 @@ static void lgarto_ensure_root_zone_to_population(int num_layers,
     return;
   }
 
-  const int min_mobile_to_fronts_in_root_zone = 3;
-  for (int population_iter = 0; population_iter < min_mobile_to_fronts_in_root_zone; population_iter++) {
-    if (count_no_surface_to_aet_population_fronts(*head) >= min_mobile_to_fronts_in_root_zone) {
+  for (int population_iter = 0;
+       population_iter < TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS;
+       population_iter++) {
+    if (count_no_surface_to_aet_population_fronts(*head) >=
+        TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS) {
       break;
     }
 
@@ -1090,7 +1127,7 @@ static bool lgarto_cross_internal_to_boundary_after_aet_if_needed(int num_layers
     }
 
     crossed_any_boundary = true;
-    lgar_global_psi_update(soil_type, soil_properties, head);
+    lgar_global_psi_update(cum_layer_thickness_cm, soil_type, soil_properties, head);
 
     front_to_check = listFindFront(front_num_to_check, *head, NULL);
     if (front_to_check != NULL && front_to_check->to_bottom && front_to_check->next != NULL) {
@@ -1128,7 +1165,7 @@ static bool lgarto_cross_TO_layer_boundaries_after_batched_aet(int num_layers,
 
     crossed_any_boundary = true;
     total_storage_residual_cm += storage_residual_cm;
-    lgar_global_psi_update(soil_type, soil_properties, head);
+    lgar_global_psi_update(cum_layer_thickness_cm, soil_type, soil_properties, head);
   }
 
   if (verbosity.compare("high") == 0 && crossed_any_boundary) {
@@ -1599,6 +1636,7 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
 
   struct TOAETAllocation {
     wetting_front *front;
+    wetting_front *stress_front;
     double thickness_cm;
     bool allow_zero_depth;
   };
@@ -1607,6 +1645,39 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
     std::vector<TOAETAllocation> allocations;
     double segment_top_cm =
       fmax(top_of_to_root_zone_cm, fmin(segment_start_cm, explicit_to_aet_depth_cm));
+    const bool allow_connected_to_bottom_bridge_aet = (surface_front_count == 0);
+
+    auto find_to_aet_target_at_or_below = [](wetting_front *front) {
+      for (wetting_front *candidate = front; candidate != NULL; candidate = candidate->next) {
+        if (candidate->is_WF_GW == FALSE) {
+          return static_cast<wetting_front *>(NULL);
+        }
+        if (is_to_aet_eligible_front(candidate)) {
+          return candidate;
+        }
+      }
+      return static_cast<wetting_front *>(NULL);
+    };
+
+    auto add_allocation = [&](wetting_front *target_front,
+                              wetting_front *stress_front,
+                              double thickness_cm,
+                              bool allow_zero_depth) {
+      if (target_front == NULL || thickness_cm <= 0.0) {
+        return;
+      }
+      if (stress_front == NULL) {
+        stress_front = target_front;
+      }
+      if (!allocations.empty() && allocations.back().front == target_front &&
+          allocations.back().allow_zero_depth == allow_zero_depth &&
+          to_aet_fronts_are_psi_connected(allocations.back().stress_front, stress_front)) {
+        allocations.back().thickness_cm += thickness_cm;
+        return;
+      }
+      allocations.push_back({target_front, stress_front, thickness_cm, allow_zero_depth});
+    };
+
     wetting_front *active_zero_depth_support_front = NULL;
     if (no_surface_needs_zero_depth_support) {
       active_zero_depth_support_front = find_active_zero_depth_to_support_front(*head);
@@ -1615,14 +1686,15 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
           find_zero_depth_support_interval_bottom_cm(active_zero_depth_support_front, explicit_to_aet_depth_cm);
         const double support_thickness_cm = fmax(0.0, support_interval_bottom_cm - segment_top_cm);
         if (support_thickness_cm > 0.0) {
-          allocations.push_back({active_zero_depth_support_front, support_thickness_cm, true});
+          add_allocation(active_zero_depth_support_front, active_zero_depth_support_front,
+                         support_thickness_cm, true);
           segment_top_cm = fmax(segment_top_cm, support_interval_bottom_cm);
         }
       }
     }
 
     for (wetting_front *current = *head; current != NULL; current = current->next) {
-      if (!is_to_aet_eligible_front(current)) {
+      if (current->is_WF_GW == FALSE) {
         continue;
       }
 
@@ -1634,14 +1706,33 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
         continue;
       }
 
-      if (current->depth_cm >= explicit_to_aet_depth_cm) {
+      const bool current_is_mobile_target = is_to_aet_eligible_front(current);
+      if (!current_is_mobile_target && !allow_connected_to_bottom_bridge_aet) {
+        continue;
+      }
+
+      if (!allow_connected_to_bottom_bridge_aet &&
+          current_is_mobile_target && current->depth_cm >= explicit_to_aet_depth_cm) {
         break;
       }
 
-      const double thickness_cm = fmax(0.0, current->depth_cm - segment_top_cm);
+      wetting_front *target_front =
+        current_is_mobile_target ? current : find_to_aet_target_at_or_below(current);
+      if (target_front == NULL) {
+        continue;
+      }
+
+      const double allocation_bottom_cm = fmin(current->depth_cm, explicit_to_aet_depth_cm);
+      const double thickness_cm = fmax(0.0, allocation_bottom_cm - segment_top_cm);
       if (thickness_cm > 0.0) {
-        allocations.push_back({current, thickness_cm, false});
-        segment_top_cm = fmax(segment_top_cm, current->depth_cm);
+        // A to_bottom bridge is fixed in place, but its root-zone interval can
+        // still supply AET through the connected movable TO front below it.
+        add_allocation(target_front, current, thickness_cm, false);
+        segment_top_cm = fmax(segment_top_cm, allocation_bottom_cm);
+      }
+
+      if (segment_top_cm >= explicit_to_aet_depth_cm - 1.0e-8) {
+        break;
       }
     }
 
@@ -1739,8 +1830,10 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
                "a mobile TO AET target.\n",
                current->front_num);
       }
+      const wetting_front *stress_front =
+        (allocation.stress_front != NULL) ? allocation.stress_front : current;
       const double stale_allocation_aet_cm =
-        calc_to_aet_demand_for_front_state(current, allocation.thickness_cm, root_zone_depth_cm,
+        calc_to_aet_demand_for_front_state(stress_front, allocation.thickness_cm, root_zone_depth_cm,
                                            PET_timestep_cm, timestep_h, wilting_point_psi_cm,
                                            field_capacity_psi_cm, soil_type, soil_properties);
       (void) redistribute_unmet_to_aet(current, stale_allocation_aet_cm,
@@ -1751,10 +1844,18 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
 
     fallback_to_aet_front = current;
 
+    const wetting_front *stress_front =
+      (allocation.stress_front != NULL) ? allocation.stress_front : current;
     const double temp_AET_value =
-      calc_aet_for_individual_TO_WFs(current->front_num, allocation.thickness_cm, root_zone_depth_cm,
-                                     PET_timestep_cm, timestep_h, wilting_point_psi_cm,
-                                     field_capacity_psi_cm, soil_type, soil_properties, head);
+      calc_to_aet_demand_for_front_state(stress_front, allocation.thickness_cm, root_zone_depth_cm,
+                                         PET_timestep_cm, timestep_h, wilting_point_psi_cm,
+                                         field_capacity_psi_cm, soil_type, soil_properties);
+    if (verbosity.compare("high") == 0) {
+      printf("TO AET allocation target front %d stress front %d thickness %.17lf cm "
+             "component %.17lf cm\n",
+             current->front_num, stress_front->front_num, allocation.thickness_cm,
+             temp_AET_value);
+    }
     if (temp_AET_value <= 0.0) {
       next_to_aet_segment_top_cm = allocation_bottom_cm;
       continue;
