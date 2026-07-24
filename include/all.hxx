@@ -413,6 +413,23 @@ extern double lgarto_project_TO_motion_lower_boundary_flux_cm(double timestep_h,
 								      struct wetting_front* head,
 								      struct soil_properties_ *soil_properties,
 								      double groundwater_depth_cm = -1.0);
+extern double lgarto_lateral_flux_candidate_cm(double timestep_h, int num_layers,
+                                               double lateral_flow_psi_threshold_cm,
+                                               double lateral_flow_factor,
+                                               double *cum_layer_thickness_cm,
+                                               struct wetting_front *head,
+                                               struct wetting_front *previous,
+                                               struct wetting_front *current,
+                                               bool mobile_groundwater_level,
+                                               int *soil_type,
+                                               struct soil_properties_ *soil_properties);
+extern double lgarto_project_TO_interflow_depth_cm(double requested_lateral_flux_cm,
+                                                   double original_depth_cm,
+                                                   double layer_bottom_cm,
+                                                   double next_depth_cm,
+                                                   double theta,
+                                                   double next_theta,
+                                                   double *applied_lateral_flux_cm);
 
 extern double lgarto_submerge_wetting_fronts_below_groundwater(double groundwater_depth_cm,
 							      int num_layers,

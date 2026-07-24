@@ -109,16 +109,6 @@ string verbosity="none";
 #define LGARTO_TO_PACKET_EVENT_SPLIT_MIN_DT_H ((double)1.0e-8)
 #endif
 
-#ifndef LGARTO_TO_PACKET_INTERFLOW_DEPTH_SPACING_CM
-// Keep this synchronized with DEPTH_AVOIDS_SAME_WF_DEPTH in lgar.cxx.
-#define LGARTO_TO_PACKET_INTERFLOW_DEPTH_SPACING_CM ((double)1.0e-6)
-#endif
-
-#ifndef LGARTO_TO_PACKET_INTERFLOW_MASS_TOL_CM
-// Keep this synchronized with MBAL_ITERATIVE_TOLERANCE in lgar.cxx.
-#define LGARTO_TO_PACKET_INTERFLOW_MASS_TOL_CM ((double)1.0e-10)
-#endif
-
 #ifndef LGARTO_TO_PACKET_INTERFLOW_EVENT_BISECTION_ITERATIONS
 #define LGARTO_TO_PACKET_INTERFLOW_EVENT_BISECTION_ITERATIONS 60
 #endif
@@ -1490,22 +1480,18 @@ static void lgarto_write_infiltration_limit_trace(
   fflush(trace_file);
 }
 
-static double lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
+static double lgarto_limit_subtimestep_for_surface_boundary_crossing(
   double proposed_subtimestep_h,
   double groundwater_depth_cm,
   int num_layers,
   const double *cum_layer_thickness_cm,
-  const int *soil_type,
-  const wetting_front *head,
-  const soil_properties_ *soil_properties)
+  const wetting_front *head)
 {
   if (proposed_subtimestep_h <= 0.0 || head == NULL || num_layers < 2 ||
       !lgarto_has_TO_fronts(head)) {
     return proposed_subtimestep_h;
   }
 
-  const double column_depth_cm = cum_layer_thickness_cm[num_layers];
-  const double max_reasonable_remap_depth_cm = 1.10 * column_depth_cm;
   double limited_subtimestep_h = proposed_subtimestep_h;
 
   for (const wetting_front *current = head; current != NULL; current = current->next) {
@@ -1535,42 +1521,8 @@ static double lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
       continue;
     }
 
-    const int soil_num = soil_type[layer_num];
-    const int soil_num_next = soil_type[layer_num + 1];
-    const double theta_e = soil_properties[soil_num].theta_e;
-    const double theta_r = soil_properties[soil_num].theta_r;
-    const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
-    const double vg_m = soil_properties[soil_num].vg_m;
-    const double vg_n = soil_properties[soil_num].vg_n;
-
-    const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
-    const double psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
-    const double theta_new =
-      calc_theta_from_h(psi_cm,
-                        soil_properties[soil_num_next].vg_alpha_per_cm,
-                        soil_properties[soil_num_next].vg_m,
-                        soil_properties[soil_num_next].vg_n,
-                        soil_properties[soil_num_next].theta_e,
-                        soil_properties[soil_num_next].theta_r);
-
-    const double denominator = theta_new - next->next->theta;
-    double depth_new_cm = HUGE_VAL;
-    if (denominator != 0.0) {
-      const double current_theta = fmin(theta_e, current->theta);
-      const double overshot_depth_cm = projected_depth_cm - boundary_depth_cm;
-      const double mbal_Z_correction_cm =
-        overshot_depth_cm * (current_theta - next->theta) / denominator;
-      depth_new_cm = boundary_depth_cm + mbal_Z_correction_cm;
-    }
-
-    const bool risky_remap =
-      !std::isfinite(depth_new_cm) ||
-      depth_new_cm < 0.0 ||
-      depth_new_cm > max_reasonable_remap_depth_cm;
-    if (!risky_remap) {
-      continue;
-    }
-
+    // Stop at the geometric event; the mover remains the sole owner of the
+    // hydraulic remap performed immediately after the boundary is reached.
     const double event_subtimestep_h =
       (boundary_depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM - current->depth_cm) /
       current->dzdt_cm_per_h;
@@ -1581,27 +1533,16 @@ static double lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
     limited_subtimestep_h = event_subtimestep_h;
 
     if (verbosity.compare("high") == 0) {
-      char remap_depth_text[64];
-      if (std::isfinite(depth_new_cm)) {
-        snprintf(remap_depth_text, sizeof(remap_depth_text), "%.17lf", depth_new_cm);
-      }
-      else {
-        snprintf(remap_depth_text, sizeof(remap_depth_text), "undefined");
-      }
-
-      printf("Adaptive LGARTO event split before risky surface layer-boundary remap: "
+      printf("Adaptive LGARTO event split at surface layer-boundary crossing: "
              "front=%d layer=%d old_dt_h=%.17lf new_dt_h=%.17lf "
-             "depth_cm=%.17lf projected_depth_cm=%.17lf boundary_cm=%.17lf "
-             "projected_remap_depth_cm=%s max_reasonable_remap_depth_cm=%.17lf\n",
+             "depth_cm=%.17lf projected_depth_cm=%.17lf boundary_cm=%.17lf\n",
              current->front_num,
              layer_num,
              proposed_subtimestep_h,
              limited_subtimestep_h,
              current->depth_cm,
              projected_depth_cm,
-             boundary_depth_cm,
-             remap_depth_text,
-             max_reasonable_remap_depth_cm);
+             boundary_depth_cm);
     }
   }
 
@@ -1636,9 +1577,7 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
   }
 
   const lgar_bmi_parameters& params = state->lgar_bmi_params;
-  if (!params.lateral_flow_enabled ||
-      params.lateral_flow_factor <= 0.0 ||
-      params.num_layers < 1 ||
+  if (params.num_layers < 1 ||
       params.cum_layer_thickness_cm == NULL) {
     return false;
   }
@@ -1650,10 +1589,10 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
     return false;
   }
 
-  std::vector<const wetting_front *> front_by_num(wetting_front_count + 1, NULL);
+  std::vector<wetting_front *> front_by_num(wetting_front_count + 1, NULL);
   std::vector<double> projected_depth_by_num(
     wetting_front_count + 1, std::numeric_limits<double>::quiet_NaN());
-  for (const wetting_front *front = state->head;
+  for (wetting_front *front = state->head;
        front != NULL;
        front = front->next) {
     if (front->front_num < 1 || front->front_num > wetting_front_count ||
@@ -1675,7 +1614,7 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
       state, lgar_project_upward_TO_flux_demand_cm(state, subtimestep_h));
 
   for (int wf = wetting_front_count - 1; wf >= 1; --wf) {
-    const wetting_front *current = front_by_num[wf];
+    wetting_front *current = front_by_num[wf];
     if (current == NULL || !current->is_WF_GW || current->to_bottom) {
       continue;
     }
@@ -1691,68 +1630,21 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
     const double layer_bottom_cm = params.cum_layer_thickness_cm[layer_num];
     double current_depth_cm = projected_depth_by_num[wf];
 
-    /*
-      Match lgar_lateral_flux_candidate_cm() and
-      lgar_apply_lateral_flux_to_TO_front_by_depth().  A mobile-GW psi=0
-      support chain is naturally immobile here: its colocated vadose/support
-      pair has no available depth and its saturated members have zero theta
-      slope.
-    */
-    if (subtimestep_h > 0.0 &&
-        current->psi_cm <= params.lateral_flow_psi_threshold_cm &&
-        std::isfinite(current->K_cm_per_h) &&
-        current->K_cm_per_h > 0.0 &&
+    if (params.lateral_flow_enabled && params.lateral_flow_factor > 0.0 &&
         current->next->layer_num == layer_num) {
-      double support_top_cm = layer_top_cm;
-      const wetting_front *previous =
-        wf > 1 ? front_by_num[wf - 1] : NULL;
-      if (previous != NULL && previous->layer_num == layer_num &&
-          std::isfinite(previous->depth_cm)) {
-        support_top_cm = fmax(support_top_cm, previous->depth_cm);
-      }
-      const double support_bottom_cm =
-        fmax(layer_top_cm, fmin(layer_bottom_cm, current->depth_cm));
-      support_top_cm =
-        fmax(layer_top_cm, fmin(layer_bottom_cm, support_top_cm));
-      const double support_depth_cm =
-        fmax(0.0, support_bottom_cm - support_top_cm);
-
-      if (support_depth_cm > 0.0) {
-        const double requested_lateral_flux_cm =
-          fmax(0.0, current->K_cm_per_h) *
-          params.lateral_flow_factor *
-          fmin(1.0, support_depth_cm / column_depth_cm) *
-          subtimestep_h;
-        const double next_depth_cm =
-          projected_depth_by_num[current->next->front_num];
-        double max_depth_cm =
-          fmin(layer_bottom_cm - LGARTO_TO_PACKET_INTERFLOW_DEPTH_SPACING_CM,
-               next_depth_cm - LGARTO_TO_PACKET_INTERFLOW_DEPTH_SPACING_CM);
-        max_depth_cm = fmax(current_depth_cm, max_depth_cm);
-        const double removal_cm_per_depth_cm =
-          current->next->theta - current->theta;
-
-        if (requested_lateral_flux_cm > 0.0 &&
-            max_depth_cm >
-              current_depth_cm + LGARTO_TO_PACKET_INTERFLOW_DEPTH_SPACING_CM &&
-            std::isfinite(removal_cm_per_depth_cm) &&
-            removal_cm_per_depth_cm > 0.0) {
-          const double max_removed_cm =
-            (max_depth_cm - current_depth_cm) * removal_cm_per_depth_cm;
-          const double target_removed_cm =
-            fmin(requested_lateral_flux_cm, max_removed_cm);
-          if (target_removed_cm >=
-              max_removed_cm - LGARTO_TO_PACKET_INTERFLOW_MASS_TOL_CM) {
-            current_depth_cm = max_depth_cm;
-          }
-          else {
-            current_depth_cm =
-              fmin(max_depth_cm,
-                   current_depth_cm +
-                     target_removed_cm / removal_cm_per_depth_cm);
-          }
-        }
-      }
+      const double requested_lateral_flux_cm =
+        lgarto_lateral_flux_candidate_cm(
+          subtimestep_h, params.num_layers,
+          params.lateral_flow_psi_threshold_cm, params.lateral_flow_factor,
+          params.cum_layer_thickness_cm, state->head,
+          wf > 1 ? front_by_num[wf - 1] : NULL, current,
+          params.mobile_groundwater_level, params.layer_soil_type,
+          state->soil_properties);
+      current_depth_cm =
+        lgarto_project_TO_interflow_depth_cm(
+          requested_lateral_flux_cm, current_depth_cm, layer_bottom_cm,
+          projected_depth_by_num[current->next->front_num],
+          current->theta, current->next->theta, NULL);
     }
 
     double dzdt_cm_per_h = current->dzdt_cm_per_h;
@@ -1878,6 +1770,21 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       continue;
     }
 
+    double ordered_projected_current_depth_cm = 0.0;
+    double ordered_projected_next_depth_cm = 0.0;
+    double ordered_projected_gap_cm = 0.0;
+    const bool interflow_enabled =
+      state->lgar_bmi_params.lateral_flow_enabled &&
+      state->lgar_bmi_params.lateral_flow_factor > 0.0;
+    const bool ordered_projection_valid =
+      interflow_enabled &&
+      lgarto_project_mobile_TO_packet_gap_after_interflow(
+        proposed_subtimestep_h, state,
+        current->front_num, next->front_num,
+        &ordered_projected_current_depth_cm,
+        &ordered_projected_next_depth_cm,
+        &ordered_projected_gap_cm);
+
     // Match the event prediction to the CR-supply cap applied before TO motion.
     const double upward_TO_supply_scale =
       lgar_CR_capillary_supply_scale(
@@ -1900,34 +1807,37 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       next->depth_cm + next_dzdt_cm_per_h * proposed_subtimestep_h;
     const double projected_gap_cm =
       projected_next_depth_cm - projected_current_depth_cm;
-    if (projected_gap_cm >= min_spacing_cm) {
+    if ((ordered_projection_valid ? ordered_projected_gap_cm :
+         projected_gap_cm) >= min_spacing_cm) {
       continue;
     }
 
     const double closing_speed_cm_per_h =
-      current_dzdt_cm_per_h - next_dzdt_cm_per_h;
+      ordered_projection_valid
+        ? (current_gap_cm - ordered_projected_gap_cm) /
+            proposed_subtimestep_h
+        : current_dzdt_cm_per_h - next_dzdt_cm_per_h;
     if (closing_speed_cm_per_h <= 0.0) {
       continue;
     }
 
     double event_subtimestep_h =
       (current_gap_cm - min_spacing_cm) / closing_speed_cm_per_h;
-    double event_projected_current_depth_cm = projected_current_depth_cm;
-    double event_projected_next_depth_cm = projected_next_depth_cm;
+    double event_projected_current_depth_cm =
+      ordered_projection_valid ? ordered_projected_current_depth_cm :
+                                 projected_current_depth_cm;
+    double event_projected_next_depth_cm =
+      ordered_projection_valid ? ordered_projected_next_depth_cm :
+                                 projected_next_depth_cm;
     bool event_is_interflow_aware = false;
 
-    if (state->lgar_bmi_params.lateral_flow_enabled &&
-        state->lgar_bmi_params.lateral_flow_factor > 0.0) {
-      double interflow_projected_current_depth_cm = 0.0;
-      double interflow_projected_next_depth_cm = 0.0;
-      double interflow_projected_gap_cm = 0.0;
-      const bool projected =
-        lgarto_project_mobile_TO_packet_gap_after_interflow(
-          proposed_subtimestep_h, state,
-          current->front_num, next->front_num,
-          &interflow_projected_current_depth_cm,
-          &interflow_projected_next_depth_cm,
-          &interflow_projected_gap_cm);
+    if (interflow_enabled) {
+      double interflow_projected_current_depth_cm =
+        ordered_projected_current_depth_cm;
+      double interflow_projected_next_depth_cm =
+        ordered_projected_next_depth_cm;
+      double interflow_projected_gap_cm = ordered_projected_gap_cm;
+      const bool projected = ordered_projection_valid;
 
       if (projected && interflow_projected_gap_cm >= min_spacing_cm) {
         // The actual ordered motion keeps this pair separated for the full step.
@@ -2405,8 +2315,7 @@ Update()
   }
   
   // subcycling loop (loop over model's timestep). LGARTO can add dynamic event
-  // splits inside this interval when a surface front would create an absurd
-  // layer-boundary remap.
+  // splits at surface layer crossings and mobile TO/GW packet contacts.
   double remaining_forcing_h = subcycles * base_subtimestep_h;
   int cycle = 0;
   int lgarto_event_splits_this_forcing = 0;
@@ -2423,14 +2332,12 @@ Update()
           ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
           : -1.0;
       double event_limited_subtimestep_h =
-        lgarto_limit_subtimestep_for_risky_surface_boundary_remap(
+        lgarto_limit_subtimestep_for_surface_boundary_crossing(
           subtimestep_h,
           groundwater_depth_for_event_split_cm,
           state->lgar_bmi_params.num_layers,
           state->lgar_bmi_params.cum_layer_thickness_cm,
-          state->lgar_bmi_params.layer_soil_type,
-          state->head,
-          state->soil_properties);
+          state->head);
       event_limited_subtimestep_h =
         lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
           event_limited_subtimestep_h,
