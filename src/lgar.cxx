@@ -2867,9 +2867,17 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   if (state->lgar_bmi_params.mobile_groundwater_level &&
       state->lgar_bmi_params.TO_enabled &&
       state->lgar_bmi_params.lower_bdy_flux_to_CR) {
-    const double target_CR_storage_cm =
+    double target_CR_storage_cm =
       fmax(0.0, state->lgar_mass_balance.CR_fast_storage_cm +
                  state->lgar_mass_balance.CR_slow_storage_cm);
+    double max_CR_storage_cm = 0.0;
+    for (int layer = 1; layer <= state->lgar_bmi_params.num_layers; layer++) {
+      const int soil = state->lgar_bmi_params.layer_soil_type[layer];
+      max_CR_storage_cm +=
+        fmax(0.0, state->soil_properties[soil].theta_e -
+                  state->soil_properties[soil].theta_r) *
+        state->lgar_bmi_params.layer_thickness_cm[layer];
+    }
     wetting_front *trial_head = listCopy(state->head, NULL);
     double solved_groundwater_depth_cm = state->lgar_bmi_params.groundwater_depth_cm;
     if (trial_head != NULL) {
@@ -2902,6 +2910,36 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
           state->soil_properties);
       const double storage_tol_cm =
         fmax(1.0e-8, 1.0e-8 * fmax(1.0, target_CR_storage_cm));
+      const double capacity_tol_cm =
+        fmax(1.0e-6, 1.0e-8 * fmax(1.0, max_CR_storage_cm));
+      if (!non_vadose_restart_loaded &&
+          std::isfinite(chain_storage_cm) &&
+          target_CR_storage_cm > chain_storage_cm + MBAL_ITERATIVE_TOLERANCE &&
+          fabs(chain_storage_cm - max_CR_storage_cm) <= capacity_tol_cm) {
+        // Use the actual surface-tolerance-limited chain capacity for both stores.
+        const double requested_CR_storage_cm = target_CR_storage_cm;
+        target_CR_storage_cm = chain_storage_cm;
+        state->lgar_mass_balance.CR_slow_storage_cm =
+          fmin(state->lgar_mass_balance.CR_slow_storage_cm, target_CR_storage_cm);
+        state->lgar_mass_balance.CR_fast_storage_cm =
+          target_CR_storage_cm - state->lgar_mass_balance.CR_slow_storage_cm;
+        state->lgar_bmi_params.initial_CR_fast_storage_cm =
+          state->lgar_mass_balance.CR_fast_storage_cm;
+        state->lgar_bmi_params.initial_CR_slow_storage_cm =
+          state->lgar_mass_balance.CR_slow_storage_cm;
+        fprintf(stderr,
+                "\n****************************************************************\n"
+                "WARNING: INITIAL CR STORAGE EXCEEDS SOIL CAPACITY\n"
+                "Requested initial CR storage : %.10f cm\n"
+                "Maximum representable storage: %.10f cm\n"
+                "Applied initial CR storage   : %.10f cm\n"
+                "Excluded from initial state  : %.10f cm\n"
+                "The excess was not added to the model or routed to runoff.\n"
+                "****************************************************************\n\n",
+                requested_CR_storage_cm, target_CR_storage_cm,
+                target_CR_storage_cm,
+                requested_CR_storage_cm - target_CR_storage_cm);
+      }
       if (std::isfinite(chain_storage_cm) &&
           fabs(chain_storage_cm - target_CR_storage_cm) <= storage_tol_cm) {
         listDelete(state->head);
