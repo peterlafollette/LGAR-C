@@ -1820,110 +1820,6 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
   return std::isfinite(*projected_gap_cm);
 }
 
-static double lgarto_limit_subtimestep_for_interflow_TO_boundary_crossing(
-  double proposed_subtimestep_h,
-  const model_state *state)
-{
-  if (!state->lgar_bmi_params.lateral_flow_enabled ||
-      state->lgar_bmi_params.lateral_flow_factor <= 0.0) {
-    return proposed_subtimestep_h;
-  }
-
-  double limited_subtimestep_h = proposed_subtimestep_h;
-  const wetting_front *limiting_front = NULL;
-  double limiting_projected_depth_cm = 0.0;
-  const double upward_TO_supply_scale =
-    lgar_CR_capillary_supply_scale(
-      state, lgar_project_upward_TO_flux_demand_cm(
-               state, proposed_subtimestep_h));
-  for (const wetting_front *current = state->head;
-       current != NULL && current->next != NULL;
-       current = current->next) {
-    const wetting_front *next = current->next;
-    if (!current->is_WF_GW || current->to_bottom ||
-        !next->is_WF_GW || !next->to_bottom ||
-        current->layer_num != next->layer_num ||
-        current->layer_num >= state->lgar_bmi_params.num_layers) {
-      continue;
-    }
-    double vertical_dzdt_cm_per_h = current->dzdt_cm_per_h;
-    if (vertical_dzdt_cm_per_h < 0.0) {
-      vertical_dzdt_cm_per_h *= upward_TO_supply_scale;
-    }
-    if (current->depth_cm +
-          vertical_dzdt_cm_per_h * proposed_subtimestep_h >
-        next->depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM) {
-      continue; // Existing boundary correction already handles vertical-only crossings.
-    }
-
-    double projected_current_depth_cm = 0.0;
-    double projected_next_depth_cm = 0.0;
-    double projected_gap_cm = 0.0;
-    if (!lgarto_project_mobile_TO_packet_gap_after_interflow(
-          proposed_subtimestep_h, state,
-          current->front_num, next->front_num,
-          &projected_current_depth_cm,
-          &projected_next_depth_cm,
-          &projected_gap_cm) ||
-        projected_current_depth_cm <=
-          projected_next_depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM) {
-      continue;
-    }
-
-    // Bisect the same ordered interflow-plus-dzdt operator used by the mover.
-    double safe_dt_h = 0.0;
-    double crossing_dt_h = proposed_subtimestep_h;
-    bool projection_valid = true;
-    for (int iteration = 0;
-         iteration < LGARTO_TO_PACKET_INTERFLOW_EVENT_BISECTION_ITERATIONS;
-         ++iteration) {
-      const double trial_dt_h = 0.5 * (safe_dt_h + crossing_dt_h);
-      double trial_current_depth_cm = 0.0;
-      double trial_next_depth_cm = 0.0;
-      double trial_gap_cm = 0.0;
-      if (!lgarto_project_mobile_TO_packet_gap_after_interflow(
-            trial_dt_h, state,
-            current->front_num, next->front_num,
-            &trial_current_depth_cm,
-            &trial_next_depth_cm,
-            &trial_gap_cm)) {
-        projection_valid = false;
-        break;
-      }
-      if (trial_current_depth_cm <=
-          trial_next_depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM) {
-        safe_dt_h = trial_dt_h;
-      }
-      else {
-        crossing_dt_h = trial_dt_h;
-      }
-    }
-
-    if (!projection_valid ||
-        crossing_dt_h <= LGARTO_TO_PACKET_EVENT_SPLIT_MIN_DT_H ||
-        crossing_dt_h >= limited_subtimestep_h) {
-      continue;
-    }
-    limited_subtimestep_h = crossing_dt_h;
-    limiting_front = current;
-    limiting_projected_depth_cm = projected_current_depth_cm;
-  }
-
-  if (limiting_front != NULL && verbosity.compare("high") == 0) {
-    printf("Adaptive LGARTO event split before interflow-assisted TO layer-boundary "
-           "crossing: front=%d layer=%d old_dt_h=%.17lf new_dt_h=%.17lf "
-           "depth_cm=%.17lf projected_depth_cm=%.17lf boundary_cm=%.17lf\n",
-           limiting_front->front_num,
-           limiting_front->layer_num,
-           proposed_subtimestep_h,
-           limited_subtimestep_h,
-           limiting_front->depth_cm,
-           limiting_projected_depth_cm,
-           limiting_front->next->depth_cm);
-  }
-  return limited_subtimestep_h;
-}
-
 extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   double proposed_subtimestep_h,
   const model_state *state,
@@ -1940,9 +1836,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     return proposed_subtimestep_h;
   }
 
-  double limited_subtimestep_h =
-    lgarto_limit_subtimestep_for_interflow_TO_boundary_crossing(
-      proposed_subtimestep_h, state);
+  // The normal TO correction resolves interflow-assisted to_bottom crossings.
+  double limited_subtimestep_h = proposed_subtimestep_h;
   if (state->lgar_bmi_params.lower_bdy_flux_to_CR &&
       lgar_total_CR_storage_cm(state) <= SMALL_EPS) {
     return limited_subtimestep_h;
