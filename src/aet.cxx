@@ -1392,6 +1392,25 @@ static void propagate_groundwater_chain_psi_from_below(int *soil_type,
   }
 }
 
+static double max_to_aet_chain_psi_cm(const wetting_front *head,
+                                      const wetting_front *target)
+{
+  const wetting_front *upper_mobile_front = NULL;
+  for (const wetting_front *current = head; current != NULL && current != target;
+       current = current->next) {
+    if (current->is_WF_GW == FALSE) {
+      upper_mobile_front = NULL;
+    }
+    else if (current->to_bottom == FALSE) {
+      upper_mobile_front = current;
+    }
+  }
+
+  // Do not dry a lower TO chain past the movable front that bounds it above.
+  return (upper_mobile_front != NULL) ? upper_mobile_front->psi_cm :
+         std::numeric_limits<double>::infinity();
+}
+
 static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_aet_cm,
                                                              double *cum_layer_thickness_cm,
                                                              int *soil_type,
@@ -1493,9 +1512,24 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
     return 0.0;
   }
 
+  struct SavedFrontState {
+    wetting_front *front;
+    double psi_cm;
+    double theta;
+    double K_cm_per_h;
+  };
+  std::vector<SavedFrontState> saved_states;
+  for (wetting_front *current = *head; current != NULL; current = current->next) {
+    saved_states.push_back({current, current->psi_cm, current->theta, current->K_cm_per_h});
+  }
+
   const double original_psi_cm = target_front->psi_cm;
   double psi_lo_cm = fmax(0.0, original_psi_cm);
   double mass_lo = mass_before;
+  const double max_psi_cm = max_to_aet_chain_psi_cm(*head, target_front);
+  if (max_psi_cm <= psi_lo_cm) {
+    return 0.0;
+  }
 
   auto apply_trial_psi = [&](double psi_trial_cm) {
     target_front->psi_cm = psi_trial_cm;
@@ -1504,11 +1538,11 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
     return lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
   };
 
-  double psi_hi_cm = fmax(psi_lo_cm + 1.0, psi_lo_cm * 2.0);
+  double psi_hi_cm = fmin(max_psi_cm, fmax(psi_lo_cm + 1.0, psi_lo_cm * 2.0));
   double mass_hi = apply_trial_psi(psi_hi_cm);
   int expand_iter = 0;
-  while (mass_hi > target_mass && psi_hi_cm < 1.0e7 && expand_iter < 80) {
-    psi_hi_cm = fmax(psi_hi_cm + 1.0, psi_hi_cm * 2.0);
+  while (mass_hi > target_mass && psi_hi_cm < fmin(1.0e7, max_psi_cm) && expand_iter < 80) {
+    psi_hi_cm = fmin(max_psi_cm, fmax(psi_hi_cm + 1.0, psi_hi_cm * 2.0));
     mass_hi = apply_trial_psi(psi_hi_cm);
     expand_iter++;
   }
@@ -1554,9 +1588,12 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
   }
 
   if (extracted_cm <= 0.0) {
-    target_front->psi_cm = original_psi_cm;
-    refresh_front_state_from_psi(target_front, soil_type, frozen_factor, soil_properties);
-    propagate_groundwater_chain_psi_from_below(soil_type, frozen_factor, soil_properties, head);
+    // A failed trial must restore capped or otherwise non-invertible states exactly.
+    for (const SavedFrontState &saved : saved_states) {
+      saved.front->psi_cm = saved.psi_cm;
+      saved.front->theta = saved.theta;
+      saved.front->K_cm_per_h = saved.K_cm_per_h;
+    }
   }
 
   return extracted_cm;
@@ -1892,7 +1929,14 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
         printf("Skipping TO AET extraction for front %d because the capped movement would not advance the front.\n",
                current->front_num);
       }
-      (void) redistribute_unmet_to_aet(current, temp_AET_value,
+      // Keep the proportional interval extraction on its assigned TO chain before
+      // sending only a hydraulically constrained remainder to another front.
+      const double extracted_in_place_cm =
+        lgarto_extract_missing_to_aet_from_to_chain(current, temp_AET_value,
+                                                    cum_layer_thickness_cm, soil_type,
+                                                    frozen_factor, soil_properties, head);
+      (void) redistribute_unmet_to_aet(current,
+                                       fmax(0.0, temp_AET_value - extracted_in_place_cm),
                                        "capped TO AET extraction interval");
       next_to_aet_segment_top_cm = allocation_bottom_cm;
       continue;
