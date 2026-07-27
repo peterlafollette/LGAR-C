@@ -9310,7 +9310,8 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
       previous_to_existing_support = scan;
     }
     if (previous_to_existing_support != NULL &&
-        previous_to_existing_support->is_WF_GW &&
+        // A colocated surface contact is also the vadose-side pair member; it
+        // is canonicalized to TO/GW with the support below.
         !previous_to_existing_support->to_bottom &&
         previous_to_existing_support->layer_num == closest_existing_support->layer_num &&
         fabs(previous_to_existing_support->depth_cm -
@@ -9457,7 +9458,8 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
   }
   if (vadose_side_front == NULL &&
       previous_to_support != NULL &&
-      previous_to_support->is_WF_GW &&
+      // Preserve a colocated surface/support pair instead of inserting a
+      // duplicate vadose-side front solely because the contact is still surface.
       !previous_to_support->to_bottom &&
       previous_to_support->layer_num == support->layer_num &&
       fabs(previous_to_support->depth_cm - support->depth_cm) <= support_tol_cm) {
@@ -9705,8 +9707,10 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
       if (scan->is_WF_GW &&
           !scan->to_bottom &&
           scan->layer_num == active_vadose_side_front->layer_num &&
-          !lgarto_front_is_near_saturated(scan, num_layers, soil_type,
-                                          soil_properties)) {
+          std::isfinite(scan->psi_cm) &&
+          // Use psi for hydraulic source selection: small-alpha soils can have
+          // distinct positive-psi fronts whose theta rounds to theta_e.
+          scan->psi_cm > BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM) {
         has_unsaturated_same_layer_source = true;
       }
       if (scan->is_WF_GW &&
@@ -12529,6 +12533,9 @@ static bool lgar_should_delay_surface_creation_gw_conversion(struct wetting_fron
 static bool lgar_connected_surface_creation_structure_is_effectively_saturated(struct wetting_front *front_start,
                                                                                int *soil_type,
                                                                                struct soil_properties_ *soil_properties);
+static bool lgar_is_mobile_groundwater_storage_pair_member(const struct wetting_front *front,
+                                                           struct wetting_front *head,
+                                                           double *cum_layer_thickness_cm);
 
 static bool lgar_created_surface_front_can_fold_into_connected_gw_chain(struct wetting_front *repair_target,
                                                                         int *soil_type,
@@ -12554,26 +12561,41 @@ static bool lgar_created_surface_front_can_fold_into_connected_gw_chain(struct w
 
 static struct wetting_front *lgar_fold_redundant_created_gw_front_into_connected_chain(struct wetting_front *repair_target,
                                                                                        struct wetting_front **head,
+                                                                                       double *cum_layer_thickness_cm,
                                                                                        int *soil_type,
                                                                                        struct soil_properties_ *soil_properties)
 {
-  if (repair_target == NULL || head == NULL || *head == NULL || repair_target->next == NULL) {
+  if (repair_target == NULL || head == NULL || *head == NULL || repair_target->next == NULL ||
+      cum_layer_thickness_cm == NULL) {
     return repair_target;
   }
 
-  // A saturated created front is storage-neutral when it matches the same-layer
-  // TO/GW packet below; fold it before it can become an independent fast packet.
+  struct wetting_front *chain_head = repair_target->next;
   if (repair_target->is_WF_GW &&
       !repair_target->to_bottom &&
-      repair_target->next->is_WF_GW &&
-      repair_target->layer_num == repair_target->next->layer_num &&
-      std::fabs(repair_target->theta - repair_target->next->theta) <= 1.0e-10) {
-    if (verbosity.compare("high") == 0) {
-      printf("surface creation folding redundant GW front %d into connected chain below "
-             "because it shares theta %.15f with front %d.\n",
-             repair_target->front_num, repair_target->theta, repair_target->next->front_num);
+      chain_head->is_WF_GW &&
+      repair_target->layer_num == chain_head->layer_num &&
+      repair_target->depth_cm <
+        cum_layer_thickness_cm[repair_target->layer_num] - LOWER_BOUNDARY_FINAL_TOL_CM &&
+      std::fabs(repair_target->psi_cm - chain_head->psi_cm) <= 1.0e-3 &&
+      !lgar_is_mobile_groundwater_storage_pair_member(repair_target, *head, cum_layer_thickness_cm) &&
+      !lgar_is_mobile_groundwater_storage_pair_member(chain_head, *head, cum_layer_thickness_cm)) {
+    // Trial the delete because listDeleteFront also re-snaps to_bottom boundaries.
+    const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+    struct wetting_front *trial_head = listCopy(*head, NULL);
+    (void) listDeleteFront(repair_target->front_num, &trial_head, soil_type, soil_properties);
+    const double mass_change_cm =
+      lgar_calc_mass_bal(cum_layer_thickness_cm, trial_head) - mass_before_cm;
+    listDelete(trial_head);
+    if (std::isfinite(mass_change_cm) &&
+        std::fabs(mass_change_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+      if (verbosity.compare("high") == 0) {
+        printf("surface creation folding storage-neutral GW front %d into chain at front %d "
+               "(trial mass change %.17g cm).\n",
+               repair_target->front_num, chain_head->front_num, mass_change_cm);
+      }
+      return listDeleteFront(repair_target->front_num, head, soil_type, soil_properties);
     }
-    return listDeleteFront(repair_target->front_num, head, soil_type, soil_properties);
   }
 
   return repair_target;
@@ -13520,6 +13542,7 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
     }
 
     repair_target = lgar_fold_redundant_created_gw_front_into_connected_chain(repair_target, head,
+                                                                              cum_layer_thickness_cm,
                                                                               soil_type, soil_properties);
     repair_target = lgar_fold_redundant_created_surface_front_into_connected_chain(repair_target, head,
                                                                                    soil_type, soil_properties);

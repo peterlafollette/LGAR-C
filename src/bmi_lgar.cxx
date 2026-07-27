@@ -1950,9 +1950,11 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     *repeat_next_front_num = limiting_next->front_num;
     *repeat_layer_num = limiting_current->layer_num;
 
+    // A correction can recreate the exact numbered pair with a wider gap; retain
+    // the gap guard only for the looser same-layer-cluster stall match.
     if (*repeat_count >= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_COUNT &&
-        limiting_current_gap_cm <= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_MAX_GAP_CM) {
-      // A repeated near-contact split is a stall. Step just past contact so
+        (same_pair || same_nearby_layer_cluster)) {
+      // A repeated split is a stall. Step just past contact so
       // the existing TO/GW merge/correction logic resolves the local overtake.
       limited_subtimestep_h =
         fmin(proposed_subtimestep_h,
@@ -1960,7 +1962,7 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
              limiting_closing_speed_cm_per_h);
       if (verbosity.compare("high") == 0) {
         printf("Adaptive LGARTO event split handoff for repeated mobile TO/GW "
-               "packet near-contact: front=%d next_front=%d layer=%d repeats=%d "
+               "packet event: front=%d next_front=%d layer=%d repeats=%d "
                "gap_cm=%.17lf proposed_dt_h=%.17lf handoff_dt_h=%.17lf\n",
                limiting_current->front_num,
                limiting_next->front_num,
