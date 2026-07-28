@@ -1,5 +1,8 @@
 #include "../include/all.hxx"
 
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstddef>
 #include <iostream>
 #include <sstream>
@@ -134,16 +137,24 @@ static int parse_state_line_to_records(const char *line_in, WFRecord **recs_out,
 
     double depth_cm, theta, psi_cm, dzdt_cm_per_h;
     int layer_num, front_num, to_bottom_int;
+    int consumed = 0;
 
-    int matched = sscanf(tok, " ( %lf , %lf , %d , %d , %d , %lf , %lf ) ",
+    int matched = sscanf(tok, " ( %lf , %lf , %d , %d , %d , %lf , %lf ) %n",
                          &depth_cm, &theta, &layer_num, &front_num,
-                         &to_bottom_int, &psi_cm, &dzdt_cm_per_h);
+                         &to_bottom_int, &psi_cm, &dzdt_cm_per_h, &consumed);
 
     /* A restart written by the current writer must contain all seven fields. */
-    if (matched != 7) {
+    if (matched != 7 || consumed == 0 || tok[consumed] != '\0') {
       free(recs);
       free(line);
       return 4;
+    }
+
+    if (!std::isfinite(depth_cm) || !std::isfinite(theta) ||
+        !std::isfinite(psi_cm) || !std::isfinite(dzdt_cm_per_h)) {
+      free(recs);
+      free(line);
+      return 5;
     }
 
     if (to_bottom_int != 0 && to_bottom_int != 1) {
@@ -312,9 +323,10 @@ extern void InitializeWettingFrontsFromCSV(
   Restart variables that are not part of the wetting front linked list.
 
   These values carry conceptual-reservoir storage, the surface-runoff memory
-  needed for wetting front creation, and flux-caching state used during dry
-  timesteps.  The writer stores them as key=value pairs so this parser can be
-  insensitive to column position after the leading time column.
+  needed for wetting front creation, flux caching state used during dry
+  timesteps, and the model clock.  The writer stores them as key=value pairs
+  so this parser can be insensitive to column position after the leading time
+  column.
 */
 typedef struct {
   double CR_fast_storage_cm;
@@ -329,6 +341,8 @@ typedef struct {
   double previous_recharge;
   double accumulated_PET;
   double accumulated_free_drainage;
+  double time_s;
+  int timesteps;
 } nonvadoseRestartState;
 
 /* Booleans are written as 0/1 in the restart CSV files. */
@@ -345,12 +359,43 @@ static bool parse_bool_01(const char *s, bool *out)
   return false;
 }
 
+/* Parse a complete finite floating-point token instead of silently accepting
+   malformed text as zero through strtod(). */
+static bool parse_finite_double(const char *s, double *out)
+{
+  char *end = NULL;
+  errno = 0;
+  double value = strtod(s, &end);
+
+  if (end == s || errno == ERANGE || !std::isfinite(value)) return false;
+  while (*end == ' ' || *end == '\t') end++;
+  if (*end != '\0') return false;
+
+  *out = value;
+  return true;
+}
+
+/* Parse a complete integer token and reject overflow or trailing characters. */
+static bool parse_int(const char *s, int *out)
+{
+  char *end = NULL;
+  errno = 0;
+  long value = strtol(s, &end, 10);
+
+  if (end == s || errno == ERANGE || value < INT_MIN || value > INT_MAX) return false;
+  while (*end == ' ' || *end == '\t') end++;
+  if (*end != '\0') return false;
+
+  *out = (int)value;
+  return true;
+}
+
 static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartState *rst)
 {
   /*
-    Older restart rows may not have all cache-history fields.  Defaults here
-    keep those optional cache terms cold-started unless explicit values are
-    found below.
+    Older restart rows may not have all cache history or model clock fields.
+    Defaults here keep those optional values cold-started unless explicit
+    values are found below.
   */
   rst->cache_fluxes = false;
   rst->cache_count = 1;
@@ -359,6 +404,8 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
   rst->previous_recharge = 0.0;
   rst->accumulated_PET = 0.0;
   rst->accumulated_free_drainage = 0.0;
+  rst->time_s = 0.0;
+  rst->timesteps = 0;
 
   char *line = strdup(line_in);
   if (!line) return 1;
@@ -395,15 +442,24 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
       future writer adds more restart metadata that older code can safely skip.
     */
     if (strcmp(key, "CR_fast_storage_cm") == 0) {
-      rst->CR_fast_storage_cm = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->CR_fast_storage_cm)) {
+        free(line);
+        return 6;
+      }
       got_fast = true;
     }
     else if (strcmp(key, "CR_slow_storage_cm") == 0) {
-      rst->CR_slow_storage_cm = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->CR_slow_storage_cm)) {
+        free(line);
+        return 6;
+      }
       got_slow = true;
     }
     else if (strcmp(key, "volon_timestep_cm") == 0) {
-      rst->volon_timestep_cm = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->volon_timestep_cm)) {
+        free(line);
+        return 6;
+      }
       got_volon = true;
     }
     else if (strcmp(key, "runoff_in_prev_step") == 0) {
@@ -414,7 +470,10 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
       got_runoff = true;
     }
     else if (strcmp(key, "precip_previous_timestep_cm") == 0) {
-      rst->precip_previous_timestep_cm = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->precip_previous_timestep_cm)) {
+        free(line);
+        return 6;
+      }
       got_precip_prev = true;
     }
     else if (strcmp(key, "cache_fluxes") == 0) {
@@ -424,27 +483,59 @@ static int parse_non_vadose_state_kv_line(const char *line_in, nonvadoseRestartS
       }
     }
     else if (strcmp(key, "cache_count") == 0) {
-      rst->cache_count = (int)strtol(val, NULL, 10);
+      if (!parse_int(val, &rst->cache_count)) {
+        free(line);
+        return 7;
+      }
       if (rst->cache_count < 1) rst->cache_count = 1;
     }
     else if (strcmp(key, "previous_AET") == 0) {
-      rst->previous_AET = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->previous_AET)) {
+        free(line);
+        return 6;
+      }
     }
     else if (strcmp(key, "previous_PET") == 0) {
-      rst->previous_PET = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->previous_PET)) {
+        free(line);
+        return 6;
+      }
     }
     else if (strcmp(key, "previous_recharge") == 0) {
-      rst->previous_recharge = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->previous_recharge)) {
+        free(line);
+        return 6;
+      }
     }
     else if (strcmp(key, "accumulated_PET") == 0) {
-      rst->accumulated_PET = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->accumulated_PET)) {
+        free(line);
+        return 6;
+      }
     }
     else if (strcmp(key, "accumulated_free_drainage") == 0) {
-      rst->accumulated_free_drainage = strtod(val, NULL);
+      if (!parse_finite_double(val, &rst->accumulated_free_drainage)) {
+        free(line);
+        return 6;
+      }
+    }
+    else if (strcmp(key, "time_s") == 0) {
+      if (!parse_finite_double(val, &rst->time_s)) {
+        free(line);
+        return 6;
+      }
+    }
+    else if (strcmp(key, "timesteps") == 0) {
+      if (!parse_int(val, &rst->timesteps)) {
+        free(line);
+        return 7;
+      }
     }
   }
 
   free(line);
+
+  if (rst->time_s < 0.0 || rst->timesteps < 0) return 8;
 
   /* Refuse restart if any required non-vadose state is absent. */
   if (!(got_fast && got_slow && got_volon && got_runoff && got_precip_prev)) {
@@ -506,6 +597,8 @@ extern void InitializenonvadoseStateFromCSV(
   state->lgar_mass_balance.volon_timestep_cm = rst.volon_timestep_cm;
   state->lgar_bmi_params.runoff_in_prev_step = rst.runoff_in_prev_step;
   state->lgar_bmi_params.precip_previous_timestep_cm = rst.precip_previous_timestep_cm;
+  state->lgar_bmi_params.time_s = rst.time_s;
+  state->lgar_bmi_params.timesteps = rst.timesteps;
 
   /*
     Flux-cache values are only meaningful when the current config allows flux
@@ -568,7 +661,15 @@ static int parse_giuh_state_line(const char *line_in, GIUHRestartState *rst)
     return 2;
   }
 
-  if (sscanf(num_ptr, "num_giuh_ordinates=%d", &rst->num_giuh_ordinates) != 1) {
+  char *num_value = num_ptr + strlen("num_giuh_ordinates=");
+  char *num_end = strchr(num_value, ',');
+  if (!num_end) {
+    free(line);
+    return 3;
+  }
+  *num_end = '\0';
+  if (!parse_int(num_value, &rst->num_giuh_ordinates) ||
+      rst->num_giuh_ordinates < 0) {
     free(line);
     return 3;
   }
@@ -605,7 +706,12 @@ static int parse_giuh_state_line(const char *line_in, GIUHRestartState *rst)
       return 6;
     }
 
-    rst->queue_vals[nread++] = strtod(tok, NULL);
+    if (!parse_finite_double(tok, &rst->queue_vals[nread])) {
+      free(rst->queue_vals);
+      free(line);
+      return 8;
+    }
+    nread++;
   }
 
   free(line);

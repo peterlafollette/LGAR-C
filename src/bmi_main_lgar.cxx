@@ -76,8 +76,9 @@ int main(int argc, char *argv[])
 
   // get time steps
   double endtime = model_state.GetEndTime();
+  double current_time = model_state.GetCurrentTime();
   double timestep = model_state.GetTimeStep();
-  int nsteps = int(endtime/timestep); // total number of time steps
+  int nsteps = int((endtime-current_time)/timestep); // time steps remaining in this invocation
 
   std::vector<std::string> time;
   std::vector<double> precipitation;
@@ -109,7 +110,7 @@ int main(int argc, char *argv[])
         "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,"
         "runoff_in_prev_step,precip_previous_timestep_cm,cache_fluxes,"
         "cache_count,previous_AET,previous_PET,previous_recharge,"
-        "accumulated_PET,accumulated_free_drainage\n");
+        "accumulated_PET,accumulated_free_drainage,time_s,timesteps\n");
     for (int j = 0; j < num_output_var; j++) {
       fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
       if (j == num_output_var-1)
@@ -153,7 +154,7 @@ int main(int argc, char *argv[])
 	std::string name = output_var_names[j];
 	double value = 0.0;
 	model_state.GetValue(name,&value);
-	fprintf(outdata_fptr,"%.12f",value);
+	fprintf(outdata_fptr,"%6.15f",value);
 	if (j == num_output_var-1)
 	  fprintf(outdata_fptr,"\n");
 	else
@@ -318,7 +319,9 @@ extern void write_non_vadose_state(FILE *out, struct model_state* state)
           "previous_PET=%.17g,"
           "previous_recharge=%.17g,"
           "accumulated_PET=%.17g,"
-          "accumulated_free_drainage=%.17g\n",
+          "accumulated_free_drainage=%.17g,"
+          "time_s=%.17g,"
+          "timesteps=%d\n",
           state->lgar_mass_balance.CR_fast_storage_cm,
           state->lgar_mass_balance.CR_slow_storage_cm,
           state->lgar_mass_balance.volon_timestep_cm,
@@ -330,7 +333,9 @@ extern void write_non_vadose_state(FILE *out, struct model_state* state)
           state->lgar_mass_balance.previous_PET,
           state->lgar_mass_balance.previous_recharge,
           state->lgar_mass_balance.accumulated_PET,
-          state->lgar_mass_balance.accumulated_free_drainage);
+          state->lgar_mass_balance.accumulated_free_drainage,
+          state->lgar_bmi_params.time_s,
+          state->lgar_bmi_params.timesteps);
 }
 
 extern void write_giuh_runoff_queue_state(

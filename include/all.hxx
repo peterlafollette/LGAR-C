@@ -197,6 +197,7 @@ struct lgar_mass_balance_variables
   // for global mass balance (compute cumulative mass balance)
   double volstart_cm;         // initial volume of water in the soil (at timestep 0)
   double volCRstart_cm;       // initial volume of water in CRs (at timestep 0)
+  double volon_start_cm;      // initial volume of ponded surface water (at timestep 0)
   double volend_cm;           // volume of water
   double volCRend_cm;         // volume of water in conceptual reservoir(s)
   double volprecip_cm;        // volume of rainfall

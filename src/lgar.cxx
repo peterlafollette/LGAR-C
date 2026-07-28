@@ -137,6 +137,10 @@ static void PrintSavedStateInitializationDetails(struct model_state *state,
               << state->lgar_mass_balance.accumulated_PET << " cm\n";
     std::cerr << "Saved accumulated_free_drainage: "
               << state->lgar_mass_balance.accumulated_free_drainage << " cm\n";
+    std::cerr << "Saved model time: "
+              << state->lgar_bmi_params.time_s << " s\n";
+    std::cerr << "Saved model timesteps: "
+              << state->lgar_bmi_params.timesteps << "\n";
   }
 
   if (is_giuh_state_path_set) {
@@ -283,6 +287,7 @@ extern void lgar_initialize(string config_file, struct model_state *state)
     state->lgar_mass_balance.volCRend_cm = 0.0;
     state->lgar_mass_balance.volCRend_timestep_cm = 0.0;
     state->lgar_mass_balance.volCRstart_cm = 0.0;
+    state->lgar_mass_balance.volon_start_cm = 0.0;
     state->lgar_mass_balance.volon_timestep_cm = 0.0; /* setting volon and precip at the initial time to 0.0
 							       as they determine the creation of surficial wetting front */
     state->lgar_bmi_params.precip_previous_timestep_cm = 0.0;
@@ -298,6 +303,10 @@ extern void lgar_initialize(string config_file, struct model_state *state)
     state->lgar_mass_balance.volCRstart_cm =
         state->lgar_mass_balance.CR_fast_storage_cm +
         state->lgar_mass_balance.CR_slow_storage_cm;
+    // Ponded water restored for the first update is also initial storage for
+    // the restarted run's global mass balance.
+    state->lgar_mass_balance.volon_start_cm =
+        state->lgar_mass_balance.volon_timestep_cm;
   }
 }
 
@@ -1120,11 +1129,12 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     throw runtime_error(errMsg.str());
   }
 
+  // Wetting front and non vadose state form one complete valid soil restart;
+  // loading only one can discard ponding, precipitation history, or model time.
   if (!state->lgar_bmi_params.is_invalid_soil_type &&
-      ((is_non_vadose_state_path_set && !is_state_path_set) || (!is_non_vadose_state_path_set && is_state_path_set)) &&
-      is_a_con_res_set) {
+      is_non_vadose_state_path_set != is_state_path_set) {
     stringstream errMsg;
-    errMsg << "The configuration file \'" << config_file <<"\' sets one of init_non_vadose_state_path or init_state_path but not both, while a nonlinear reservoir is desired. Either both or neither must be set in this case. \n";
+    errMsg << "The configuration file \'" << config_file <<"\' sets one of init_non_vadose_state_path or init_state_path but not both. A valid soil restart requires both files. \n";
     throw runtime_error(errMsg.str());
   }
 
@@ -1260,9 +1270,17 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       is_non_vadose_state_path_set,
       is_giuh_state_path_set);
 
-  state->lgar_bmi_input_params     = new lgar_bmi_input_parameters;
-  state->lgar_bmi_params.time_s    = 0.0;
-  state->lgar_bmi_params.timesteps = 0.0;
+  state->lgar_bmi_input_params = new lgar_bmi_input_parameters;
+  if (state->lgar_bmi_params.is_invalid_soil_type ||
+      !is_state_path_set || !is_non_vadose_state_path_set) {
+    state->lgar_bmi_params.time_s = 0.0;
+    state->lgar_bmi_params.timesteps = 0;
+  }
+  else {
+    // endtime is the duration requested for this invocation.  Convert it to
+    // an absolute model end time after restoring the saved model clock.
+    state->lgar_bmi_params.endtime_s += state->lgar_bmi_params.time_s;
+  }
 
   if (verbosity.compare("none") != 0) {
     std::cerr<<"------------- Initialization done! ---------------------- \n";
@@ -1418,6 +1436,7 @@ extern void lgar_update(struct model_state *state)
 extern void lgar_global_mass_balance(struct model_state *state, double *giuh_runoff_queue_cm)
 {
   double volstart           = state->lgar_mass_balance.volstart_cm;
+  double volon_start        = state->lgar_mass_balance.volon_start_cm;
   double volprecip          = state->lgar_mass_balance.volprecip_cm;
   double volrunoff          = state->lgar_mass_balance.volrunoff_cm;
   double volrunoff_CR       = state->lgar_mass_balance.volrunoff_CR_cm;
@@ -1440,7 +1459,7 @@ extern void lgar_global_mass_balance(struct model_state *state, double *giuh_run
   for(int i=0; i <= state->lgar_bmi_params.num_giuh_ordinates; i++)
     volend_giuh_cm += giuh_runoff_queue_cm[i];
 
-  double global_error_cm = volstart + volCRstart + volprecip - volrunoff - volAET - volon -
+  double global_error_cm = volstart + volCRstart + volon_start + volprecip - volrunoff - volAET - volon -
                            volrech - volinterflow - volend + volchange_calib_cm -
                            volrunoff_CR - volCRend;
   

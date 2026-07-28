@@ -50,7 +50,7 @@ The interflow parameters `interflow_psi_threshold` and `interflow_factor` are mo
 
 ### Restart Files
 
-Restart files are currently written only by standalone mode. Restart initialization reads the last data row from each requested restart file. If an invalid soil type is specified, restart files are ignored because CASAM returns input precipitation as output discharge for invalid soil types.
+Restart files are currently written only by standalone mode. Restart initialization reads the last data row from each requested restart file. For valid soil restarts, `init_state_path` and `init_non_vadose_state_path` must either both be set or both be omitted. Saved model time and timestep count are restored, while the configured `endtime` remains the duration of the new standalone invocation. If an invalid soil type is specified, restart files are ignored because CASAM returns input precipitation as output discharge for invalid soil types.
 
 The standalone `data_layers.csv` restart file saves and loads the following wetting front variables:
 
@@ -80,6 +80,8 @@ The standalone `data_non_vadose_state.csv` restart file saves and loads the foll
 | previous_recharge | cm | cached recharge |
 | accumulated_PET | cm | accumulated PET while using cached fluxes |
 | accumulated_free_drainage | cm | accumulated free drainage while using cached fluxes |
+| time_s | s | elapsed model time restored across standalone invocations |
+| timesteps | - | elapsed internal model timestep count |
 
 If `allow_flux_caching=false`, saved values for `cache_fluxes`, `cache_count`, `previous_AET`, `previous_PET`, `previous_recharge`, `accumulated_PET`, and `accumulated_free_drainage` are ignored and initialized as inactive cache state.
 
