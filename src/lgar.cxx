@@ -7592,23 +7592,21 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
       current->psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
       current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
 
-      double theta_new =
+      const double theta_new =
         calc_theta_from_h(current->psi_cm, next_vg_a, next_vg_m, next_vg_n, next_theta_e, next_theta_r);
 
-      double mbal_correction = overshot_depth * (current_theta - next->theta);
-      double denominator = theta_new - next_to_next->theta;
-      double mbal_Z_correction = mbal_correction / denominator;
+      const double mbal_correction = overshot_depth * (current_theta - next->theta);
+      const double denominator = theta_new - next_to_next->theta;
+      const double mbal_Z_correction = mbal_correction / denominator;
       double depth_new = cum_layer_thickness_cm[layer_num] + mbal_Z_correction;
 
       if (!std::isfinite(depth_new)) {
-        theta_new -= 1.0E-14;
-        denominator = theta_new - next_to_next->theta;
-        mbal_Z_correction = mbal_correction / denominator;
-        depth_new = cum_layer_thickness_cm[layer_num] + mbal_Z_correction;
-      }
-
-      if (!std::isfinite(depth_new)) {
-        depth_new = cum_layer_thickness_cm[layer_num] + TRUNCATION_DEPTH;
+        // A zero storage contrast cannot determine remap depth; keep theta
+        // psi-consistent and retain the handoff just above the next lower front.
+        depth_new = next_to_next != next && next_to_next->layer_num == layer_num + 1
+          ? fmax(cum_layer_thickness_cm[layer_num] + TRUNCATION_DEPTH,
+                 next_to_next->depth_cm - DEPTH_AVOIDS_SAME_WF_DEPTH)
+          : cum_layer_thickness_cm[layer_num] + TRUNCATION_DEPTH;
       }
       const double lower_layer_top_cm = cum_layer_thickness_cm[layer_num];
       const double lower_layer_bottom_cm = cum_layer_thickness_cm[layer_num + 1];
@@ -14276,7 +14274,7 @@ static double lgarto_integrated_resistance_to_depth(double path_top_cm,
 // ############################################################################################
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, double h_p, double subtimestep_h, int *soil_type, double *cum_layer_thickness_cm,
 				   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, bool switch_caching, int cache_count, int new_front,
-				   double groundwater_depth_cm)
+				   double groundwater_depth_cm, bool TO_only)
 {
   if (verbosity.compare("high") == 0) {
     std::cerr<<"Calculating dz/dt .... \n";
@@ -14344,6 +14342,10 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
 
     next = current->next;    // the next element in the linked list
     if (next == NULL) break; // we're done calculating dZ/dt's because we're at the end of the list
+    if (TO_only && !current->is_WF_GW) {
+      current = next; // preserve surface velocities during a post-sync TO refresh
+      continue;
+    }
 
     if (current->is_WF_GW) {
       apply_layer_crossing_limit = false;
@@ -16313,7 +16315,8 @@ static double lgar_apply_theta_mass_balance_correction_psi(
   struct wetting_front **head, double *cum_layer_thickness_cm, int *soil_type,
   struct soil_properties_ *soil_properties)
 {
-  psi_cm_loc = fmax(0.0, fmin(PSI_UPPER_LIM, psi_cm_loc));
+  // The caller owns the dry bracket, which may include a valid incoming psi above the generic cap.
+  psi_cm_loc = fmax(0.0, psi_cm_loc);
 
   int layer_num = current->layer_num;
   int soil_num = soil_type[layer_num];
@@ -16537,24 +16540,26 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
   }
 
   const double original_psi_cm = current->psi_cm;
+  const double psi_dry_bound_cm =
+    fmax(PSI_UPPER_LIM, std::isfinite(original_psi_cm) ? original_psi_cm : 0.0);
   const double mass_at_saturation =
     lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, 0.0, current,
                                                  head, cum_layer_thickness_cm,
                                                  soil_type, soil_properties);
   const double mass_at_dry_limit =
-    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, PSI_UPPER_LIM,
+    lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, psi_dry_bound_cm,
                                                  current, head, cum_layer_thickness_cm,
                                                  soil_type, soil_properties);
 
   double best_psi_cm = 0.0;
   double best_abs_error_cm = fabs(mass_at_saturation - prior_mass);
   if (fabs(mass_at_dry_limit - prior_mass) < best_abs_error_cm) {
-    best_psi_cm = PSI_UPPER_LIM;
+    best_psi_cm = psi_dry_bound_cm;
     best_abs_error_cm = fabs(mass_at_dry_limit - prior_mass);
   }
 
   if (std::isfinite(original_psi_cm) &&
-      original_psi_cm >= 0.0 && original_psi_cm <= PSI_UPPER_LIM) {
+      original_psi_cm >= 0.0 && original_psi_cm <= psi_dry_bound_cm) {
     const double mass_at_bounded_original =
       lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, original_psi_cm,
                                                    current, head, cum_layer_thickness_cm,
@@ -16574,7 +16579,7 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
 
   if (target_bracketed) {
     double bracket_lo_psi_cm = 0.0;
-    double bracket_hi_psi_cm = PSI_UPPER_LIM;
+    double bracket_hi_psi_cm = psi_dry_bound_cm;
     const bool mass_increases_with_psi = mass_at_dry_limit > mass_at_saturation;
 
     /*

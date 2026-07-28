@@ -378,7 +378,7 @@ extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_t
 // computes derivatives; called derivs() in Python code
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, double h_p, double subtimestep_h, int *soil_type, double *cum_layer_thickness,
 				   double *frozen_factor, struct wetting_front* head, struct soil_properties_ *soil_properties, bool switch_caching, int cache_count, int new_front,
-				   double groundwater_depth_cm = -1.0);
+				   double groundwater_depth_cm = -1.0, bool TO_only = false);
 
 // computes dry depth
 extern double lgar_calc_dry_depth(bool TO_enabled, bool use_closed_form_G, int nint, double timestep_h, double *deltheta, int *soil_type,

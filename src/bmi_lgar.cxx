@@ -1485,8 +1485,16 @@ static double lgarto_limit_subtimestep_for_surface_boundary_crossing(
   double groundwater_depth_cm,
   int num_layers,
   const double *cum_layer_thickness_cm,
-  const wetting_front *head)
+  const wetting_front *head,
+  int *limiting_front_num,
+  int *limiting_layer_num)
 {
+  if (limiting_front_num != NULL) {
+    *limiting_front_num = -1;
+  }
+  if (limiting_layer_num != NULL) {
+    *limiting_layer_num = -1;
+  }
   if (proposed_subtimestep_h <= 0.0 || head == NULL || num_layers < 2 ||
       !lgarto_has_TO_fronts(head)) {
     return proposed_subtimestep_h;
@@ -1531,6 +1539,12 @@ static double lgarto_limit_subtimestep_for_surface_boundary_crossing(
     }
 
     limited_subtimestep_h = event_subtimestep_h;
+    if (limiting_front_num != NULL) {
+      *limiting_front_num = current->front_num;
+    }
+    if (limiting_layer_num != NULL) {
+      *limiting_layer_num = layer_num;
+    }
 
     if (verbosity.compare("high") == 0) {
       printf("Adaptive LGARTO event split at surface layer-boundary crossing: "
@@ -2001,6 +2015,73 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   return limited_subtimestep_h;
 }
 
+/*
+  Recognize the two alternating phases of the adjacent surface-to-TO packet
+  handoff.  This is deliberately stricter than either event predictor alone:
+  an intervening front or a noncanonical boundary returns control to the
+  ordinary capped event loop.
+*/
+static int lgarto_compound_surface_TO_handoff_boundary_layer(
+  const model_state *state,
+  bool surface_boundary_event,
+  int current_front_num,
+  int next_front_num,
+  int event_layer_num)
+{
+  if (state == NULL || state->head == NULL ||
+      state->lgar_bmi_params.cum_layer_thickness_cm == NULL) {
+    return 0;
+  }
+
+  const wetting_front *previous_previous = NULL;
+  const wetting_front *previous = NULL;
+  const wetting_front *current = state->head;
+  while (current != NULL && current->front_num != current_front_num) {
+    previous_previous = previous;
+    previous = current;
+    current = current->next;
+  }
+  if (current == NULL || current->layer_num != event_layer_num) {
+    return 0;
+  }
+
+  const int upper_layer_num =
+    surface_boundary_event ? event_layer_num : event_layer_num - 1;
+  if (upper_layer_num < 1 ||
+      upper_layer_num >= state->lgar_bmi_params.num_layers) {
+    return 0;
+  }
+  const double boundary_cm =
+    state->lgar_bmi_params.cum_layer_thickness_cm[upper_layer_num];
+  if (surface_boundary_event) {
+    const wetting_front *upper_scaffold = current->next;
+    return
+      !current->is_WF_GW && !current->to_bottom &&
+      upper_scaffold != NULL && upper_scaffold->to_bottom &&
+      upper_scaffold->layer_num == upper_layer_num &&
+      upper_scaffold->depth_cm == boundary_cm
+        ? upper_layer_num : 0;
+  }
+
+  const double boundary_tol_cm =
+    fmax(10.0 * LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM,
+         1.0e-10 * fmax(1.0, std::fabs(boundary_cm)));
+  return
+    current->next != NULL &&
+    current->next->front_num == next_front_num &&
+    current->is_WF_GW && current->next->is_WF_GW &&
+    !current->to_bottom && !current->next->to_bottom &&
+    current->layer_num == upper_layer_num + 1 &&
+    current->next->layer_num == current->layer_num &&
+    previous != NULL && previous->is_WF_GW && !previous->to_bottom &&
+    previous->layer_num == current->layer_num &&
+    std::fabs(previous->depth_cm - boundary_cm) <= boundary_tol_cm &&
+    previous_previous != NULL && previous_previous->to_bottom &&
+    previous_previous->layer_num == upper_layer_num &&
+    previous_previous->depth_cm == boundary_cm
+      ? upper_layer_num : 0;
+}
+
 /**
  * @brief Delete dynamic arrays allocated in Initialize() and held by this object
  * 
@@ -2321,10 +2402,13 @@ Update()
   double remaining_forcing_h = subcycles * base_subtimestep_h;
   int cycle = 0;
   int lgarto_event_splits_this_forcing = 0;
+  int lgarto_guarded_event_splits_this_forcing = 0;
   int repeated_mobile_TO_packet_front_num = -1;
   int repeated_mobile_TO_packet_next_front_num = -1;
   int repeated_mobile_TO_packet_layer_num = -1;
   int repeated_mobile_TO_packet_split_count = 0;
+  int previous_compound_handoff_signature = 0;
+  int alternating_compound_handoff_events = 0;
   while (remaining_forcing_h > SMALL_EPS) {
     cycle++;
     subtimestep_h = fmin(base_subtimestep_h, remaining_forcing_h);
@@ -2333,13 +2417,19 @@ Update()
         state->lgar_bmi_params.mobile_groundwater_level
           ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
           : -1.0;
+      int surface_boundary_front_num = -1;
+      int surface_boundary_layer_num = -1;
       double event_limited_subtimestep_h =
         lgarto_limit_subtimestep_for_surface_boundary_crossing(
           subtimestep_h,
           groundwater_depth_for_event_split_cm,
           state->lgar_bmi_params.num_layers,
           state->lgar_bmi_params.cum_layer_thickness_cm,
-          state->head);
+          state->head,
+          &surface_boundary_front_num,
+          &surface_boundary_layer_num);
+      const double surface_limited_subtimestep_h =
+        event_limited_subtimestep_h;
       event_limited_subtimestep_h =
         lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
           event_limited_subtimestep_h,
@@ -2351,14 +2441,62 @@ Update()
 
       if (event_limited_subtimestep_h + SMALL_EPS < subtimestep_h) {
         lgarto_event_splits_this_forcing++;
-        if (lgarto_event_splits_this_forcing > LGARTO_EVENT_SPLIT_MAX_PER_FORCING) {
+        const bool mobile_packet_event =
+          event_limited_subtimestep_h + SMALL_EPS <
+          surface_limited_subtimestep_h;
+        const bool surface_boundary_event =
+          !mobile_packet_event &&
+          surface_boundary_front_num > 0 &&
+          surface_boundary_layer_num > 0;
+        const int handoff_front_num =
+          surface_boundary_event
+            ? surface_boundary_front_num
+            : repeated_mobile_TO_packet_front_num;
+        const int handoff_boundary_layer =
+          (surface_boundary_event || mobile_packet_event)
+            ? lgarto_compound_surface_TO_handoff_boundary_layer(
+                state, surface_boundary_event, handoff_front_num,
+                repeated_mobile_TO_packet_next_front_num,
+                surface_boundary_event
+                  ? surface_boundary_layer_num
+                  : repeated_mobile_TO_packet_layer_num)
+            : 0;
+        // The sign distinguishes surface-boundary (+) from mobile-contact (-).
+        const int handoff_signature =
+          surface_boundary_event ? handoff_boundary_layer : -handoff_boundary_layer;
+        alternating_compound_handoff_events =
+          handoff_signature != 0 &&
+          handoff_signature == -previous_compound_handoff_signature
+            ? alternating_compound_handoff_events + 1
+            : (handoff_signature != 0 ? 1 : 0);
+        previous_compound_handoff_signature = handoff_signature;
+
+        // Three alternating phases prove that the corrected topology returned
+        // to the same adjacent handoff; completed handoffs are productive, not stalls.
+        const bool compound_handoff_active =
+          alternating_compound_handoff_events >= 3;
+        if (!compound_handoff_active) {
+          lgarto_guarded_event_splits_this_forcing++;
+        }
+        else if (alternating_compound_handoff_events == 3 &&
+                 verbosity.compare("high") == 0) {
+          printf("Adaptive LGARTO compound surface-to-TO packet handoff active "
+                 "at layer boundary %d; subsequent alternating handoff phases "
+                 "remain subject to the ordinary mover and mass checks.\n",
+                 handoff_boundary_layer);
+        }
+
+        if (lgarto_guarded_event_splits_this_forcing >
+            LGARTO_EVENT_SPLIT_MAX_PER_FORCING) {
           fprintf(stderr,
                   "Error: adaptive LGARTO event splitting exceeded split cap.\n"
-                  "  splits=%d max_splits=%d base_subtimestep_h=%.17lf "
+                  "  splits=%d guarded_splits=%d max_guarded_splits=%d "
+                  "base_subtimestep_h=%.17lf "
                   "remaining_forcing_h=%.17lf requested_subtimestep_h=%.17lf "
                   "event_limited_subtimestep_h=%.17lf\n"
                   "  Wetting front list follows:\n",
                   lgarto_event_splits_this_forcing,
+                  lgarto_guarded_event_splits_this_forcing,
                   LGARTO_EVENT_SPLIT_MAX_PER_FORCING,
                   base_subtimestep_h,
                   remaining_forcing_h,
@@ -2371,6 +2509,10 @@ Update()
         }
 
         subtimestep_h = event_limited_subtimestep_h;
+      }
+      else {
+        previous_compound_handoff_signature = 0;
+        alternating_compound_handoff_events = 0;
       }
     }
 
@@ -3366,6 +3508,14 @@ Update()
         state->lgar_bmi_params.lower_bdy_flux_to_CR) {
       mobile_groundwater_explicit_mass_change_subtimestep_cm +=
         lgar_sync_mobile_groundwater_chain_from_CR_storage(state);
+      // CR sync can replace the support chain after dzdt was calculated.
+      lgar_dzdt_calc(use_closed_form_G, nint, num_layers, ponded_depth_subtimestep_cm,
+                     subtimestep_h, state->lgar_bmi_params.layer_soil_type,
+                     state->lgar_bmi_params.cum_layer_thickness_cm,
+                     state->lgar_bmi_params.frozen_factor, state->head,
+                     state->soil_properties, false, 1, -1,
+                     lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params),
+                     true);
     }
 
     state->lgar_mass_balance.volrunoff_CR_cm += volQ_CR_subtimestep_cm;
