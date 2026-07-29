@@ -1682,19 +1682,6 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
     std::vector<TOAETAllocation> allocations;
     double segment_top_cm =
       fmax(top_of_to_root_zone_cm, fmin(segment_start_cm, explicit_to_aet_depth_cm));
-    const bool allow_connected_to_bottom_bridge_aet = (surface_front_count == 0);
-
-    auto find_to_aet_target_at_or_below = [](wetting_front *front) {
-      for (wetting_front *candidate = front; candidate != NULL; candidate = candidate->next) {
-        if (candidate->is_WF_GW == FALSE) {
-          return static_cast<wetting_front *>(NULL);
-        }
-        if (is_to_aet_eligible_front(candidate)) {
-          return candidate;
-        }
-      }
-      return static_cast<wetting_front *>(NULL);
-    };
 
     auto add_allocation = [&](wetting_front *target_front,
                               wetting_front *stress_front,
@@ -1731,7 +1718,7 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
     }
 
     for (wetting_front *current = *head; current != NULL; current = current->next) {
-      if (current->is_WF_GW == FALSE) {
+      if (!is_to_aet_eligible_front(current)) {
         continue;
       }
 
@@ -1743,28 +1730,15 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
         continue;
       }
 
-      const bool current_is_mobile_target = is_to_aet_eligible_front(current);
-      if (!current_is_mobile_target && !allow_connected_to_bottom_bridge_aet) {
-        continue;
-      }
-
-      if (!allow_connected_to_bottom_bridge_aet &&
-          current_is_mobile_target && current->depth_cm >= explicit_to_aet_depth_cm) {
+      // A front on the AET boundary may dry in place; only deeper fronts are ineligible.
+      if (current->depth_cm > explicit_to_aet_depth_cm + 1.0e-8) {
         break;
-      }
-
-      wetting_front *target_front =
-        current_is_mobile_target ? current : find_to_aet_target_at_or_below(current);
-      if (target_front == NULL) {
-        continue;
       }
 
       const double allocation_bottom_cm = fmin(current->depth_cm, explicit_to_aet_depth_cm);
       const double thickness_cm = fmax(0.0, allocation_bottom_cm - segment_top_cm);
       if (thickness_cm > 0.0) {
-        // A to_bottom bridge is fixed in place, but its root-zone interval can
-        // still supply AET through the connected movable TO front below it.
-        add_allocation(target_front, current, thickness_cm, false);
+        add_allocation(current, current, thickness_cm, false);
         segment_top_cm = fmax(segment_top_cm, allocation_bottom_cm);
       }
 
@@ -1774,6 +1748,7 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
     }
 
     if (!allocations.empty() && allocations.back().front != active_zero_depth_support_front) {
+      // The deepest movable TO front in the AET domain represents the remaining root-zone interval.
       allocations.back().thickness_cm += fmax(0.0, explicit_to_aet_depth_cm - segment_top_cm);
     }
 
