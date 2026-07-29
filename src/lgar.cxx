@@ -131,6 +131,7 @@ static void lgar_refresh_front_state_from_theta(struct wetting_front *front,
                                                 int *soil_type,
                                                 double *frozen_factor,
                                                 struct soil_properties_ *soil_properties);
+static double lgar_psi_assertion_tolerance_cm(double psi_a_cm, double psi_b_cm);
 static double lgar_surface_creation_downstream_TO_psi_bound_cm(struct wetting_front *repair_target);
 static double lgar_theta_mass_balance_correction_with_min_psi(
   bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head,
@@ -354,10 +355,32 @@ lgar_collect_lossless_boundary_psi_states(struct wetting_front *head,
                             soil_properties[soil_num].theta_r);
     }
     if (lossless) {
-      // Keep an exact shared psi when theta cannot uniquely recover it near
-      // residual or saturation; the existing mass guard handles other states.
-      states.push_back({upper, upper->psi_cm});
-      states.push_back({lower, upper->psi_cm});
+      struct wetting_front *chain_start = upper;
+      if (upper->is_WF_GW && lower->is_WF_GW) {
+        chain_start = head;
+        for (struct wetting_front *candidate = head; candidate != upper;
+             candidate = candidate->next) {
+          const int soil_num = soil_type[candidate->layer_num];
+          if (!candidate->is_WF_GW || candidate->layer_num != upper->layer_num ||
+              candidate->psi_cm != upper->psi_cm ||
+              candidate->theta !=
+                calc_theta_from_h(upper->psi_cm,
+                                  soil_properties[soil_num].vg_alpha_per_cm,
+                                  soil_properties[soil_num].vg_m,
+                                  soil_properties[soil_num].vg_n,
+                                  soil_properties[soil_num].theta_e,
+                                  soil_properties[soil_num].theta_r)) {
+            chain_start = candidate->next;
+          }
+        }
+      }
+
+      // Preserve the exact same-layer TO chain feeding a lossless boundary pair;
+      // theta cannot uniquely recover psi near residual or saturation.
+      for (struct wetting_front *member = chain_start; member != lower->next;
+           member = member->next) {
+        states.push_back({member, upper->psi_cm});
+      }
     }
   }
   return states;
@@ -5850,7 +5873,10 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
 	    // 'current->depth_cm > next->depth_cm' ensures that merging is needed
 	    // 'current->layer_num == next->layer_num' ensures wetting fronts are in the same layer
 	    // '!next->to_bottom' ensures that the next wetting front is not the deepest wetting front in the layer
-	    if ( (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) && !next->to_bottom) {
+	    // Mixed surface/TO contacts must return to the correction loop for the
+	    // mass-aware surface/TO handoff instead of using this surface merge.
+	    if ( (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) &&
+	         !current->is_WF_GW && !next->is_WF_GW && !next->to_bottom) {
         if (lgarto_surface_front_overtook_surface_front_above_TO_chain(current)) {
           (void) lgarto_convert_overtaken_surface_front_above_TO_chain(
             head, "mixed surface/surface/TO merge guard");
@@ -6374,7 +6400,8 @@ extern double lgarto_extract_TO_GW_flux_from_surface_WFs(double *bottom_boundary
     bottom_boundary_flux_cm -= *bottom_boundary_flux_above_surface_WFs_cm;
   }
 
-  listSendToTop(*head);
+  // Do not reorder here: boundary correction needs upward-crossed TO fronts
+  // beside their to_bottom bridge so it can translate the compound crossing.
 
   current = listFindFront(listLength(*head) - 1, *head, NULL);
   if (current == NULL) {
@@ -9681,9 +9708,10 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
     if (previous_same_layer_TO != NULL &&
         std::isfinite(previous_same_layer_TO->psi_cm) &&
         std::isfinite(current->psi_cm) &&
+        // Use the invariant's tolerance so CR sync cannot leave a state it rejects.
         current->psi_cm >
           previous_same_layer_TO->psi_cm +
-            lgar_boundary_roundtrip_psi_tolerance_cm(
+            lgar_psi_assertion_tolerance_cm(
               previous_same_layer_TO->psi_cm, current->psi_cm)) {
       current->dzdt_cm_per_h = 0.0;
       lgarto_set_front_hydraulic_state_from_psi(
@@ -10019,6 +10047,10 @@ extern void lgarto_assert_mobile_groundwater_CR_chain_consistency(double target_
   if (!std::isfinite(fixed_column_depth_cm) || fixed_column_depth_cm <= 0.0) {
     return;
   }
+  // The scalar groundwater proxy may recede below the fixed soil column, while
+  // its explicit zero-storage support pair remains clipped to the column bottom.
+  const double expected_pair_depth_cm =
+    fmin(groundwater_depth_cm, fixed_column_depth_cm);
 
   const double support_tol_cm =
     fmax(MOBILE_GROUNDWATER_SUBMERGENCE_TOL_CM,
@@ -10050,8 +10082,8 @@ extern void lgarto_assert_mobile_groundwater_CR_chain_consistency(double target_
     abort();
   }
 
-  if (fabs(vadose_side_front->depth_cm - groundwater_depth_cm) > depth_tol_cm ||
-      fabs(saturated_support_front->depth_cm - groundwater_depth_cm) > depth_tol_cm) {
+  if (fabs(vadose_side_front->depth_cm - expected_pair_depth_cm) > depth_tol_cm ||
+      fabs(saturated_support_front->depth_cm - expected_pair_depth_cm) > depth_tol_cm) {
     fprintf(stderr,
             "Error: mobile groundwater CR storage pair depth does not match groundwater depth.\n"
             "  groundwater_depth_cm=%.17g vadose_pair_depth_cm=%.17g "
@@ -10409,7 +10441,8 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth
   int *soil_type,
   double *frozen_factor,
   struct wetting_front **head,
-  struct soil_properties_ *soil_properties)
+  struct soil_properties_ *soil_properties,
+  double preserved_vadose_psi_cm)
 {
   if (!lgarto_rebuild_mobile_groundwater_storage_pair_at_depth(
         groundwater_depth_cm, num_layers, cum_layer_thickness_cm, soil_type,
@@ -10431,6 +10464,14 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth
   if (lgarto_find_mobile_groundwater_storage_pair(
         *head, support_tol_cm, &vadose_side_front,
         &saturated_support_front)) {
+    if (std::isfinite(preserved_vadose_psi_cm)) {
+      // Keep the profile immediately above a packet-crossing GW rise; generic
+      // submergence cleanup can otherwise inherit a much shallower wet state.
+      vadose_side_front->dzdt_cm_per_h = 0.0;
+      lgarto_set_front_hydraulic_state_from_psi(
+        vadose_side_front, preserved_vadose_psi_cm, soil_type, frozen_factor,
+        soil_properties);
+    }
     struct wetting_front *boundary_source = NULL;
     bool has_same_layer_source = false;
     for (struct wetting_front *scan = *head;
@@ -10445,7 +10486,8 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth
         boundary_source = scan;
       }
     }
-    if (!has_same_layer_source && boundary_source != NULL &&
+    if (!std::isfinite(preserved_vadose_psi_cm) &&
+        !has_same_layer_source && boundary_source != NULL &&
         !lgarto_front_is_near_saturated(boundary_source, num_layers,
                                         soil_type, soil_properties)) {
       vadose_side_front->dzdt_cm_per_h = 0.0;
@@ -11055,7 +11097,7 @@ extern double lgarto_move_mobile_groundwater_support_for_CR_storage_change(doubl
         const bool rebuilt_trial =
           lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
             rebuild_depth_cm, num_layers, cum_layer_thickness_cm, soil_type,
-            frozen_factor, &trial_head, soil_properties);
+            frozen_factor, &trial_head, soil_properties, NAN);
         const double rebuild_trial_storage_cm =
           rebuilt_trial
             ? lgarto_mobile_groundwater_CR_storage_cm(num_layers,
@@ -11072,7 +11114,7 @@ extern double lgarto_move_mobile_groundwater_support_for_CR_storage_change(doubl
               rebuild_storage_tol_cm &&
             lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
               rebuild_depth_cm, num_layers, cum_layer_thickness_cm,
-              soil_type, frozen_factor, head, soil_properties)) {
+              soil_type, frozen_factor, head, soil_properties, NAN)) {
           if (updated_groundwater_depth_cm != NULL) {
             *updated_groundwater_depth_cm = rebuild_depth_cm;
           }
@@ -11138,22 +11180,51 @@ extern double lgarto_move_mobile_groundwater_support_for_CR_storage_change(doubl
     const int same_layer_target_layer =
       lgarto_layer_for_depth_cm(same_layer_depth_cm, num_layers,
                                 cum_layer_thickness_cm);
-    const bool same_layer_packet_crossing_rise =
-      same_layer_target_layer == pair_layer &&
-      same_layer_depth_cm < saturated_support_front->depth_cm - support_tol_cm &&
+    const bool crosses_redundant_near_contact =
+      same_layer_depth_cm <
+        saturated_support_front->depth_cm - MBAL_ITERATIVE_TOLERANCE &&
       previous_to_pair != NULL &&
       previous_to_pair->layer_num == pair_layer &&
-      same_layer_depth_cm < previous_to_pair->depth_cm - support_tol_cm;
+      same_layer_depth_cm <
+        previous_to_pair->depth_cm - MBAL_ITERATIVE_TOLERANCE &&
+      std::isfinite(previous_to_pair->psi_cm) &&
+      std::isfinite(vadose_side_front->psi_cm) &&
+      fabs(previous_to_pair->psi_cm - vadose_side_front->psi_cm) <=
+        lgar_psi_assertion_tolerance_cm(previous_to_pair->psi_cm,
+                                       vadose_side_front->psi_cm);
+    const bool same_layer_packet_crossing_rise =
+      same_layer_target_layer == pair_layer &&
+      (same_layer_depth_cm <
+         saturated_support_front->depth_cm - support_tol_cm ||
+       crosses_redundant_near_contact) &&
+      previous_to_pair != NULL &&
+      previous_to_pair->layer_num == pair_layer &&
+      (same_layer_depth_cm <
+         previous_to_pair->depth_cm - support_tol_cm ||
+       crosses_redundant_near_contact);
     if (same_layer_packet_crossing_rise) {
       const double canonical_same_layer_depth_cm =
         lgarto_canonical_mobile_groundwater_depth_cm(
           same_layer_depth_cm, num_layers, cum_layer_thickness_cm);
+      double packet_crossing_vadose_psi_cm = vadose_side_front->psi_cm;
+      for (struct wetting_front *scan = *head;
+           scan != NULL && scan != vadose_side_front; scan = scan->next) {
+        if (scan->is_WF_GW && !scan->to_bottom &&
+            scan->layer_num == pair_layer &&
+            scan->depth_cm >
+              canonical_same_layer_depth_cm + MBAL_ITERATIVE_TOLERANCE &&
+            std::isfinite(scan->psi_cm)) {
+          packet_crossing_vadose_psi_cm = scan->psi_cm;
+          break;
+        }
+      }
       struct wetting_front *trial_head = listCopy(*head, NULL);
       if (trial_head != NULL) {
         const bool rebuilt_trial =
           lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
             canonical_same_layer_depth_cm, num_layers, cum_layer_thickness_cm,
-            soil_type, frozen_factor, &trial_head, soil_properties);
+            soil_type, frozen_factor, &trial_head, soil_properties,
+            packet_crossing_vadose_psi_cm);
         const double trial_storage_cm =
           rebuilt_trial
             ? lgarto_mobile_groundwater_CR_storage_cm(num_layers,
@@ -11171,7 +11242,7 @@ extern double lgarto_move_mobile_groundwater_support_for_CR_storage_change(doubl
             lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
               canonical_same_layer_depth_cm, num_layers,
               cum_layer_thickness_cm, soil_type, frozen_factor, head,
-              soil_properties)) {
+              soil_properties, packet_crossing_vadose_psi_cm)) {
           if (updated_groundwater_depth_cm != NULL) {
             *updated_groundwater_depth_cm = canonical_same_layer_depth_cm;
           }

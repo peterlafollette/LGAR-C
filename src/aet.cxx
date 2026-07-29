@@ -179,9 +179,9 @@ static void remove_mass_neutral_redundant_to_fronts_before_aet(double *cum_layer
       continue;
     }
 
-    // Mobile-GW CR storage needs its colocated non-to_bottom psi=0 support
-    // even when ordinary profile storage says it is redundant with the front below.
-    if (is_mobile_groundwater_storage_support_for_aet_cleanup(previous, current)) {
+    // Preserve either member of the mobile-GW pair, including a saturated vadose side.
+    if (is_mobile_groundwater_storage_support_for_aet_cleanup(previous, current) ||
+        is_mobile_groundwater_storage_support_for_aet_cleanup(current, next)) {
       previous = current;
       current = next;
       continue;
