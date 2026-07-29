@@ -9672,7 +9672,9 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
        current = current->next) {
     if (!current->is_WF_GW ||
         current->to_bottom ||
-        current->layer_num != groundwater_layer) {
+        current->layer_num != groundwater_layer ||
+        // Zero-depth layer metadata is not a finite hydraulic predecessor.
+        fabs(current->depth_cm) <= ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM) {
       continue;
     }
 
@@ -15531,7 +15533,10 @@ static void lgar_dry_zero_depth_groundwater_fronts_to_surface_profile(
   }
 
   for (struct wetting_front *current = *head; current != NULL; current = current->next) {
-    if (current->is_WF_GW == FALSE || fabs(current->depth_cm) > 1.0e-12) {
+    // Deeper-layer zero-depth scaffolds have a nonzero coefficient in the
+    // legacy list mass formula, so only top-layer metadata is storage-neutral.
+    if (current->is_WF_GW == FALSE || current->layer_num != 1 ||
+        fabs(current->depth_cm) > 1.0e-12) {
       continue;
     }
     if (lgar_is_mobile_groundwater_storage_pair_member(
