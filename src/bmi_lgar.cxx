@@ -3073,27 +3073,8 @@ Update()
       if (state->lgar_bmi_params.TO_enabled &&
           create_surficial_front &&
           creation_excess_runoff_subtimestep_cm > SMALL_EPS) {
-        /* Experimental bookkeeping: after creating a saturated surface front,
-           dzdt has been recomputed for the updated TO/GW scaffold but that
-           scaffold will not physically move again in this creation substep.
-           Route only the read-only projected same-substep TO drainage from the
-           creation residual to lower-boundary flux, instead of treating all of
-           that residual as immediate surface runoff. */
-        trace_surface_creation_post_creation_TO_release_cm =
-          lgarto_project_TO_motion_lower_boundary_flux_cm(
-            subtimestep_h, num_layers,
-            state->lgar_bmi_params.cum_layer_thickness_cm,
-            state->lgar_bmi_params.layer_soil_type,
-            state->head, state->soil_properties,
-            lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params));
-        const double creation_residual_to_lower_boundary_cm =
-          fmin(creation_excess_runoff_subtimestep_cm,
-               trace_surface_creation_post_creation_TO_release_cm);
-        if (creation_residual_to_lower_boundary_cm > SMALL_EPS) {
-          creation_excess_runoff_subtimestep_cm -= creation_residual_to_lower_boundary_cm;
-          creation_excess_gw_flux_subtimestep_cm += creation_residual_to_lower_boundary_cm;
-        }
-
+        /* Retain the recomputed dzdt for later motion; do not book its
+           unexecuted post-creation movement as current-substep recharge. */
         const double already_booked_lower_boundary_cm =
           temp_rch + free_drainage_subtimestep_cm + creation_excess_gw_flux_subtimestep_cm;
         const double saturated_column_capacity_cm =
