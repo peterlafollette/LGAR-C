@@ -280,6 +280,11 @@ static bool lgar_boundary_psi_snap_candidate(const struct wetting_front *upper,
                                              int *soil_type,
                                              struct soil_properties_ *soil_properties)
 {
+  // Equal psi is already canonical; recomputing theta can add storage when the dry-head cap is not invertible.
+  if (upper->psi_cm == lower->psi_cm) {
+    return false;
+  }
+
   return lgar_should_snap_boundary_psi_to_lower(upper, lower, soil_type, soil_properties) ||
          (upper->psi_cm > 0.1 && lower->psi_cm > 0.1 &&
           std::isfinite(upper->psi_cm) && std::isfinite(lower->psi_cm));
@@ -7719,14 +7724,7 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int *front_num_with_nega
       // Preserve an existing lower-layer bottom scaffold when the remap lands
       // on that boundary; otherwise this crossing creates a movable lower front.
       next->to_bottom = remap_hits_lower_layer_bottom;
-      /*
-       * This new to_bottom scaffold is psi-connected to the lower-layer front.
-       * For extremely dry fronts, theta -> psi -> theta can change theta
-       * measurably in some soils; account for the same psi-consistent theta
-       * that the boundary snap will enforce before returning the storage residual.
-       */
-      lgarto_update_front_from_shared_psi(current, current->psi_cm, num_layers,
-                                          soil_type, frozen_factor, soil_properties);
+      // Both sides already share psi; retain the source theta when capped dry psi cannot recover it.
       crossed = true;
 
       if (!std::isfinite(next->depth_cm)) {
@@ -8086,6 +8084,9 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
         listPrint(*head);
       }
 
+      const bool ordered_zero_storage_merge =
+        current->depth_cm < next->depth_cm &&
+        lgarto_same_layer_TO_GW_zero_storage_duplicate(current, next, false);
       next = listDeleteFront(next->front_num, head, soil_type, soil_properties);
       merged = true;
 
@@ -8119,7 +8120,7 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
 
       const double legacy_absurd_depth_limit_cm =
         column_depth > 0.0 ? 10.0 * column_depth : 1.0e4;
-      bool legacy_depth_absurd = false;
+      bool legacy_depth_failed = false;
       double temp_tol = MBAL_ITERATIVE_TOLERANCE;
       double factor = current->depth_cm > column_depth ? 1000.0 : 1.0;
       bool switched = false;
@@ -8129,9 +8130,11 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
       while (std::fabs(current_mass - target_mass) > temp_tol) {
         iter++;
         if (iter > 100000) {
+          legacy_depth_failed = true;
           break;
         }
 
+        const double previous_depth_cm = current->depth_cm;
         if (current_mass >= target_mass) {
           current->depth_cm += 0.1 * factor;
           switched = false;
@@ -8145,23 +8148,28 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
         }
 
         current->depth_cm = fmax(0.0, current->depth_cm);
+        // A clipped depth cannot change storage, so hand the solve to the layer-bounded fallback.
+        if (current->depth_cm == previous_depth_cm) {
+          legacy_depth_failed = true;
+          break;
+        }
         current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 
         if (!std::isfinite(current->depth_cm) || !std::isfinite(current_mass) ||
             current->depth_cm > legacy_absurd_depth_limit_cm) {
-          legacy_depth_absurd = true;
+          legacy_depth_failed = true;
           break;
         }
       }
 
-      legacy_depth_absurd =
-        legacy_depth_absurd || !std::isfinite(current->depth_cm) ||
+      legacy_depth_failed =
+        legacy_depth_failed || !std::isfinite(current->depth_cm) ||
         !std::isfinite(current_mass) ||
         current->depth_cm > legacy_absurd_depth_limit_cm;
 
       bool closed_by_depth =
         std::fabs(current_mass - target_mass) <= MBAL_ITERATIVE_TOLERANCE;
-      if (legacy_depth_absurd) {
+      if (legacy_depth_failed) {
         if (verbosity.compare("high") == 0) {
           printf("TO depth-based merge legacy depth solve exceeded guard "
                  "(front %d depth %.17lf cm, limit %.17lf cm, residual %.12e cm); "
@@ -8205,7 +8213,12 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
                legacy_absurd_depth_limit_cm);
       }
 
-      if (legacy_depth_absurd && !closed_by_depth &&
+      const bool residual_belongs_to_ordered_zero_storage_chain =
+        ordered_zero_storage_merge && current != NULL && current->next != NULL &&
+        lgarto_same_layer_TO_GW_zero_storage_duplicate(current, current->next, false);
+      // Do not create reversed psi ordering to absorb roundoff from an ordered equal-theta chain.
+      if (legacy_depth_failed && !closed_by_depth &&
+          !residual_belongs_to_ordered_zero_storage_chain &&
           std::fabs(current_mass - target_mass) > MBAL_ITERATIVE_TOLERANCE) {
         struct wetting_front *psi_repair_front =
           (current->next != NULL && current->next->to_bottom) ? current->next : current;
