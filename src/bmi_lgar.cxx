@@ -65,7 +65,7 @@ string verbosity="none";
 #define SMALL_EPS 1.E-12
 
 #ifndef LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP
-#define LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP ((double)1.0)
+#define LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP ((double)0.0)
 #endif
 
 #ifndef LGARTO_SATURATED_CREATION_PSI_TOL_CM
@@ -1260,11 +1260,15 @@ static double lgarto_saturated_creation_lower_boundary_capacity_cm(double subtim
                                                                    double *frozen_factor,
                                                                    const wetting_front *head,
                                                                    struct soil_properties_ *soil_properties,
+                                                                   bool *is_saturated_column,
                                                                    double already_booked_flux_cm)
 {
+  if (is_saturated_column != NULL) {
+    *is_saturated_column = false;
+  }
   if (subtimestep_h <= 0.0 || num_layers <= 0 || cum_layer_thickness_cm == NULL ||
       soil_type == NULL || frozen_factor == NULL || head == NULL || soil_properties == NULL ||
-      LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP <= 0.0) {
+      LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP < 0.0) {
     return 0.0;
   }
 
@@ -1334,16 +1338,16 @@ static double lgarto_saturated_creation_lower_boundary_capacity_cm(double subtim
 
   /* Surface-creation repair can leave excess water only because the
      boundary-pinned TO scaffold is effectively saturated. In that narrow
-     regime, treat the lower boundary as a saturated layered column and allow
-     a bounded positive-pressure gradient to augment unit-gradient drainage.
-     The returned value is remaining capacity after fluxes already booked in
-     this substep, so this does not stack a second drainage term on top of the
-     natural TO/GW flux bookkeeping. */
+     regime, share one layered unit-gradient lower-boundary budget with fluxes
+     already booked in this substep. */
   const double effective_Ksat_cm_per_h = domain_depth_cm / saturated_resistance_h;
   const double saturated_column_flux_capacity_cm =
     effective_Ksat_cm_per_h *
     (1.0 + LGARTO_SATURATED_CREATION_PRESSURE_GRADIENT_CAP) *
     subtimestep_h;
+  if (is_saturated_column != NULL) {
+    *is_saturated_column = true;
+  }
 
   return fmax(0.0, saturated_column_flux_capacity_cm -
                    fmax(0.0, already_booked_flux_cm));
@@ -2862,15 +2866,20 @@ Update()
 	            lgarto_remaining_lower_boundary_capacity_cm(
 	              subtimestep_h, num_layers, state->lgar_bmi_params.cum_layer_thickness_cm,
 	              state->head, already_booked_lower_boundary_cm);
-	          trace_surface_creation_gw_capacity_cm =
-	            fmax(trace_surface_creation_gw_capacity_cm,
-	                 lgarto_saturated_creation_lower_boundary_capacity_cm(
-	                   subtimestep_h, num_layers,
-	                   state->lgar_bmi_params.cum_layer_thickness_cm,
-	                   state->lgar_bmi_params.layer_soil_type,
-	                   state->lgar_bmi_params.frozen_factor,
-	                   state->head, state->soil_properties,
-	                   already_booked_lower_boundary_cm));
+	          bool saturated_creation_column = false;
+	          const double saturated_creation_capacity_cm =
+	            lgarto_saturated_creation_lower_boundary_capacity_cm(
+	              subtimestep_h, num_layers,
+	              state->lgar_bmi_params.cum_layer_thickness_cm,
+	              state->lgar_bmi_params.layer_soil_type,
+	              state->lgar_bmi_params.frozen_factor,
+	              state->head, state->soil_properties,
+	              &saturated_creation_column, already_booked_lower_boundary_cm);
+	          if (saturated_creation_column) {
+	            /* Use the shared layered budget instead of a local
+	               bottom-layer conductivity fallback. */
+	            trace_surface_creation_gw_capacity_cm = saturated_creation_capacity_cm;
+	          }
 	        }
 
 	        // depth of the surficial front to be created
@@ -3084,7 +3093,7 @@ Update()
             state->lgar_bmi_params.layer_soil_type,
             state->lgar_bmi_params.frozen_factor,
             state->head, state->soil_properties,
-            already_booked_lower_boundary_cm);
+            NULL, already_booked_lower_boundary_cm);
         const double saturated_column_flux_cm =
           fmin(creation_excess_runoff_subtimestep_cm,
                saturated_column_capacity_cm);
