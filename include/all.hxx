@@ -396,7 +396,8 @@ extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double 
 						double *creation_excess_gw_flux_cm = nullptr,
 						double *creation_excess_runoff_cm = nullptr,
 						double saturated_creation_gw_flux_capacity_cm = 0.0,
-						double groundwater_depth_cm = -1.0);
+						double groundwater_depth_cm = -1.0,
+						bool mobile_groundwater_level = false);
 
 // computes the infiltration capacity, fp, of the soil
 extern double lgar_insert_water(bool use_closed_form_G, int nint, double timestep_h, double AET_demand_cm, double free_drainage_subtimestep_cm, double *ponded_depth,
@@ -533,7 +534,8 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int num_layers, double *
 // the subroutine lets TO wetting fronts merge after one moves too deep past the TO wetting front below it
 extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_depth, double *cum_layer_thickness_cm,
 					    struct wetting_front **head, int *soil_type,
-					    struct soil_properties_ *soil_properties);
+					    struct soil_properties_ *soil_properties,
+					    bool mobile_groundwater_level = false);
 
 // the subroutine lets surface wetting fronts merge with TO wetting fronts after overtaking them
 extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_layer, int num_layers,
@@ -741,7 +743,8 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers, double deepest_surf_de
 
 //returns an integer that describes which type of layer boundary crossing or WF merging is necessary
 extern int lgarto_correction_type(int num_layers, double* cum_layer_thickness_cm, struct wetting_front** head,
-				  double vadose_lower_boundary_depth_cm = -1.0);
+				  double vadose_lower_boundary_depth_cm = -1.0,
+				  bool mobile_groundwater_level = false);
 extern int lgarto_correction_type_surf(int num_layers, double* cum_layer_thickness_cm, struct wetting_front** head,
 				       double vadose_lower_boundary_depth_cm = -1.0);
 

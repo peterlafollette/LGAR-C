@@ -2917,7 +2917,8 @@ Update()
 		              trace_surface_creation_gw_capacity_cm,
 		              state->lgar_bmi_params.TO_enabled
 		                ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
-		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params));
+		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params),
+		              state->lgar_bmi_params.mobile_groundwater_level);
           creation_excess_gw_flux_subtimestep_cm += creation_excess_gw_flux_cm;
           creation_excess_runoff_subtimestep_cm += creation_excess_runoff_cm;
 
