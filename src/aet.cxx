@@ -238,46 +238,6 @@ static wetting_front *find_active_zero_depth_to_support_front(wetting_front *hea
   return active_front;
 }
 
-static double find_zero_depth_support_interval_bottom_cm(const wetting_front *active_front,
-                                                         double root_zone_depth_cm)
-{
-  if (active_front == NULL) {
-    return 0.0;
-  }
-
-  for (const wetting_front *current = active_front->next; current != NULL; current = current->next) {
-    if (current->depth_cm <= 1.0e-12) {
-      continue;
-    }
-
-    if (current->is_WF_GW == TRUE && current->to_bottom == TRUE) {
-      const wetting_front *connected_chain_front = current;
-      while (connected_chain_front != NULL && connected_chain_front->is_WF_GW == TRUE &&
-             connected_chain_front->to_bottom == TRUE) {
-        if (connected_chain_front->next == NULL) {
-          return root_zone_depth_cm;
-        }
-
-        if (connected_chain_front->next->depth_cm >= root_zone_depth_cm - 1.0e-12) {
-          return root_zone_depth_cm;
-        }
-
-        connected_chain_front = connected_chain_front->next;
-      }
-
-      if (connected_chain_front == NULL) {
-        return root_zone_depth_cm;
-      }
-
-      return fmin(connected_chain_front->depth_cm, root_zone_depth_cm);
-    }
-
-    return fmin(current->depth_cm, root_zone_depth_cm);
-  }
-
-  return root_zone_depth_cm;
-}
-
 static bool insert_zero_depth_to_population_front(double root_zone_depth_cm,
                                                   int *soil_type,
                                                   double *frozen_factor,
@@ -1066,10 +1026,15 @@ static double cap_to_aet_extraction_to_local_interval_cm(const wetting_front *fr
 static double cap_to_aet_extraction_to_adjacent_layer_cm(const wetting_front *front,
                                                          int num_layers,
                                                          double *cum_layer_thickness_cm,
-                                                         double requested_aet_cm)
+                                                         int *soil_type,
+                                                         soil_properties_ *soil_properties,
+                                                         double requested_aet_cm,
+                                                         double aet_lower_boundary_depth_cm)
 {
   if (front == NULL || front->next == NULL || cum_layer_thickness_cm == NULL ||
+      soil_type == NULL || soil_properties == NULL ||
       requested_aet_cm <= 0.0 || !std::isfinite(requested_aet_cm) ||
+      !std::isfinite(aet_lower_boundary_depth_cm) ||
       front->layer_num < 1 || front->layer_num > num_layers) {
     return 0.0;
   }
@@ -1081,16 +1046,34 @@ static double cap_to_aet_extraction_to_adjacent_layer_cm(const wetting_front *fr
 
   const int deepest_allowed_layer =
     (front->layer_num < num_layers) ? front->layer_num + 1 : num_layers;
-  const double deepest_allowed_depth_cm = cum_layer_thickness_cm[deepest_allowed_layer];
-  const double proposed_depth_cm = front->depth_cm + requested_aet_cm / delta_theta;
-  const double capped_depth_cm = fmax(0.0, fmin(proposed_depth_cm, deepest_allowed_depth_cm));
-
-  if (capped_depth_cm <= front->depth_cm) {
+  // AET may cross one soil boundary at a time, but it must never move its donor front below the root/AET domain.
+  const double deepest_allowed_depth_cm =
+    fmin(cum_layer_thickness_cm[deepest_allowed_layer], aet_lower_boundary_depth_cm);
+  if (deepest_allowed_depth_cm <= front->depth_cm) {
     return 0.0;
   }
 
-  const double capped_aet_cm = (capped_depth_cm - front->depth_cm) * delta_theta;
-  return fmax(0.0, fmin(requested_aet_cm, capped_aet_cm));
+  double max_aet_cm = (deepest_allowed_depth_cm - front->depth_cm) * delta_theta;
+  const double current_layer_bottom_cm = cum_layer_thickness_cm[front->layer_num];
+  if (deepest_allowed_depth_cm > current_layer_bottom_cm &&
+      deepest_allowed_depth_cm >= aet_lower_boundary_depth_cm - 1.0e-10 &&
+      front->next->to_bottom == TRUE && front->next->next != NULL) {
+    const int lower_soil_num = soil_type[front->layer_num + 1];
+    const double translated_theta =
+      calc_theta_from_h(front->psi_cm,
+                        soil_properties[lower_soil_num].vg_alpha_per_cm,
+                        soil_properties[lower_soil_num].vg_m,
+                        soil_properties[lower_soil_num].vg_n,
+                        soil_properties[lower_soil_num].theta_e,
+                        soil_properties[lower_soil_num].theta_r);
+    // Use the lower soil's storage contrast so the mass-preserving remap itself lands at the root boundary.
+    max_aet_cm =
+      fmax(0.0, current_layer_bottom_cm - front->depth_cm) * delta_theta +
+      (deepest_allowed_depth_cm - current_layer_bottom_cm) *
+      fmax(0.0, front->next->next->theta - translated_theta);
+  }
+
+  return fmax(0.0, fmin(requested_aet_cm, max_aet_cm));
 }
 
 static bool lgarto_cross_internal_to_boundary_after_aet_if_needed(int num_layers,
@@ -1680,7 +1663,7 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
 
   auto build_to_aet_allocations = [&](double segment_start_cm) {
     std::vector<TOAETAllocation> allocations;
-    double segment_top_cm =
+    const double aet_top_cm =
       fmax(top_of_to_root_zone_cm, fmin(segment_start_cm, explicit_to_aet_depth_cm));
 
     auto add_allocation = [&](wetting_front *target_front,
@@ -1702,54 +1685,35 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       allocations.push_back({target_front, stress_front, thickness_cm, allow_zero_depth});
     };
 
-    wetting_front *active_zero_depth_support_front = NULL;
-    if (no_surface_needs_zero_depth_support) {
-      active_zero_depth_support_front = find_active_zero_depth_to_support_front(*head);
-      if (active_zero_depth_support_front != NULL) {
-        const double support_interval_bottom_cm =
-          find_zero_depth_support_interval_bottom_cm(active_zero_depth_support_front, explicit_to_aet_depth_cm);
-        const double support_thickness_cm = fmax(0.0, support_interval_bottom_cm - segment_top_cm);
-        if (support_thickness_cm > 0.0) {
-          add_allocation(active_zero_depth_support_front, active_zero_depth_support_front,
-                         support_thickness_cm, true);
-          segment_top_cm = fmax(segment_top_cm, support_interval_bottom_cm);
+    for (wetting_front *target = *head; target != NULL; target = target->next) {
+      const bool allow_zero_depth =
+        surface_front_count == 0 && fabs(target->depth_cm) <= 1.0e-12 &&
+        fabs(target->psi_cm) > 1.0e-8;
+      if (!is_to_aet_eligible_front(target, allow_zero_depth)) {
+        continue;
+      }
+
+      if (target->depth_cm >= explicit_to_aet_depth_cm - 1.0e-8) {
+        break;
+      }
+
+      double interval_top_cm = target->depth_cm;
+      for (wetting_front *donor = target->next;
+           donor != NULL && donor->is_WF_GW == TRUE; donor = donor->next) {
+        const double overlap_top_cm = fmax(aet_top_cm, interval_top_cm);
+        const double overlap_bottom_cm = fmin(explicit_to_aet_depth_cm, donor->depth_cm);
+        // Moving the shallower target reduces the height owned by the deeper donor.
+        add_allocation(target, donor, fmax(0.0, overlap_bottom_cm - overlap_top_cm),
+                       allow_zero_depth);
+
+        if (donor->depth_cm >= explicit_to_aet_depth_cm - 1.0e-8 ||
+            donor->to_bottom == FALSE || donor->next == NULL ||
+            donor->next->is_WF_GW == FALSE ||
+            !to_aet_fronts_are_psi_connected(donor, donor->next)) {
+          break;
         }
+        interval_top_cm = donor->depth_cm;
       }
-    }
-
-    for (wetting_front *current = *head; current != NULL; current = current->next) {
-      if (!is_to_aet_eligible_front(current)) {
-        continue;
-      }
-
-      if (current == active_zero_depth_support_front) {
-        continue;
-      }
-
-      if (current->depth_cm <= segment_top_cm + 1.0e-8) {
-        continue;
-      }
-
-      // A front on the AET boundary may dry in place; only deeper fronts are ineligible.
-      if (current->depth_cm > explicit_to_aet_depth_cm + 1.0e-8) {
-        break;
-      }
-
-      const double allocation_bottom_cm = fmin(current->depth_cm, explicit_to_aet_depth_cm);
-      const double thickness_cm = fmax(0.0, allocation_bottom_cm - segment_top_cm);
-      if (thickness_cm > 0.0) {
-        add_allocation(current, current, thickness_cm, false);
-        segment_top_cm = fmax(segment_top_cm, allocation_bottom_cm);
-      }
-
-      if (segment_top_cm >= explicit_to_aet_depth_cm - 1.0e-8) {
-        break;
-      }
-    }
-
-    if (!allocations.empty() && allocations.back().front != active_zero_depth_support_front) {
-      // The deepest movable TO front in the AET domain represents the remaining root-zone interval.
-      allocations.back().thickness_cm += fmax(0.0, explicit_to_aet_depth_cm - segment_top_cm);
     }
 
     return allocations;
@@ -1809,8 +1773,53 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
 
   const double mass_before_to_aet_batch_cm =
     lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (surface_front_count == 0 && find_active_zero_depth_to_support_front(*head) == NULL) {
+    wetting_front *top_stress_front = *head;
+    wetting_front *top_drying_front = NULL;
+    double top_interval_thickness_cm = 0.0;
+    double interval_top_cm = 0.0;
+    for (wetting_front *current = *head;
+         current != NULL && current->is_WF_GW == TRUE; current = current->next) {
+      top_interval_thickness_cm +=
+        fmax(0.0, fmin(current->depth_cm, explicit_to_aet_depth_cm) - interval_top_cm);
+      if (current->to_bottom == FALSE) {
+        top_drying_front = current;
+        break;
+      }
+      if (current->depth_cm >= explicit_to_aet_depth_cm - 1.0e-8 ||
+          current->next == NULL || current->next->is_WF_GW == FALSE ||
+          !to_aet_fronts_are_psi_connected(current, current->next)) {
+        break;
+      }
+      interval_top_cm = current->depth_cm;
+    }
+
+    if (top_drying_front != NULL && top_interval_thickness_cm > 0.0) {
+      // With no shallower TO boundary to move, dry only the boundaryless top TO state in place.
+      const double top_aet_cm =
+        calc_to_aet_demand_for_front_state(top_stress_front, top_interval_thickness_cm,
+                                           root_zone_depth_cm, PET_timestep_cm, timestep_h,
+                                           wilting_point_psi_cm, field_capacity_psi_cm,
+                                           soil_type, soil_properties);
+      const double extracted_top_aet_cm =
+        lgarto_extract_missing_to_aet_from_to_chain(top_drying_front, top_aet_cm,
+                                                    cum_layer_thickness_cm, soil_type,
+                                                    frozen_factor, soil_properties, head);
+      if (verbosity.compare("high") == 0 && extracted_top_aet_cm > 0.0) {
+        printf("TO AET dried boundaryless top state through front %d over %.17lf cm "
+               "(requested %.17lf cm, extracted %.17lf cm).\n",
+               top_drying_front->front_num, top_interval_thickness_cm,
+               top_aet_cm, extracted_top_aet_cm);
+      }
+    }
+  }
   std::vector<TOAETAllocation> allocations =
     build_to_aet_allocations(next_to_aet_segment_top_cm);
+  struct RootCappedAET {
+    wetting_front *anchor;
+    double residual_cm;
+  };
+  std::vector<RootCappedAET> root_capped_aet;
   bool edited_mobile_to_depth_for_aet = false;
   bool aet_depth_edit_crossed_layer_boundary = false;
 
@@ -1898,7 +1907,9 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       temp_AET_value;
     const double capped_AET_value =
       cap_to_aet_extraction_to_adjacent_layer_cm(current, num_layers, cum_layer_thickness_cm,
-                                                 interval_capped_AET_value);
+                                                 soil_type, soil_properties,
+                                                 interval_capped_AET_value,
+                                                 explicit_to_aet_depth_cm);
     if (capped_AET_value <= 0.0) {
       if (verbosity.compare("high") == 0) {
         printf("Skipping TO AET extraction for front %d because the capped movement would not advance the front.\n",
@@ -1924,15 +1935,22 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
 
     if (verbosity.compare("high") == 0 && capped_AET_value + 1.0e-12 < interval_capped_AET_value) {
       const double proposed_depth_cm = current->depth_cm + interval_capped_AET_value / delta_theta;
-      const double capped_depth_cm = current->depth_cm + capped_AET_value / delta_theta;
+      const double pre_remap_capped_depth_cm = current->depth_cm + capped_AET_value / delta_theta;
       printf("Capping TO AET extraction for front %d from %.17lf cm to %.17lf cm "
-             "to keep AET movement within the current or adjacent soil layer "
-             "(proposed_depth_cm=%.17lf capped_depth_cm=%.17lf).\n",
+             "to keep AET movement within the current or adjacent soil layer and AET domain "
+             "(proposed_depth_cm=%.17lf pre_remap_capped_depth_cm=%.17lf).\n",
              current->front_num, interval_capped_AET_value, capped_AET_value,
-             proposed_depth_cm, capped_depth_cm);
+             proposed_depth_cm, pre_remap_capped_depth_cm);
     }
 
     unmet_interval_limited_to_aet_cm += fmax(0.0, temp_AET_value - interval_capped_AET_value);
+    const int deepest_allowed_layer =
+      (current->layer_num < num_layers) ? current->layer_num + 1 : num_layers;
+    if (capped_AET_value + 1.0e-12 < interval_capped_AET_value &&
+        explicit_to_aet_depth_cm <= cum_layer_thickness_cm[deepest_allowed_layer] + 1.0e-10) {
+      // After any layer remap, dry the same root-zone donor for demand left when its motion reaches the root boundary.
+      root_capped_aet.push_back({current, interval_capped_AET_value - capped_AET_value});
+    }
     current->depth_cm += capped_AET_value / delta_theta;
     edited_mobile_to_depth_for_aet = true;
     if (current->layer_num >= 1 && current->layer_num <= num_layers &&
@@ -1947,6 +1965,28 @@ extern double lgarto_calc_aet_from_TO_WFs(int num_layers,
       lgarto_cross_TO_layer_boundaries_after_batched_aet(num_layers, cum_layer_thickness_cm,
                                                          soil_type, frozen_factor,
                                                          soil_properties, head);
+  }
+
+  for (const RootCappedAET &capped : root_capped_aet) {
+    wetting_front *target = capped.anchor;
+    while (target != NULL && target->to_bottom == TRUE && target->next != NULL &&
+           target->next->is_WF_GW == TRUE) {
+      target = target->next;
+    }
+    if (target != NULL && target->depth_cm > explicit_to_aet_depth_cm &&
+        target->depth_cm <= explicit_to_aet_depth_cm + 1.0e-8) {
+      target->depth_cm = explicit_to_aet_depth_cm;
+    }
+    if (target != NULL && target->depth_cm <= explicit_to_aet_depth_cm + 1.0e-8) {
+      const double extracted_cm =
+        lgarto_extract_missing_to_aet_from_to_chain(target, capped.residual_cm,
+                                                    cum_layer_thickness_cm, soil_type,
+                                                    frozen_factor, soil_properties, head);
+      if (verbosity.compare("high") == 0 && extracted_cm > 0.0) {
+        printf("Root-capped TO AET extracted %.17lf of %.17lf cm remaining from front %d at %.17lf cm.\n",
+               extracted_cm, capped.residual_cm, target->front_num, target->depth_cm);
+      }
+    }
   }
 
   cumulative_ET_from_TO_WFs_cm =
