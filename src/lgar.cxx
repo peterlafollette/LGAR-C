@@ -1816,12 +1816,9 @@ static bool lgarto_try_refine_large_to_psi_gap(int num_layers,
     return false;
   }
 
-  const double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-  struct wetting_front *snapshot = listCopy(*head, NULL);
-
   const double insert_depth_cm =
     0.5 * (candidate.upper_front->depth_cm + candidate.refinement_lower_depth_cm);
-  const double inserted_psi_cm =
+  double inserted_psi_cm =
     0.5 * (candidate.upper_front->psi_cm + candidate.refinement_lower_psi_cm);
   const double dry_zero_depth_psi_cm =
     TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_DRY_FACTOR * cum_layer_thickness_cm[num_layers];
@@ -1829,11 +1826,37 @@ static bool lgarto_try_refine_large_to_psi_gap(int num_layers,
   if (insert_depth_cm <= TO_PSI_GAP_REFINEMENT_ZERO_DEPTH_MAX_CM &&
       candidate.upper_front->psi_cm > dry_zero_depth_psi_cm &&
       candidate.refinement_lower_psi_cm > dry_zero_depth_psi_cm) {
-    if (snapshot != NULL) {
-      listDelete(snapshot);
-    }
     return false;
   }
+
+  const int soil_num = soil_type[candidate.upper_front->layer_num];
+  const double theta_e = soil_properties[soil_num].theta_e;
+  const double theta_r = soil_properties[soil_num].theta_r;
+  const double vg_a = soil_properties[soil_num].vg_alpha_per_cm;
+  const double vg_m = soil_properties[soil_num].vg_m;
+  const double vg_n = soil_properties[soil_num].vg_n;
+  const double upper_theta =
+    calc_theta_from_h(candidate.upper_front->psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+  const double lower_theta =
+    calc_theta_from_h(candidate.refinement_lower_psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+  double inserted_theta =
+    calc_theta_from_h(inserted_psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+
+  // Use a moisture midpoint when the arithmetic psi midpoint lies on the
+  // residual plateau and would add a storage-indistinguishable TO front.
+  if (!(inserted_theta > upper_theta && inserted_theta < lower_theta)) {
+    const double theta_midpoint = 0.5 * (upper_theta + lower_theta);
+    inserted_psi_cm =
+      calc_h_from_Se(calc_Se_from_theta(theta_midpoint, theta_e, theta_r), vg_a, vg_m, vg_n);
+    inserted_theta =
+      calc_theta_from_h(inserted_psi_cm, vg_a, vg_m, vg_n, theta_e, theta_r);
+    if (!(inserted_theta > upper_theta && inserted_theta < lower_theta)) {
+      return false;
+    }
+  }
+
+  const double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  struct wetting_front *snapshot = listCopy(*head, NULL);
 
   struct wetting_front *inserted =
     lgar_insert_groundwater_front_before(insert_depth_cm, inserted_psi_cm, candidate.lower_front,
