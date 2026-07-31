@@ -1565,18 +1565,19 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
   apply_trial_psi(best_psi_cm);
   const double extracted_cm = fmax(0.0, mass_before - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
 
-  if (verbosity.compare("high") == 0 && extracted_cm > 0.0) {
+  if (verbosity.compare("high") == 0 && extracted_cm > ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM) {
     printf("TO AET direct fallback extracted %.17lf cm from TO front %d via psi increase to %.17lf cm.\n",
            extracted_cm, target_front->front_num, target_front->psi_cm);
   }
 
-  if (extracted_cm <= 0.0) {
-    // A failed trial must restore capped or otherwise non-invertible states exactly.
+  if (extracted_cm <= ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM) {
+    // A sub-resolution trial must not leave a finite psi collapsed onto theta_r.
     for (const SavedFrontState &saved : saved_states) {
       saved.front->psi_cm = saved.psi_cm;
       saved.front->theta = saved.theta;
       saved.front->K_cm_per_h = saved.K_cm_per_h;
     }
+    return 0.0;
   }
 
   return extracted_cm;

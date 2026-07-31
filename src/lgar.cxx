@@ -290,13 +290,14 @@ static bool lgar_boundary_psi_snap_candidate(const struct wetting_front *upper,
           std::isfinite(upper->psi_cm) && std::isfinite(lower->psi_cm));
 }
 
-static void lgar_snap_boundary_psi_to_lower_or_abort(double mass_before_boundary_snaps_cm,
-                                                     double *cum_layer_thickness_cm,
-                                                     int *soil_type,
-                                                     struct soil_properties_ *soil_properties,
-                                                     struct wetting_front *head,
-                                                     struct wetting_front *upper,
-                                                     struct wetting_front *lower)
+static bool lgar_try_snap_boundary_psi_to_lower(double mass_before_boundary_snaps_cm,
+                                                double *cum_layer_thickness_cm,
+                                                int *soil_type,
+                                                struct soil_properties_ *soil_properties,
+                                                struct wetting_front *head,
+                                                struct wetting_front *upper,
+                                                struct wetting_front *lower,
+                                                double *mass_change_out_cm)
 {
   const double old_theta = upper->theta;
   const double old_psi_cm = upper->psi_cm;
@@ -311,13 +312,35 @@ static void lgar_snap_boundary_psi_to_lower_or_abort(double mass_before_boundary
 
   const double mass_change_cm =
     lgar_calc_mass_bal(cum_layer_thickness_cm, head) - mass_before_boundary_snaps_cm;
+  if (mass_change_out_cm != NULL) {
+    *mass_change_out_cm = mass_change_cm;
+  }
   if (std::isfinite(mass_change_cm) &&
       std::fabs(mass_change_cm) <= BOUNDARY_PSI_SNAP_MASS_TOLERANCE_CM) {
-    return;
+    return true;
   }
 
   upper->theta = old_theta;
   upper->psi_cm = old_psi_cm;
+  return false;
+}
+
+static void lgar_snap_boundary_psi_to_lower_or_abort(double mass_before_boundary_snaps_cm,
+                                                     double *cum_layer_thickness_cm,
+                                                     int *soil_type,
+                                                     struct soil_properties_ *soil_properties,
+                                                     struct wetting_front *head,
+                                                     struct wetting_front *upper,
+                                                     struct wetting_front *lower)
+{
+  const double old_psi_cm = upper->psi_cm;
+  double mass_change_cm = NAN;
+  if (lgar_try_snap_boundary_psi_to_lower(
+        mass_before_boundary_snaps_cm, cum_layer_thickness_cm, soil_type,
+        soil_properties, head, upper, lower, &mass_change_cm)) {
+    return;
+  }
+
   std::cerr << "Error: boundary psi canonicalization would change total storage too much.\n"
             << "  upper front_num=" << upper->front_num
             << " layer=" << upper->layer_num
@@ -358,6 +381,27 @@ struct lgar_preserved_boundary_psi_state
   double psi_cm;
 };
 
+static bool lgar_theta_is_compatible_with_shared_psi(
+  const struct wetting_front *front, double psi_cm, int *soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  const int soil_num = soil_type[front->layer_num];
+  const struct soil_properties_ &soil = soil_properties[soil_num];
+  const double theta_at_psi =
+    calc_theta_from_h(psi_cm, soil.vg_alpha_per_cm, soil.vg_m, soil.vg_n,
+                      soil.theta_e, soil.theta_r);
+  if (front->theta == theta_at_psi) {
+    return true;
+  }
+  if (front->theta < soil.theta_r || front->theta >= theta_at_psi) {
+    return false;
+  }
+
+  const double Se = calc_Se_from_theta(front->theta, soil.theta_e, soil.theta_r);
+  // A drier theta may invert back to the shared psi when the inverse is capped.
+  return calc_h_from_Se(Se, soil.vg_alpha_per_cm, soil.vg_m, soil.vg_n) == psi_cm;
+}
+
 static std::vector<lgar_preserved_boundary_psi_state>
 lgar_collect_lossless_boundary_psi_states(struct wetting_front *head,
                                           int *soil_type,
@@ -375,16 +419,8 @@ lgar_collect_lossless_boundary_psi_states(struct wetting_front *head,
     bool lossless = true;
     struct wetting_front *pair[2] = {upper, lower};
     for (int i = 0; i < 2; i++) {
-      const int soil_num = soil_type[pair[i]->layer_num];
-      lossless =
-        lossless &&
-        pair[i]->theta ==
-          calc_theta_from_h(upper->psi_cm,
-                            soil_properties[soil_num].vg_alpha_per_cm,
-                            soil_properties[soil_num].vg_m,
-                            soil_properties[soil_num].vg_n,
-                            soil_properties[soil_num].theta_e,
-                            soil_properties[soil_num].theta_r);
+      lossless = lossless && lgar_theta_is_compatible_with_shared_psi(
+                               pair[i], upper->psi_cm, soil_type, soil_properties);
     }
     if (lossless) {
       struct wetting_front *chain_start = upper;
@@ -392,16 +428,10 @@ lgar_collect_lossless_boundary_psi_states(struct wetting_front *head,
         chain_start = head;
         for (struct wetting_front *candidate = head; candidate != upper;
              candidate = candidate->next) {
-          const int soil_num = soil_type[candidate->layer_num];
           if (!candidate->is_WF_GW || candidate->layer_num != upper->layer_num ||
               candidate->psi_cm != upper->psi_cm ||
-              candidate->theta !=
-                calc_theta_from_h(upper->psi_cm,
-                                  soil_properties[soil_num].vg_alpha_per_cm,
-                                  soil_properties[soil_num].vg_m,
-                                  soil_properties[soil_num].vg_n,
-                                  soil_properties[soil_num].theta_e,
-                                  soil_properties[soil_num].theta_r)) {
+              !lgar_theta_is_compatible_with_shared_psi(
+                candidate, upper->psi_cm, soil_type, soil_properties)) {
             chain_start = candidate->next;
           }
         }
@@ -6651,8 +6681,8 @@ lgarto_collect_changed_to_bottom_snap_scaffold(
         changed_scaffold_front = true;
       }
       if (previous_boundary && current->next != NULL && !current->next->to_bottom &&
-          current->next->is_WF_GW && current->layer_num != current->next->layer_num) {
-        // Include the terminal recipient so one mass-aware solve canonicalizes the full chain.
+          current->layer_num != current->next->layer_num) {
+        // The terminal recipient may still be surface; solve the full connected boundary chain.
         scaffold.push_back(current->next);
       }
     }
@@ -6845,6 +6875,42 @@ static bool lgarto_mass_aware_to_bottom_snap(
   return true;
 }
 
+static std::vector<struct wetting_front *> lgarto_boundary_snap_chain(
+  struct wetting_front *head, struct wetting_front *boundary_upper)
+{
+  std::vector<struct wetting_front *> fronts;
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    fronts.push_back(current);
+  }
+
+  size_t upper_index = fronts.size();
+  for (size_t i = 0; i < fronts.size(); i++) {
+    if (fronts[i] == boundary_upper) {
+      upper_index = i;
+      break;
+    }
+  }
+  if (upper_index == fronts.size()) {
+    return std::vector<struct wetting_front *>();
+  }
+
+  while (upper_index > 0 && fronts[upper_index - 1]->to_bottom &&
+         fronts[upper_index]->to_bottom &&
+         fronts[upper_index - 1]->layer_num != fronts[upper_index]->layer_num) {
+    upper_index--;
+  }
+
+  std::vector<struct wetting_front *> chain;
+  for (size_t i = upper_index; i < fronts.size(); i++) {
+    chain.push_back(fronts[i]);
+    if (i + 1 == fronts.size() || !fronts[i]->to_bottom ||
+        fronts[i]->layer_num == fronts[i + 1]->layer_num) {
+      break;
+    }
+  }
+  return chain;
+}
+
 extern void lgar_global_theta_update(double bottom_boundary_flux_above_surface_WFs_cm,
 					     double target_mass_after_fluxes_cm,
 					     double *cum_layer_thickness_cm,
@@ -6993,10 +7059,18 @@ extern void lgar_global_psi_update(double *cum_layer_thickness_cm,
     const double vg_m = soil_properties[soil_num].vg_m;
     const double vg_n = soil_properties[soil_num].vg_n;
 
+    const double original_psi_cm = current->psi_cm;
     const double Se = calc_Se_from_theta(current->theta, theta_e, theta_r);
     if (!lgar_restore_lossless_boundary_psi(
           current, preserved_boundary_psi_states)) {
-      current->psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+      const double inverse_psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+      // Retain TO psi when it already reproduces theta; its inverse may be non-unique.
+      if (!(current->is_WF_GW && std::isfinite(original_psi_cm) &&
+            original_psi_cm >= 0.0 &&
+            current->theta == calc_theta_from_h(original_psi_cm, vg_a, vg_m, vg_n,
+                                                theta_e, theta_r))) {
+        current->psi_cm = inverse_psi_cm;
+      }
     }
 
     current = current->next;
@@ -7016,10 +7090,25 @@ extern void lgar_global_psi_update(double *cum_layer_thickness_cm,
       continue;
     }
 
-    lgar_snap_boundary_psi_to_lower_or_abort(mass_before_boundary_snaps_cm,
-                                             cum_layer_thickness_cm,
-                                             soil_type, soil_properties,
-                                             *head, current, next);
+    double simple_snap_mass_change_cm = NAN;
+    if (lgar_try_snap_boundary_psi_to_lower(
+          mass_before_boundary_snaps_cm, cum_layer_thickness_cm, soil_type,
+          soil_properties, *head, current, next, &simple_snap_mass_change_cm)) {
+      continue;
+    }
+
+    // A correction may expose a new boundary neighbor; canonicalize its whole chain without changing storage.
+    const std::vector<struct wetting_front *> snap_chain =
+      lgarto_boundary_snap_chain(*head, current);
+    if (lgarto_mass_aware_to_bottom_snap(
+          mass_before_boundary_snaps_cm, cum_layer_thickness_cm, soil_type,
+          soil_properties, head, snap_chain)) {
+      continue;
+    }
+
+    lgar_snap_boundary_psi_to_lower_or_abort(
+      mass_before_boundary_snaps_cm, cum_layer_thickness_cm, soil_type,
+      soil_properties, *head, current, next);
   }
 
   if (verbosity.compare("high") == 0) {

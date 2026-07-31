@@ -1567,6 +1567,57 @@ static double lgarto_limit_subtimestep_for_surface_boundary_crossing(
   return limited_subtimestep_h;
 }
 
+static double lgarto_limit_subtimestep_for_surface_front_contact(
+  double proposed_subtimestep_h,
+  const wetting_front *head,
+  int *limiting_front_num,
+  int *limiting_next_front_num)
+{
+  if (limiting_front_num != NULL) *limiting_front_num = -1;
+  if (limiting_next_front_num != NULL) *limiting_next_front_num = -1;
+
+  double limited_subtimestep_h = proposed_subtimestep_h;
+  for (const wetting_front *current = head; current != NULL && current->next != NULL;
+       current = current->next) {
+    const wetting_front *next = current->next;
+    if (current->is_WF_GW || next->is_WF_GW || current->to_bottom || next->to_bottom ||
+        current->layer_num != next->layer_num || next->next == NULL ||
+        next->depth_cm <= current->depth_cm) {
+      continue;
+    }
+
+    const double relative_dzdt_cm_per_h =
+      current->dzdt_cm_per_h - next->dzdt_cm_per_h;
+    if (relative_dzdt_cm_per_h <= 0.0 ||
+        current->depth_cm + current->dzdt_cm_per_h * proposed_subtimestep_h <=
+          next->depth_cm + next->dzdt_cm_per_h * proposed_subtimestep_h) {
+      continue;
+    }
+
+    // Stop just past first contact so the conservative surface merge owns the topology change.
+    const double event_subtimestep_h =
+      (next->depth_cm - current->depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM) /
+      relative_dzdt_cm_per_h;
+    if (event_subtimestep_h <= 0.0 || event_subtimestep_h >= limited_subtimestep_h) {
+      continue;
+    }
+
+    limited_subtimestep_h = event_subtimestep_h;
+    if (limiting_front_num != NULL) *limiting_front_num = current->front_num;
+    if (limiting_next_front_num != NULL) *limiting_next_front_num = next->front_num;
+  }
+
+  if (limiting_front_num != NULL && *limiting_front_num > 0 &&
+      verbosity.compare("high") == 0) {
+    printf("Adaptive LGARTO event split at same-layer surface contact: "
+           "front=%d next_front=%d old_dt_h=%.17lf new_dt_h=%.17lf\n",
+           *limiting_front_num,
+           limiting_next_front_num != NULL ? *limiting_next_front_num : -1,
+           proposed_subtimestep_h, limited_subtimestep_h);
+  }
+  return limited_subtimestep_h;
+}
+
 /*
   Project the same interflow-before-dzdt, deepest-to-shallowest depth operator
   used for movable TO/GW fronts in lgar_move_wetting_fronts().  This is only an
@@ -2402,7 +2453,7 @@ Update()
   }
   
   // subcycling loop (loop over model's timestep). LGARTO can add dynamic event
-  // splits at surface layer crossings and mobile TO/GW packet contacts.
+  // splits at surface layer crossings, surface contacts, and mobile TO/GW packet contacts.
   double remaining_forcing_h = subcycles * base_subtimestep_h;
   int cycle = 0;
   int lgarto_event_splits_this_forcing = 0;
@@ -2432,7 +2483,13 @@ Update()
           state->head,
           &surface_boundary_front_num,
           &surface_boundary_layer_num);
-      const double surface_limited_subtimestep_h =
+      int surface_contact_front_num = -1;
+      int surface_contact_next_front_num = -1;
+      event_limited_subtimestep_h =
+        lgarto_limit_subtimestep_for_surface_front_contact(
+          event_limited_subtimestep_h, state->head,
+          &surface_contact_front_num, &surface_contact_next_front_num);
+      const double surface_contact_limited_subtimestep_h =
         event_limited_subtimestep_h;
       event_limited_subtimestep_h =
         lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
@@ -2447,9 +2504,11 @@ Update()
         lgarto_event_splits_this_forcing++;
         const bool mobile_packet_event =
           event_limited_subtimestep_h + SMALL_EPS <
-          surface_limited_subtimestep_h;
+          surface_contact_limited_subtimestep_h;
+        const bool surface_contact_event =
+          !mobile_packet_event && surface_contact_front_num > 0;
         const bool surface_boundary_event =
-          !mobile_packet_event &&
+          !mobile_packet_event && !surface_contact_event &&
           surface_boundary_front_num > 0 &&
           surface_boundary_layer_num > 0;
         const int handoff_front_num =
