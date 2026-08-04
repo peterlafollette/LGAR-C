@@ -368,7 +368,9 @@ extern double lgarto_cleanup_redundant_colocated_psi0_support_stacks(double *cum
                                                                      int *soil_type,
                                                                      struct wetting_front **head,
                                                                      struct soil_properties_ *soil_properties);
-
+extern bool lgarto_merge_one_dense_finite_TO_front_after_creation(
+  double *cum_layer_thickness_cm, int *soil_type, double *frozen_factor,
+  struct wetting_front **head, struct soil_properties_ *soil_properties);
 extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_type,
                                         struct soil_properties_ *soil_properties,
                                         bool apply_zero_depth_groundwater_cap = true,
@@ -423,7 +425,14 @@ extern double lgarto_lateral_flux_candidate_cm(double timestep_h, int num_layers
                                                struct wetting_front *current,
                                                bool mobile_groundwater_level,
                                                int *soil_type,
-                                               struct soil_properties_ *soil_properties);
+                                               struct soil_properties_ *soil_properties,
+                                               const bool *cached_is_mobile_CR_chain = nullptr);
+extern bool lgar_lateral_front_is_mobile_CR_chain(struct wetting_front *front,
+                                                  struct wetting_front *head,
+                                                  int num_layers,
+                                                  double *cum_layer_thickness_cm,
+                                                  int *soil_type,
+                                                  struct soil_properties_ *soil_properties);
 extern double lgarto_project_TO_interflow_depth_cm(double requested_lateral_flux_cm,
                                                    double original_depth_cm,
                                                    double layer_bottom_cm,

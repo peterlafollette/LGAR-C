@@ -4,6 +4,7 @@
 #include "../include/all.hxx"
 
 static constexpr double ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM = 1.0e-10;
+static constexpr double TO_AET_MAX_PSI_CM = 1.0e7;
 /*
   No-surface TO AET needs a small zero-depth TO scaffold so extraction can be
   distributed through the root zone instead of acting on one coarse support.
@@ -1410,23 +1411,28 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
     return 0.0;
   }
 
+  const int current_soil_num = soil_type[current->layer_num];
+  const soil_properties_ &current_soil = soil_properties[current_soil_num];
+  // Leave unmet demand for the TO chain instead of drying its surface fallback past psi=1e7 cm.
+  const double theta_floor = fmin(current->theta,
+    calc_theta_from_h(TO_AET_MAX_PSI_CM, current_soil.vg_alpha_per_cm, current_soil.vg_m,
+                      current_soil.vg_n, current_soil.theta_e, current_soil.theta_r));
   const double mass_before = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
 
   if (current->layer_num == 1) {
     if (current->depth_cm > 0.0) {
-      const int soil_num = soil_type[current->layer_num];
+      const int soil_num = current_soil_num;
       const double theta_e = soil_properties[soil_num].theta_e;
-      const double theta_r = soil_properties[soil_num].theta_r;
       const double theta_reduction = missing_to_aet_cm / current->depth_cm;
       const double theta_new =
-        fmax(theta_r + 1.0e-12, fmin(current->theta - theta_reduction, theta_e));
+        fmax(theta_floor, fmin(current->theta - theta_reduction, theta_e));
       current->theta = theta_new;
       refresh_front_state_from_theta(current, soil_type, frozen_factor, soil_properties);
     }
   }
   else if (current->next != NULL) {
     const int layer_num = current->layer_num;
-    const int soil_num = soil_type[layer_num];
+    const int soil_num = current_soil_num;
     double *delta_thetas = (double *)malloc(sizeof(double) * (layer_num + 1));
     double *delta_thickness = (double *)malloc(sizeof(double) * (layer_num + 1));
 
@@ -1466,7 +1472,7 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
                               &aet_demand_cm, delta_thetas, delta_thickness, soil_type,
                               soil_properties, true);
     current->theta =
-      fmax(soil_properties[soil_num].theta_r, fmin(theta_new, soil_properties[soil_num].theta_e));
+      fmax(theta_floor, fmin(theta_new, soil_properties[soil_num].theta_e));
     refresh_front_state_from_theta(current, soil_type, frozen_factor, soil_properties);
 
     free(delta_thetas);
@@ -1524,7 +1530,7 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
   double psi_hi_cm = fmin(max_psi_cm, fmax(psi_lo_cm + 1.0, psi_lo_cm * 2.0));
   double mass_hi = apply_trial_psi(psi_hi_cm);
   int expand_iter = 0;
-  while (mass_hi > target_mass && psi_hi_cm < fmin(1.0e7, max_psi_cm) && expand_iter < 80) {
+  while (mass_hi > target_mass && psi_hi_cm < fmin(TO_AET_MAX_PSI_CM, max_psi_cm) && expand_iter < 80) {
     psi_hi_cm = fmin(max_psi_cm, fmax(psi_hi_cm + 1.0, psi_hi_cm * 2.0));
     mass_hi = apply_trial_psi(psi_hi_cm);
     expand_iter++;

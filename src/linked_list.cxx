@@ -288,6 +288,7 @@ extern struct wetting_front* listDeleteFront(int front_num, struct wetting_front
       struct wetting_front *current_temp = listFindFront(wf, *head, NULL);
       struct wetting_front *next_temp = current_temp->next;
       if ( (current_temp->to_bottom) ){
+        const double prior_boundary_psi_cm = current_temp->psi_cm;
         current_temp->is_WF_GW = next_temp->is_WF_GW;
         current_temp->psi_cm = next_temp->psi_cm;
 
@@ -297,7 +298,17 @@ extern struct wetting_front* listDeleteFront(int front_num, struct wetting_front
         double vg_a_k      = soil_properties[soil_num_k1].vg_alpha_per_cm;
         double vg_m_k      = soil_properties[soil_num_k1].vg_m;
         double vg_n_k      = soil_properties[soil_num_k1].vg_n;
-        current_temp->theta = calc_theta_from_h(current_temp->psi_cm, vg_a_k, vg_m_k, vg_n_k,theta_e_k,theta_r_k);
+        const double theta_at_shared_psi =
+          calc_theta_from_h(next_temp->psi_cm, vg_a_k, vg_m_k, vg_n_k, theta_e_k, theta_r_k);
+        const double current_Se = calc_Se_from_theta(current_temp->theta, theta_e_k, theta_r_k);
+        // Preserve mass-aware theta when its inverse is clipped to the already-shared psi.
+        const bool preserve_capped_theta =
+          prior_boundary_psi_cm == next_temp->psi_cm && current_temp->theta >= theta_r_k &&
+          current_temp->theta < theta_at_shared_psi &&
+          calc_h_from_Se(current_Se, vg_a_k, vg_m_k, vg_n_k) == next_temp->psi_cm;
+        if (!preserve_capped_theta) {
+          current_temp->theta = theta_at_shared_psi;
+        }
         double Ksat_cm_per_h_k  = soil_properties[soil_num_k1].Ksat_cm_per_h;
         double Se = calc_Se_from_theta(current_temp->theta,theta_e_k, theta_r_k);
         current_temp->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h_k, vg_m_k);

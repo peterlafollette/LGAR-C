@@ -1092,16 +1092,29 @@ static double lgar_CR_capillary_supply_scale(const model_state *state,
 }
 
 static double lgar_project_upward_TO_flux_demand_cm(const model_state *state,
-                                                    double subtimestep_h)
+                                                    double subtimestep_h,
+                                                    const std::vector<wetting_front *> *indexed_fronts = NULL)
 {
   if (state == NULL || state->head == NULL || subtimestep_h <= 0.0) {
     return 0.0;
   }
 
+  std::vector<wetting_front *> local_index;
+  if (indexed_fronts == NULL) {
+    const int wetting_front_count = listLength(state->head);
+    local_index.assign(wetting_front_count + 1, NULL);
+    for (wetting_front *front = state->head; front != NULL; front = front->next) {
+      if (front->front_num >= 1 && front->front_num <= wetting_front_count) {
+        local_index[front->front_num] = front;
+      }
+    }
+    indexed_fronts = &local_index;
+  }
+
   double upward_demand_cm = 0.0;
-  const int wetting_front_count = listLength(state->head);
+  const int wetting_front_count = (int) indexed_fronts->size() - 1;
   for (int wf = wetting_front_count - 1; wf >= 1; wf--) {
-    const wetting_front *current = listFindFront(wf, state->head, NULL);
+    const wetting_front *current = (*indexed_fronts)[wf];
     if (current == NULL || !current->is_WF_GW || current->to_bottom ||
         current->dzdt_cm_per_h >= 0.0) {
       continue;
@@ -1569,14 +1582,18 @@ static double lgarto_limit_subtimestep_for_surface_boundary_crossing(
 
 static double lgarto_limit_subtimestep_for_surface_front_contact(
   double proposed_subtimestep_h,
-  const wetting_front *head,
+  const model_state *state,
   int *limiting_front_num,
   int *limiting_next_front_num)
 {
   if (limiting_front_num != NULL) *limiting_front_num = -1;
   if (limiting_next_front_num != NULL) *limiting_next_front_num = -1;
 
+  if (state == NULL || state->head == NULL) return proposed_subtimestep_h;
+  const wetting_front *head = state->head;
+
   double limited_subtimestep_h = proposed_subtimestep_h;
+  int mass_solved_front_num = -1;
   for (const wetting_front *current = head; current != NULL && current->next != NULL;
        current = current->next) {
     const wetting_front *next = current->next;
@@ -1591,6 +1608,23 @@ static double lgarto_limit_subtimestep_for_surface_front_contact(
     if (relative_dzdt_cm_per_h <= 0.0 ||
         current->depth_cm + current->dzdt_cm_per_h * proposed_subtimestep_h <=
           next->depth_cm + next->dzdt_cm_per_h * proposed_subtimestep_h) {
+      continue;
+    }
+
+    if (mass_solved_front_num < 0) {
+      const double groundwater_depth_cm = lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params);
+      const double column_depth_cm = state->lgar_bmi_params.cum_layer_thickness_cm[state->lgar_bmi_params.num_layers];
+      const bool mobile_boundary_active = state->lgar_bmi_params.mobile_groundwater_level &&
+        lgarto_has_TO_fronts(head) && groundwater_depth_cm > 0.0 &&
+        fabs(groundwater_depth_cm - column_depth_cm) > 1.0e-6;
+      mass_solved_front_num = mobile_boundary_active
+        ? wetting_front_free_drainage_mobile_groundwater(state->head)
+        : wetting_front_free_drainage(state->head);
+    }
+    const int soil_num = state->lgar_bmi_params.layer_soil_type[current->layer_num];
+    // Mass closure, rather than raw dzdt, owns the final depth of this saturated front.
+    if (current->front_num == mass_solved_front_num &&
+        fabs(current->theta - state->soil_properties[soil_num].theta_e) < 1.0e-15) {
       continue;
     }
 
@@ -1628,20 +1662,59 @@ static double lgarto_limit_subtimestep_for_surface_front_contact(
   surface/layer-boundary caps in the mover.  The targeted TO/to_bottom pair is
   the exception: its uncapped projection is needed to locate boundary contact.
 */
-static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
+struct lgarto_mobile_TO_projection_workspace
+{
+  std::vector<wetting_front *> front_by_num;
+  std::vector<double> projected_depth_by_num;
+  std::vector<unsigned char> is_mobile_CR_chain_by_num;
+};
+
+static bool lgarto_prepare_mobile_TO_projection_workspace(
+  const model_state *state,
+  lgarto_mobile_TO_projection_workspace *workspace)
+{
+  if (state == NULL || state->head == NULL || workspace == NULL) return false;
+
+  const int wetting_front_count = listLength(state->head);
+  if (wetting_front_count < 2) return false;
+  workspace->front_by_num.assign(wetting_front_count + 1, NULL);
+  workspace->projected_depth_by_num.assign(
+    wetting_front_count + 1, std::numeric_limits<double>::quiet_NaN());
+  workspace->is_mobile_CR_chain_by_num.assign(wetting_front_count + 1, 0);
+
+  for (wetting_front *front = state->head; front != NULL; front = front->next) {
+    if (front->front_num < 1 || front->front_num > wetting_front_count ||
+        !std::isfinite(front->depth_cm)) {
+      return false;
+    }
+    workspace->front_by_num[front->front_num] = front;
+  }
+  for (int wf = 1; wf <= wetting_front_count; ++wf) {
+    wetting_front *front = workspace->front_by_num[wf];
+    if (front == NULL) return false;
+    workspace->is_mobile_CR_chain_by_num[wf] =
+      state->lgar_bmi_params.mobile_groundwater_level &&
+      lgar_lateral_front_is_mobile_CR_chain(
+        front, state->head, state->lgar_bmi_params.num_layers,
+        state->lgar_bmi_params.cum_layer_thickness_cm,
+        state->lgar_bmi_params.layer_soil_type, state->soil_properties);
+  }
+  return true;
+}
+
+static bool lgarto_project_mobile_TO_packet_depths_after_interflow(
   double subtimestep_h,
   const model_state *state,
-  int current_front_num,
-  int next_front_num,
-  double *projected_current_depth_cm,
-  double *projected_next_depth_cm,
-  double *projected_gap_cm)
+  lgarto_mobile_TO_projection_workspace *workspace,
+  double cached_upward_TO_supply_scale,
+  int targeted_current_front_num,
+  int targeted_next_front_num)
 {
-  if (state == NULL || state->head == NULL || subtimestep_h < 0.0 ||
-      current_front_num < 1 || next_front_num < 1 ||
-      projected_current_depth_cm == NULL ||
-      projected_next_depth_cm == NULL ||
-      projected_gap_cm == NULL) {
+  if (state == NULL || state->head == NULL || workspace == NULL ||
+      subtimestep_h < 0.0 ||
+      targeted_current_front_num < 0 || targeted_next_front_num < 0 ||
+      ((targeted_current_front_num == 0) !=
+       (targeted_next_front_num == 0))) {
     return false;
   }
 
@@ -1651,25 +1724,24 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
     return false;
   }
 
-  const int wetting_front_count = listLength(state->head);
+  const int wetting_front_count = (int) workspace->front_by_num.size() - 1;
   if (wetting_front_count < 2 ||
-      current_front_num > wetting_front_count ||
-      next_front_num > wetting_front_count) {
+      targeted_current_front_num > wetting_front_count ||
+      targeted_next_front_num > wetting_front_count ||
+      workspace->projected_depth_by_num.size() !=
+        workspace->front_by_num.size() ||
+      workspace->is_mobile_CR_chain_by_num.size() !=
+        workspace->front_by_num.size()) {
     return false;
   }
 
-  std::vector<wetting_front *> front_by_num(wetting_front_count + 1, NULL);
-  std::vector<double> projected_depth_by_num(
-    wetting_front_count + 1, std::numeric_limits<double>::quiet_NaN());
-  for (wetting_front *front = state->head;
-       front != NULL;
-       front = front->next) {
-    if (front->front_num < 1 || front->front_num > wetting_front_count ||
-        !std::isfinite(front->depth_cm)) {
-      return false;
-    }
-    front_by_num[front->front_num] = front;
-    projected_depth_by_num[front->front_num] = front->depth_cm;
+  std::vector<wetting_front *>& front_by_num = workspace->front_by_num;
+  std::vector<double>& projected_depth_by_num =
+    workspace->projected_depth_by_num;
+  for (int wf = 1; wf <= wetting_front_count; ++wf) {
+    if (front_by_num[wf] == NULL ||
+        !std::isfinite(front_by_num[wf]->depth_cm)) return false;
+    projected_depth_by_num[wf] = front_by_num[wf]->depth_cm;
   }
 
   const double column_depth_cm =
@@ -1679,8 +1751,11 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
   }
 
   const double upward_TO_supply_scale =
-    lgar_CR_capillary_supply_scale(
-      state, lgar_project_upward_TO_flux_demand_cm(state, subtimestep_h));
+    std::isfinite(cached_upward_TO_supply_scale)
+      ? cached_upward_TO_supply_scale
+      : lgar_CR_capillary_supply_scale(
+          state, lgar_project_upward_TO_flux_demand_cm(
+                   state, subtimestep_h, &front_by_num));
 
   for (int wf = wetting_front_count - 1; wf >= 1; --wf) {
     wetting_front *current = front_by_num[wf];
@@ -1701,6 +1776,8 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
 
     if (params.lateral_flow_enabled && params.lateral_flow_factor > 0.0 &&
         current->next->layer_num == layer_num) {
+      const bool is_mobile_CR_chain =
+        workspace->is_mobile_CR_chain_by_num[wf] != 0;
       const double requested_lateral_flux_cm =
         lgarto_lateral_flux_candidate_cm(
           subtimestep_h, params.num_layers,
@@ -1708,7 +1785,7 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
           params.cum_layer_thickness_cm, state->head,
           wf > 1 ? front_by_num[wf - 1] : NULL, current,
           params.mobile_groundwater_level, params.layer_soil_type,
-          state->soil_properties);
+          state->soil_properties, &is_mobile_CR_chain);
       current_depth_cm =
         lgarto_project_TO_interflow_depth_cm(
           requested_lateral_flux_cm, current_depth_cm, layer_bottom_cm,
@@ -1727,8 +1804,9 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
     const double vertically_projected_depth_cm =
       current_depth_cm + dzdt_cm_per_h * subtimestep_h;
     const bool targeted_to_bottom_boundary =
-      current->front_num == current_front_num &&
-      current->next->front_num == next_front_num &&
+      targeted_current_front_num > 0 &&
+      current->front_num == targeted_current_front_num &&
+      current->next->front_num == targeted_next_front_num &&
       current->next->to_bottom;
 
     /*
@@ -1758,19 +1836,37 @@ static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
 
     projected_depth_by_num[wf] = vertically_projected_depth_cm;
     if (targeted_to_bottom_boundary) {
-      *projected_current_depth_cm = vertically_projected_depth_cm;
-      *projected_next_depth_cm =
-        projected_depth_by_num[next_front_num];
-      *projected_gap_cm =
-        *projected_next_depth_cm - *projected_current_depth_cm;
-      return std::isfinite(*projected_gap_cm);
+      return std::isfinite(
+        projected_depth_by_num[targeted_next_front_num] -
+        vertically_projected_depth_cm);
     }
   }
 
-  const double current_depth_cm =
-    projected_depth_by_num[current_front_num];
-  const double next_depth_cm =
-    projected_depth_by_num[next_front_num];
+  return true;
+}
+
+static bool lgarto_project_mobile_TO_packet_gap_after_interflow(
+  double subtimestep_h,
+  const model_state *state,
+  lgarto_mobile_TO_projection_workspace *workspace,
+  double cached_upward_TO_supply_scale,
+  int current_front_num,
+  int next_front_num,
+  double *projected_current_depth_cm,
+  double *projected_next_depth_cm,
+  double *projected_gap_cm)
+{
+  if (current_front_num < 1 || next_front_num < 1 ||
+      projected_current_depth_cm == NULL ||
+      projected_next_depth_cm == NULL || projected_gap_cm == NULL ||
+      !lgarto_project_mobile_TO_packet_depths_after_interflow(
+        subtimestep_h, state, workspace, cached_upward_TO_supply_scale,
+        current_front_num, next_front_num)) {
+    return false;
+  }
+
+  const double current_depth_cm = workspace->projected_depth_by_num[current_front_num];
+  const double next_depth_cm = workspace->projected_depth_by_num[next_front_num];
   if (!std::isfinite(current_depth_cm) || !std::isfinite(next_depth_cm)) {
     return false;
   }
@@ -1816,6 +1912,29 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   double limiting_current_dzdt_cm_per_h = 0.0;
   double limiting_next_dzdt_cm_per_h = 0.0;
   bool limiting_event_is_interflow_aware = false;
+  lgarto_mobile_TO_projection_workspace projection_workspace;
+  const bool projection_workspace_valid =
+    lgarto_prepare_mobile_TO_projection_workspace(state, &projection_workspace);
+  // The proposed-step CR cap is identical for every candidate front pair.
+  const double proposed_upward_TO_supply_scale =
+    lgar_CR_capillary_supply_scale(
+      state, lgar_project_upward_TO_flux_demand_cm(
+               state, proposed_subtimestep_h,
+               projection_workspace_valid
+                 ? &projection_workspace.front_by_num : NULL));
+  const bool interflow_enabled =
+    state->lgar_bmi_params.lateral_flow_enabled &&
+    state->lgar_bmi_params.lateral_flow_factor > 0.0;
+  const bool proposed_projection_valid =
+    interflow_enabled && projection_workspace_valid &&
+    lgarto_project_mobile_TO_packet_depths_after_interflow(
+      proposed_subtimestep_h, state, &projection_workspace,
+      proposed_upward_TO_supply_scale, 0, 0);
+  // Preserve the one full-step projection while event-time trials reuse the workspace.
+  const std::vector<double> proposed_projected_depth_by_num =
+    proposed_projection_valid
+      ? projection_workspace.projected_depth_by_num
+      : std::vector<double>();
 
   for (const wetting_front *current = state->head;
        current != NULL && current->next != NULL;
@@ -1842,31 +1961,25 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     double ordered_projected_current_depth_cm = 0.0;
     double ordered_projected_next_depth_cm = 0.0;
     double ordered_projected_gap_cm = 0.0;
-    const bool interflow_enabled =
-      state->lgar_bmi_params.lateral_flow_enabled &&
-      state->lgar_bmi_params.lateral_flow_factor > 0.0;
-    const bool ordered_projection_valid =
-      interflow_enabled &&
-      lgarto_project_mobile_TO_packet_gap_after_interflow(
-        proposed_subtimestep_h, state,
-        current->front_num, next->front_num,
-        &ordered_projected_current_depth_cm,
-        &ordered_projected_next_depth_cm,
-        &ordered_projected_gap_cm);
+    const bool ordered_projection_valid = proposed_projection_valid;
+    if (ordered_projection_valid) {
+      ordered_projected_current_depth_cm =
+        proposed_projected_depth_by_num[current->front_num];
+      ordered_projected_next_depth_cm =
+        proposed_projected_depth_by_num[next->front_num];
+      ordered_projected_gap_cm =
+        ordered_projected_next_depth_cm - ordered_projected_current_depth_cm;
+    }
 
     // Match the event prediction to the CR-supply cap applied before TO motion.
-    const double upward_TO_supply_scale =
-      lgar_CR_capillary_supply_scale(
-        state, lgar_project_upward_TO_flux_demand_cm(
-                 state, proposed_subtimestep_h));
     double current_dzdt_cm_per_h = current->dzdt_cm_per_h;
     double next_dzdt_cm_per_h = next->dzdt_cm_per_h;
-    if (upward_TO_supply_scale < 1.0 - SMALL_EPS) {
+    if (proposed_upward_TO_supply_scale < 1.0 - SMALL_EPS) {
       if (current_dzdt_cm_per_h < 0.0) {
-        current_dzdt_cm_per_h *= upward_TO_supply_scale;
+        current_dzdt_cm_per_h *= proposed_upward_TO_supply_scale;
       }
       if (next_dzdt_cm_per_h < 0.0) {
-        next_dzdt_cm_per_h *= upward_TO_supply_scale;
+        next_dzdt_cm_per_h *= proposed_upward_TO_supply_scale;
       }
     }
 
@@ -1923,7 +2036,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
         */
         const bool candidate_projected =
           lgarto_project_mobile_TO_packet_gap_after_interflow(
-            event_subtimestep_h, state,
+            event_subtimestep_h, state, &projection_workspace,
+            std::numeric_limits<double>::quiet_NaN(),
             current->front_num, next->front_num,
             &interflow_projected_current_depth_cm,
             &interflow_projected_next_depth_cm,
@@ -1946,7 +2060,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
           double trial_next_depth_cm = 0.0;
           double trial_gap_cm = 0.0;
           if (!lgarto_project_mobile_TO_packet_gap_after_interflow(
-                trial_dt_h, state,
+                trial_dt_h, state, &projection_workspace,
+                std::numeric_limits<double>::quiet_NaN(),
                 current->front_num, next->front_num,
                 &trial_current_depth_cm,
                 &trial_next_depth_cm,
@@ -2455,6 +2570,12 @@ Update()
   // subcycling loop (loop over model's timestep). LGARTO can add dynamic event
   // splits at surface layer crossings, surface contacts, and mobile TO/GW packet contacts.
   double remaining_forcing_h = subcycles * base_subtimestep_h;
+  double forcing_end_time_s = state->lgar_bmi_params.time_s +
+                              remaining_forcing_h * state->units.hr_to_sec;
+  const double nearest_forcing_end_second = round(forcing_end_time_s);
+  if (fabs(forcing_end_time_s - nearest_forcing_end_second) <= 1.0e-6) {
+    forcing_end_time_s = nearest_forcing_end_second; // Remove only roundoff at an intended whole-second boundary.
+  }
   int cycle = 0;
   int lgarto_event_splits_this_forcing = 0;
   int lgarto_guarded_event_splits_this_forcing = 0;
@@ -2487,7 +2608,7 @@ Update()
       int surface_contact_next_front_num = -1;
       event_limited_subtimestep_h =
         lgarto_limit_subtimestep_for_surface_front_contact(
-          event_limited_subtimestep_h, state->head,
+          event_limited_subtimestep_h, state,
           &surface_contact_front_num, &surface_contact_next_front_num);
       const double surface_contact_limited_subtimestep_h =
         event_limited_subtimestep_h;
@@ -2969,15 +3090,27 @@ Update()
 
           double creation_excess_gw_flux_cm = 0.0;
           double creation_excess_runoff_cm = 0.0;
-		        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
-		            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
+	        const int front_count_before_creation = listLength(state->head);
+	        lgar_create_surficial_front(state->lgar_bmi_params.TO_enabled, num_layers, &ponded_depth_subtimestep_cm, &volin_subtimestep_cm, dry_depth, theta_for_new_wf,
+	            state->lgar_bmi_params.layer_soil_type, state->lgar_bmi_params.cum_layer_thickness_cm,
 		            state->lgar_bmi_params.frozen_factor, &state->head, state->soil_properties,
 		              &creation_excess_gw_flux_cm, &creation_excess_runoff_cm,
 		              trace_surface_creation_gw_capacity_cm,
 		              state->lgar_bmi_params.TO_enabled
 		                ? lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params)
 		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params),
-		              state->lgar_bmi_params.mobile_groundwater_level);
+	              state->lgar_bmi_params.mobile_groundwater_level);
+          if (state->lgar_bmi_params.TO_enabled &&
+              listLength(state->head) > front_count_before_creation &&
+              listLength_surface(state->head) == 0) {
+            // Coarsen at most one older dense TO interval created by repeated
+            // rainfall entry while retaining the newly converted front.
+            (void) lgarto_merge_one_dense_finite_TO_front_after_creation(
+              state->lgar_bmi_params.cum_layer_thickness_cm,
+              state->lgar_bmi_params.layer_soil_type,
+              state->lgar_bmi_params.frozen_factor, &state->head,
+              state->soil_properties);
+          }
           creation_excess_gw_flux_subtimestep_cm += creation_excess_gw_flux_cm;
           creation_excess_runoff_subtimestep_cm += creation_excess_runoff_cm;
 
@@ -3725,6 +3858,10 @@ Update()
 
   } // end of subcycling
 
+  if (remaining_forcing_h == 0.0) {
+    // Event substeps integrate the saved duration; publish its precomputed endpoint without accumulated clock drift.
+    state->lgar_bmi_params.time_s = forcing_end_time_s;
+  }
   state->lgar_bmi_params.timestep_h = base_subtimestep_h;
 
   lgar_assert_wetting_fronts_nonnegative_depth(state->head);
