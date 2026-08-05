@@ -13,8 +13,6 @@ static constexpr double TO_AET_MAX_PSI_CM = 1.0e7;
   packets after those supports move downward.  Smaller values coarsen that AET
   support population and reduce runtime/front-count pressure in stability runs.
 */
-static constexpr int TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS = 2;
-
 //################################################################################
 /* authors : Fred Ogden and Ahmad Jan and Peter La Follette
    year    : 2022

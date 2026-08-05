@@ -40,6 +40,9 @@ extern string verbosity;
 #define MAX_SOIL_NAME_CHARS 25
 #define MAX_NUM_WETTING_FRONTS 300
 
+// Keep conservative TO coarsening from undoing the minimum AET resolution.
+static constexpr int TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS = 2;
+
 
 // Define a data structure to hold everything that describes a wetting front
 struct wetting_front
@@ -113,6 +116,7 @@ struct lgar_bmi_parameters
   double *cum_layer_thickness_cm;  // cumulative thickness of layers, allocate memory at run time
   double soil_depth_cm;            // depth of the computational domain (i.e., depth of the last/deepest soil layer from the surface)
   double initial_psi_cm;           // model initial (psi) condition
+  int    initial_wetting_fronts_per_layer = 16; // generated TO fronts per layer when no restart state is supplied
   double timestep_h;               // model timestep in hours
   double forcing_resolution_h;     // forcing resolution in hours
   double minimum_timestep_h;       // minimum time step in hours, only used if adaptive_timestep is true
@@ -368,9 +372,10 @@ extern double lgarto_cleanup_redundant_colocated_psi0_support_stacks(double *cum
                                                                      int *soil_type,
                                                                      struct wetting_front **head,
                                                                      struct soil_properties_ *soil_properties);
-extern bool lgarto_merge_one_dense_finite_TO_front_after_creation(
-  double *cum_layer_thickness_cm, int *soil_type, double *frozen_factor,
-  struct wetting_front **head, struct soil_properties_ *soil_properties);
+extern bool lgarto_merge_one_dense_finite_TO_front(
+  double root_zone_depth_cm, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct wetting_front **head,
+  struct soil_properties_ *soil_properties);
 extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_type,
                                         struct soil_properties_ *soil_properties,
                                         bool apply_zero_depth_groundwater_cap = true,
@@ -699,7 +704,8 @@ extern double calc_storage_in_free_drainage_wetting_front(int wf_free_drainage, 
 extern void lgar_initialize(string config_file, struct model_state *state);
 extern void InitFromConfigFile(string config_file, struct model_state *state);
 extern vector<double> ReadVectorData(string key);
-extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double initial_psi_cm, int *layer_soil_type,
+extern void InitializeWettingFronts(bool TO_enabled, int num_layers, int initial_wetting_fronts_per_layer,
+                                    double initial_psi_cm, int *layer_soil_type,
 				    double *cum_layer_thickness_cm, double *layer_thickness_cm, double *frozen_factor,
 				    double initial_extra_moisture_factor_cm, bool mobile_groundwater_level,
 				    struct wetting_front** head, struct soil_properties_ *soil_properties);

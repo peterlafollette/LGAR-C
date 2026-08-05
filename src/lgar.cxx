@@ -76,6 +76,7 @@ using namespace std;
 #define FINITE_SAME_LAYER_TO_DELETE_MASS_TOL_CM 1.E-4 // finite duplicate deletes can re-snap nearby to_bottom fronts by roundoff-scale amounts
 #define ZERO_DEPTH_TO_DRY_SUPPORT_MAX_SE 0.1   // only delete zero-depth TO supports when they are close to residual saturation
 #define SURFACE_CREATION_FOLD_MASS_TOLERANCE_CM 1.E-4 // coarsen only rainfall fronts carrying micrometre-scale water depth
+#define TO_DENSE_CHAIN_MERGE_STORAGE_TOLERANCE_CM 1.E-3 // preserve mass exactly while smoothing millimetre-scale differential storage
 /*
   TO psi-gap refinement is a numerical-resolution aid for dry-over-wet TO/GW
   chains; it is not an event correction.  The gap knobs below decide how eager
@@ -2068,6 +2069,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   state->lgar_bmi_params.initial_CR_fast_storage_cm = 0.0;
   state->lgar_bmi_params.initial_CR_slow_storage_cm = 0.0;
   state->lgar_bmi_params.initial_extra_moisture_factor_cm = 0.0;
+  state->lgar_bmi_params.initial_wetting_fronts_per_layer = 16;
   state->lgar_bmi_params.CR_capillary_supply_threshold_cm = 0.1;
   // setting mass balance tolerance to be large by default; this can be specified in the config file
   state->lgar_bmi_params.mbal_tol = 1.E1;
@@ -2401,6 +2403,14 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     }
     else if (param_key == "initial_extra_moisture_factor_cm") {
       state->lgar_bmi_params.initial_extra_moisture_factor_cm = stod(param_value);
+      continue;
+    }
+    else if (param_key == "initial_wetting_fronts_per_layer") {
+      state->lgar_bmi_params.initial_wetting_fronts_per_layer = stoi(param_value);
+      if (state->lgar_bmi_params.initial_wetting_fronts_per_layer < 2) {
+        std::cerr<<"Invalid option: initial_wetting_fronts_per_layer must be >= 2. \n";
+        abort();
+      }
       continue;
     }
     else if (param_key == "CR_capillary_supply_threshold" ||
@@ -3014,6 +3024,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
   if (!is_state_path_set){
     InitializeWettingFronts(state->lgar_bmi_params.TO_enabled, state->lgar_bmi_params.num_layers,
+          state->lgar_bmi_params.initial_wetting_fronts_per_layer,
           state->lgar_bmi_params.initial_psi_cm, state->lgar_bmi_params.layer_soil_type,
           state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.layer_thickness_cm,
           state->lgar_bmi_params.frozen_factor, state->lgar_bmi_params.initial_extra_moisture_factor_cm,
@@ -3171,7 +3182,8 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   from the prescribed psi value for each of the soil layers
 */
 // #############################################################################
-extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double initial_psi_cm, int *layer_soil_type,
+extern void InitializeWettingFronts(bool TO_enabled, int num_layers, int initial_wetting_fronts_per_layer,
+                                    double initial_psi_cm, int *layer_soil_type,
 				    double *cum_layer_thickness_cm, double *layer_thickness_cm, double *frozen_factor,
 				    double initial_extra_moisture_factor_cm, bool mobile_groundwater_level,
 				    struct wetting_front** head, struct soil_properties_ *soil_properties)
@@ -3183,7 +3195,7 @@ extern void InitializeWettingFronts(bool TO_enabled, int num_layers, double init
     bool bottom_flag;
     double Ksat_cm_per_h;
     struct wetting_front *current;
-    const int number_of_WFs_per_layer = 16; //16
+    const int number_of_WFs_per_layer = initial_wetting_fronts_per_layer;
     bool switch_to_next_layer_flag = false;
     double prior_psi_cm = cum_layer_thickness_cm[num_layers];
     double new_wf_depth;
@@ -15978,7 +15990,8 @@ static struct wetting_front *lgar_unlink_front_without_canonicalization(
   return after_delete;
 }
 
-extern bool lgarto_merge_one_dense_finite_TO_front_after_creation(
+extern bool lgarto_merge_one_dense_finite_TO_front(
+  double root_zone_depth_cm,
   double *cum_layer_thickness_cm,
   int *soil_type,
   double *frozen_factor,
@@ -15990,103 +16003,154 @@ extern bool lgarto_merge_one_dense_finite_TO_front_after_creation(
     return false;
   }
 
-  // Preserve the new first finite-depth front and fold only the next, older,
-  // densely spaced TO/GW interval into the front below it.
-  struct wetting_front *new_front = *head;
-  while (new_front != NULL &&
-         new_front->depth_cm <= ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM) {
-    new_front = new_front->next;
-  }
-  if (new_front == NULL || new_front->next == NULL ||
-      new_front->next->next == NULL || new_front->next->next->next == NULL) {
-    return false;
-  }
-
-  struct wetting_front *fronts[4] = {
-    new_front, new_front->next, new_front->next->next,
-    new_front->next->next->next
-  };
-  struct wetting_front *merge_front = fronts[1];
-  struct wetting_front *retained_front = fronts[2];
-  struct wetting_front *lower_front = fronts[3];
-  const int layer_num = new_front->layer_num;
   const double depth_tol_cm = ZERO_DEPTH_TO_DELETE_DEPTH_TOL_CM;
-  if (layer_num < 1) {
-    return false;
-  }
-  for (int i = 0; i < 4; i++) {
-    if (fronts[i]->is_WF_GW == FALSE || fronts[i]->to_bottom == TRUE ||
-        fronts[i]->layer_num != layer_num || !std::isfinite(fronts[i]->theta) ||
-        !std::isfinite(fronts[i]->psi_cm) ||
-        lgar_is_mobile_groundwater_storage_pair_member(
-          fronts[i], *head, cum_layer_thickness_cm)) {
-      return false;
+  int deepest_layer = 0;
+  int root_zone_TO_fronts = 0;
+  for (struct wetting_front *scan = *head; scan != NULL; scan = scan->next) {
+    deepest_layer = std::max(deepest_layer, scan->layer_num);
+    if (root_zone_depth_cm > 0.0 && scan->is_WF_GW && !scan->to_bottom &&
+        scan->depth_cm > 1.0e-8 &&
+        scan->depth_cm < root_zone_depth_cm - 1.0e-8 &&
+        scan->next != NULL && scan->next->is_WF_GW) {
+      root_zone_TO_fronts++;
     }
   }
-  if (new_front->depth_cm <= cum_layer_thickness_cm[layer_num - 1] + depth_tol_cm ||
-      retained_front->depth_cm - new_front->depth_cm >
-        TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM) {
-    return false;
-  }
+  const double support_tol_cm =
+    deepest_layer > 0
+      ? fmax(MOBILE_GROUNDWATER_SUBMERGENCE_TOL_CM,
+             1.0e-10 * fmax(1.0, cum_layer_thickness_cm[deepest_layer]))
+      : MOBILE_GROUNDWATER_SUBMERGENCE_TOL_CM;
+  struct wetting_front *active_vadose = NULL;
+  struct wetting_front *active_support = NULL;
+  (void) lgarto_find_mobile_groundwater_storage_pair(
+    *head, support_tol_cm, &active_vadose, &active_support);
 
+  // Scan the full ordinary chain and remove only its least consequential
+  // eligible interval; one invocation can therefore delete at most one front.
+  struct lgarto_dense_TO_merge_candidate {
+    struct wetting_front *merge_front = NULL;
+    struct wetting_front *retained_front = NULL;
+    int layer_num = 0;
+    double merged_theta = NAN;
+    double merged_psi_cm = NAN;
+    double merged_Se = NAN;
+    double storage_contrast_cm = HUGE_VAL;
+  } best;
   const double state_tol = 1.0e-12;
-  for (int i = 0; i < 3; i++) {
-    if (fronts[i + 1]->depth_cm <= fronts[i]->depth_cm + depth_tol_cm ||
-        fronts[i]->theta > fronts[i + 1]->theta + state_tol ||
-        fronts[i]->psi_cm + state_tol < fronts[i + 1]->psi_cm) {
-      return false;
+  for (struct wetting_front *upper = *head;
+       upper != NULL && upper->next != NULL && upper->next->next != NULL &&
+         upper->next->next->next != NULL;
+       upper = upper->next) {
+    struct wetting_front *fronts[4] = {
+      upper, upper->next, upper->next->next, upper->next->next->next
+    };
+    struct wetting_front *merge_front = fronts[1];
+    struct wetting_front *retained_front = fronts[2];
+    struct wetting_front *lower_front = fronts[3];
+    const int layer_num = upper->layer_num;
+    if (layer_num < 1 ||
+        upper->depth_cm <= cum_layer_thickness_cm[layer_num - 1] + depth_tol_cm ||
+        retained_front->depth_cm - upper->depth_cm >
+          TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM ||
+        (merge_front->depth_cm < root_zone_depth_cm - 1.0e-8 &&
+         root_zone_TO_fronts <= TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS)) {
+      continue;
     }
+    bool ordinary_same_layer_chain = true;
+    for (int i = 0; i < 4; i++) {
+      if (!fronts[i]->is_WF_GW || fronts[i]->to_bottom ||
+          fronts[i]->layer_num != layer_num ||
+          fronts[i]->depth_cm <= depth_tol_cm ||
+          !std::isfinite(fronts[i]->theta) ||
+          !std::isfinite(fronts[i]->psi_cm) ||
+          fronts[i] == active_vadose || fronts[i] == active_support ||
+          (i < 3 &&
+           (fronts[i + 1]->depth_cm <= fronts[i]->depth_cm + depth_tol_cm ||
+            fronts[i]->theta > fronts[i + 1]->theta + state_tol ||
+            fronts[i]->psi_cm + state_tol < fronts[i + 1]->psi_cm))) {
+        ordinary_same_layer_chain = false;
+        break;
+      }
+    }
+    if (!ordinary_same_layer_chain) {
+      continue;
+    }
+
+    const double upper_span_cm = merge_front->depth_cm - upper->depth_cm;
+    const double lower_span_cm = retained_front->depth_cm - merge_front->depth_cm;
+    const double merged_span_cm = upper_span_cm + lower_span_cm;
+    const double storage_contrast_cm =
+      std::fabs(retained_front->theta - merge_front->theta) * upper_span_cm;
+    if (storage_contrast_cm > TO_DENSE_CHAIN_MERGE_STORAGE_TOLERANCE_CM) {
+      continue;
+    }
+
+    const double merged_theta =
+      (merge_front->theta * upper_span_cm + retained_front->theta * lower_span_cm) /
+      merged_span_cm;
+    const int soil_num = soil_type[layer_num];
+    const struct soil_properties_ &soil = soil_properties[soil_num];
+    const double merged_Se =
+      calc_Se_from_theta(merged_theta, soil.theta_e, soil.theta_r);
+    const double merged_psi_cm =
+      calc_h_from_Se(merged_Se, soil.vg_alpha_per_cm, soil.vg_m, soil.vg_n);
+    if (!std::isfinite(merged_theta) || !std::isfinite(merged_Se) ||
+        !std::isfinite(merged_psi_cm) ||
+        merged_theta + state_tol < merge_front->theta ||
+        merged_theta > retained_front->theta + state_tol ||
+        merged_psi_cm > merge_front->psi_cm +
+          lgar_psi_assertion_tolerance_cm(merged_psi_cm, merge_front->psi_cm) ||
+        merged_psi_cm +
+          lgar_psi_assertion_tolerance_cm(merged_psi_cm, retained_front->psi_cm) <
+            retained_front->psi_cm ||
+        merged_psi_cm +
+          lgar_psi_assertion_tolerance_cm(merged_psi_cm, lower_front->psi_cm) <
+            lower_front->psi_cm) {
+      continue;
+    }
+
+    const double upper_gap_threshold_cm =
+      fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
+           TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR *
+             0.5 * (fmax(0.0, upper->psi_cm) + fmax(0.0, merged_psi_cm)));
+    const double lower_gap_span_cm = lower_front->depth_cm - retained_front->depth_cm;
+    const double lower_gap_threshold_cm =
+      fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
+           TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR *
+             0.5 * (fmax(0.0, merged_psi_cm) + fmax(0.0, lower_front->psi_cm)));
+    if ((merged_span_cm >= TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM &&
+         upper->psi_cm - merged_psi_cm > upper_gap_threshold_cm) ||
+        (lower_gap_span_cm >= TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM &&
+         merged_psi_cm - lower_front->psi_cm > lower_gap_threshold_cm) ||
+        storage_contrast_cm >= best.storage_contrast_cm) {
+      continue;
+    }
+
+    best.merge_front = merge_front;
+    best.retained_front = retained_front;
+    best.layer_num = layer_num;
+    best.merged_theta = merged_theta;
+    best.merged_psi_cm = merged_psi_cm;
+    best.merged_Se = merged_Se;
+    best.storage_contrast_cm = storage_contrast_cm;
   }
 
-  const double upper_span_cm = merge_front->depth_cm - new_front->depth_cm;
-  const double lower_span_cm = retained_front->depth_cm - merge_front->depth_cm;
-  const double merged_span_cm = upper_span_cm + lower_span_cm;
-  const double removable_storage_contrast_cm =
-    std::fabs(retained_front->theta - merge_front->theta) * upper_span_cm;
-  if (removable_storage_contrast_cm > SURFACE_CREATION_FOLD_MASS_TOLERANCE_CM) {
+  if (best.merge_front == NULL || best.retained_front == NULL) {
     return false;
   }
 
-  const double merged_theta =
-    (merge_front->theta * upper_span_cm + retained_front->theta * lower_span_cm) /
-    merged_span_cm;
-  const int soil_num = soil_type[layer_num];
-  const struct soil_properties_ &soil = soil_properties[soil_num];
-  const double merged_Se = calc_Se_from_theta(merged_theta, soil.theta_e, soil.theta_r);
-  const double merged_psi_cm =
-    calc_h_from_Se(merged_Se, soil.vg_alpha_per_cm, soil.vg_m, soil.vg_n);
-  if (!std::isfinite(merged_theta) || !std::isfinite(merged_psi_cm) ||
-      merged_theta + state_tol < merge_front->theta ||
-      merged_theta > retained_front->theta + state_tol ||
-      merged_psi_cm > merge_front->psi_cm +
-                        lgar_psi_assertion_tolerance_cm(merged_psi_cm, merge_front->psi_cm) ||
-      merged_psi_cm + lgar_psi_assertion_tolerance_cm(merged_psi_cm, retained_front->psi_cm) <
-                        retained_front->psi_cm ||
-      merged_psi_cm + lgar_psi_assertion_tolerance_cm(merged_psi_cm, lower_front->psi_cm) <
-                        lower_front->psi_cm) {
-    return false;
-  }
-
-  const double lower_gap_span_cm = lower_front->depth_cm - retained_front->depth_cm;
-  const double lower_gap_cm = merged_psi_cm - lower_front->psi_cm;
-  const double lower_gap_threshold_cm =
-    fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
-         TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR *
-           0.5 * (fmax(0.0, merged_psi_cm) + fmax(0.0, lower_front->psi_cm)));
-  if (lower_gap_span_cm >= TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM &&
-      lower_gap_cm > lower_gap_threshold_cm) {
-    return false;
-  }
-
-  const int deleted_front_num = merge_front->front_num;
+  const int deleted_front_num = best.merge_front->front_num;
   const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
-  retained_front->theta = merged_theta;
-  retained_front->psi_cm = merged_psi_cm;
-  retained_front->K_cm_per_h =
-    calc_K_from_Se(merged_Se,
-                   frozen_factor[layer_num] * soil.Ksat_cm_per_h, soil.vg_m);
-  retained_front->dzdt_cm_per_h = 0.0;
-  (void) lgar_unlink_front_without_canonicalization(merge_front, head);
+  const int soil_num = soil_type[best.layer_num];
+  const struct soil_properties_ &soil = soil_properties[soil_num];
+  best.retained_front->theta = best.merged_theta;
+  best.retained_front->psi_cm = best.merged_psi_cm;
+  best.retained_front->K_cm_per_h =
+    calc_K_from_Se(best.merged_Se,
+                   frozen_factor[best.layer_num] * soil.Ksat_cm_per_h,
+                   soil.vg_m);
+  best.retained_front->dzdt_cm_per_h = 0.0;
+  (void) lgar_unlink_front_without_canonicalization(best.merge_front, head);
   const double mass_change_cm =
     lgar_calc_mass_bal(cum_layer_thickness_cm, *head) - mass_before_cm;
 
@@ -16104,9 +16168,9 @@ extern bool lgarto_merge_one_dense_finite_TO_front_after_creation(
   }
 
   if (verbosity.compare("high") == 0) {
-    printf("Merged dense finite TO/GW front %d after surface creation "
+    printf("Merged dense finite TO/GW front %d "
            "(storage contrast %.17g cm, mass change %.17g cm).\n",
-           deleted_front_num, removable_storage_contrast_cm, mass_change_cm);
+           deleted_front_num, best.storage_contrast_cm, mass_change_cm);
   }
   return true;
 }

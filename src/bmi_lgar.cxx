@@ -888,6 +888,7 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
     fmax(1.0e-4, 1.0e-4 * fmax(1.0, target_CR_storage_cm));
   const double mass_before_cm =
     lgar_calc_mass_bal(cum_layer_thickness_cm, state->head);
+  const int front_count_before_sync = listLength(state->head);
   auto sync_trial_is_usable = [&](double chain_storage_after_cm,
                                   double actual_chain_storage_change_cm,
                                   double explicit_mass_change_cm,
@@ -1043,6 +1044,12 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
 	    lgarto_cleanup_redundant_colocated_psi0_support_stacks(
 	      cum_layer_thickness_cm, soil_type, &state->head,
 	      state->soil_properties);
+	  if (listLength(state->head) > front_count_before_sync) {
+	    // Remove at most one older negligible TO interval created by this sync.
+	    (void) lgarto_merge_one_dense_finite_TO_front(
+	      state->lgar_bmi_params.root_zone_depth_cm, cum_layer_thickness_cm,
+	      soil_type, frozen_factor, &state->head, state->soil_properties);
+	  }
 
 	  if (verbosity.compare("high") == 0 &&
       (fabs(actual_chain_storage_change_cm) > SMALL_EPS ||
@@ -3105,7 +3112,8 @@ Update()
               listLength_surface(state->head) == 0) {
             // Coarsen at most one older dense TO interval created by repeated
             // rainfall entry while retaining the newly converted front.
-            (void) lgarto_merge_one_dense_finite_TO_front_after_creation(
+            (void) lgarto_merge_one_dense_finite_TO_front(
+              state->lgar_bmi_params.root_zone_depth_cm,
               state->lgar_bmi_params.cum_layer_thickness_cm,
               state->lgar_bmi_params.layer_soil_type,
               state->lgar_bmi_params.frozen_factor, &state->head,
@@ -3231,9 +3239,9 @@ Update()
 	          : column_depth_cm;
 		      lgar_clean_redundant_fronts(&state->head, state->lgar_bmi_params.layer_soil_type,
 		                                  state->soil_properties,
-		                                  PET_subtimestep_cm_per_h > 0.0,
+		                                  true, // Zero-depth TO/GW fronts carry no storage, so cap their stack in every substep.
 		                                  state->lgar_bmi_params.cum_layer_thickness_cm,
-		                                  column_depth_cm); // deletes redundant WFs; leading zero-depth TO/GW capping is limited to PET-active substeps
+		                                  column_depth_cm); // deletes redundant WFs
 
 	      int correction_type_surf_after_cleanup =
 	        lgarto_correction_type_surf(num_layers, state->lgar_bmi_params.cum_layer_thickness_cm,
