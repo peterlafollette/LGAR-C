@@ -76,7 +76,6 @@ using namespace std;
 #define FINITE_SAME_LAYER_TO_DELETE_MASS_TOL_CM 1.E-4 // finite duplicate deletes can re-snap nearby to_bottom fronts by roundoff-scale amounts
 #define ZERO_DEPTH_TO_DRY_SUPPORT_MAX_SE 0.1   // only delete zero-depth TO supports when they are close to residual saturation
 #define SURFACE_CREATION_FOLD_MASS_TOLERANCE_CM 1.E-4 // coarsen only rainfall fronts carrying micrometre-scale water depth
-#define TO_DENSE_CHAIN_MERGE_STORAGE_TOLERANCE_CM 1.E-3 // preserve mass exactly while smoothing millimetre-scale differential storage
 /*
   TO psi-gap refinement is a numerical-resolution aid for dry-over-wet TO/GW
   chains; it is not an event correction.  The gap knobs below decide how eager
@@ -16034,7 +16033,7 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
     double merged_theta = NAN;
     double merged_psi_cm = NAN;
     double merged_Se = NAN;
-    double storage_contrast_cm = HUGE_VAL;
+    double hydraulic_gap_ratio = HUGE_VAL;
   } best;
   const double state_tol = 1.0e-12;
   for (struct wetting_front *upper = *head;
@@ -16050,8 +16049,6 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
     const int layer_num = upper->layer_num;
     if (layer_num < 1 ||
         upper->depth_cm <= cum_layer_thickness_cm[layer_num - 1] + depth_tol_cm ||
-        retained_front->depth_cm - upper->depth_cm >
-          TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM ||
         (merge_front->depth_cm < root_zone_depth_cm - 1.0e-8 &&
          root_zone_TO_fronts <= TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS)) {
       continue;
@@ -16079,12 +16076,6 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
     const double upper_span_cm = merge_front->depth_cm - upper->depth_cm;
     const double lower_span_cm = retained_front->depth_cm - merge_front->depth_cm;
     const double merged_span_cm = upper_span_cm + lower_span_cm;
-    const double storage_contrast_cm =
-      std::fabs(retained_front->theta - merge_front->theta) * upper_span_cm;
-    if (storage_contrast_cm > TO_DENSE_CHAIN_MERGE_STORAGE_TOLERANCE_CM) {
-      continue;
-    }
-
     const double merged_theta =
       (merge_front->theta * upper_span_cm + retained_front->theta * lower_span_cm) /
       merged_span_cm;
@@ -16113,16 +16104,18 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
       fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
            TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR *
              0.5 * (fmax(0.0, upper->psi_cm) + fmax(0.0, merged_psi_cm)));
-    const double lower_gap_span_cm = lower_front->depth_cm - retained_front->depth_cm;
     const double lower_gap_threshold_cm =
       fmax(TO_PSI_GAP_REFINEMENT_MIN_GAP_CM,
            TO_PSI_GAP_REFINEMENT_RELATIVE_GAP_FACTOR *
              0.5 * (fmax(0.0, merged_psi_cm) + fmax(0.0, lower_front->psi_cm)));
-    if ((merged_span_cm >= TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM &&
-         upper->psi_cm - merged_psi_cm > upper_gap_threshold_cm) ||
-        (lower_gap_span_cm >= TO_PSI_GAP_REFINEMENT_MIN_DEPTH_SPAN_CM &&
-         merged_psi_cm - lower_front->psi_cm > lower_gap_threshold_cm) ||
-        storage_contrast_cm >= best.storage_contrast_cm) {
+    // Consolidate by hydraulic resolution, independent of front spacing or
+    // differential storage; the weighted theta preserves profile mass.
+    const double hydraulic_gap_ratio =
+      fmax(fmax(0.0, upper->psi_cm - merged_psi_cm) / upper_gap_threshold_cm,
+           fmax(0.0, merged_psi_cm - lower_front->psi_cm) /
+             lower_gap_threshold_cm);
+    if (hydraulic_gap_ratio > 1.0 ||
+        hydraulic_gap_ratio >= best.hydraulic_gap_ratio) {
       continue;
     }
 
@@ -16132,7 +16125,7 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
     best.merged_theta = merged_theta;
     best.merged_psi_cm = merged_psi_cm;
     best.merged_Se = merged_Se;
-    best.storage_contrast_cm = storage_contrast_cm;
+    best.hydraulic_gap_ratio = hydraulic_gap_ratio;
   }
 
   if (best.merge_front == NULL || best.retained_front == NULL) {
@@ -16168,9 +16161,9 @@ extern bool lgarto_merge_one_dense_finite_TO_front(
   }
 
   if (verbosity.compare("high") == 0) {
-    printf("Merged dense finite TO/GW front %d "
-           "(storage contrast %.17g cm, mass change %.17g cm).\n",
-           deleted_front_num, best.storage_contrast_cm, mass_change_cm);
+    printf("Merged hydraulically redundant finite TO/GW front %d "
+           "(gap ratio %.17g, mass change %.17g cm).\n",
+           deleted_front_num, best.hydraulic_gap_ratio, mass_change_cm);
   }
   return true;
 }

@@ -3108,10 +3108,9 @@ Update()
 		                : lgar_fixed_soil_depth_cm(&state->lgar_bmi_params),
 	              state->lgar_bmi_params.mobile_groundwater_level);
           if (state->lgar_bmi_params.TO_enabled &&
-              listLength(state->head) > front_count_before_creation &&
-              listLength_surface(state->head) == 0) {
-            // Coarsen at most one older dense TO interval created by repeated
-            // rainfall entry while retaining the newly converted front.
+              listLength(state->head) > front_count_before_creation) {
+            // Coarsen at most one hydraulically redundant ordinary TO interval
+            // after rainfall entry, even when an unrelated surface front remains.
             (void) lgarto_merge_one_dense_finite_TO_front(
               state->lgar_bmi_params.root_zone_depth_cm,
               state->lgar_bmi_params.cum_layer_thickness_cm,
