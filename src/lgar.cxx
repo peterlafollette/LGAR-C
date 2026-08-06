@@ -3951,6 +3951,27 @@ extern double lgarto_lateral_flux_candidate_cm(double timestep_h,
   return fmax(0.0, lateral_flux_cm_per_h * timestep_h);
 }
 
+extern double lgarto_movable_TO_lateral_flux_candidate_cm(
+  double timestep_h, int num_layers, double lateral_flow_psi_threshold_cm,
+  double lateral_flow_factor, double *cum_layer_thickness_cm,
+  struct wetting_front *head, struct wetting_front *target,
+  bool mobile_groundwater_level, int *soil_type,
+  struct soil_properties_ *soil_properties,
+  const bool *cached_donor_is_mobile_CR_chain)
+{
+  struct wetting_front *donor = target != NULL ? target->next : NULL;
+  if (target == NULL || !target->is_WF_GW || target->to_bottom ||
+      donor == NULL || !donor->is_WF_GW || donor->layer_num != target->layer_num) {
+    return 0.0;
+  }
+
+  // Moving the shallower target reduces the interval owned by the deeper donor.
+  return lgarto_lateral_flux_candidate_cm(
+    timestep_h, num_layers, lateral_flow_psi_threshold_cm, lateral_flow_factor,
+    cum_layer_thickness_cm, head, target, donor, mobile_groundwater_level,
+    soil_type, soil_properties, cached_donor_is_mobile_CR_chain);
+}
+
 static void lgar_calc_surface_lateral_fluxes_by_front(double timestep_h,
                                                       int num_layers,
                                                       double lateral_flow_psi_threshold_cm,
@@ -4013,6 +4034,185 @@ static double lgar_lateral_flow_psi_cap_cm(double lateral_flow_psi_threshold_cm)
               fmin(lateral_flow_psi_threshold_cm + 1.0 -
                      lateral_flow_psi_cap_buffer_cm,
                    PSI_UPPER_LIM));
+}
+
+static std::vector<struct wetting_front *>
+lgar_surface_supported_TO_chain(struct wetting_front *head)
+{
+  std::vector<struct wetting_front *> chain;
+  struct wetting_front *deepest_surface = NULL;
+  for (struct wetting_front *current = head; current != NULL; current = current->next) {
+    if (!current->is_WF_GW) {
+      deepest_surface = current;
+    }
+  }
+
+  for (struct wetting_front *current =
+         deepest_surface != NULL ? deepest_surface->next : NULL;
+       current != NULL; current = current->next) {
+    if (!current->is_WF_GW ||
+        (!chain.empty() &&
+         (current->layer_num != chain.back()->layer_num + 1 ||
+          !lgarto_psis_match_for_local_chain(current->psi_cm, chain.back()->psi_cm)))) {
+      chain.clear();
+      break;
+    }
+    chain.push_back(current);
+    if (!current->to_bottom) {
+      break;
+    }
+  }
+
+  // A bridge-only chain has no ordinary TO state that can be dried independently.
+  if (chain.empty() || chain.back()->to_bottom) {
+    chain.clear();
+  }
+  return chain;
+}
+
+static double lgar_surface_supported_TO_lateral_flux_candidate_cm(
+  double timestep_h, int num_layers, double lateral_flow_psi_threshold_cm,
+  double lateral_flow_factor, double *cum_layer_thickness_cm,
+  struct wetting_front *head, bool mobile_groundwater_level,
+  int *soil_type, struct soil_properties_ *soil_properties)
+{
+  const std::vector<struct wetting_front *> chain =
+    lgar_surface_supported_TO_chain(head);
+  if (chain.empty()) {
+    return 0.0;
+  }
+
+  double requested_cm = 0.0;
+  size_t chain_index = 0;
+  struct wetting_front *previous = NULL;
+  for (struct wetting_front *current = head; current != NULL && chain_index < chain.size();
+       previous = current, current = current->next) {
+    if (current != chain[chain_index]) {
+      continue;
+    }
+    if (mobile_groundwater_level &&
+        lgar_lateral_front_is_mobile_CR_chain(current, head, num_layers,
+                                              cum_layer_thickness_cm,
+                                              soil_type, soil_properties)) {
+      return 0.0;
+    }
+    requested_cm +=
+      lgarto_lateral_flux_candidate_cm(
+        timestep_h, num_layers, lateral_flow_psi_threshold_cm,
+        lateral_flow_factor, cum_layer_thickness_cm, head, previous, current,
+        mobile_groundwater_level, soil_type, soil_properties);
+    chain_index++;
+  }
+  return chain_index == chain.size() ? requested_cm : 0.0;
+}
+
+static double lgar_apply_lateral_flux_to_surface_supported_TO_chain(
+  double requested_lateral_flux_cm, double lateral_flow_psi_threshold_cm,
+  int num_layers, double *cum_layer_thickness_cm, int *soil_type,
+  double *frozen_factor, struct soil_properties_ *soil_properties,
+  struct wetting_front **head, bool mobile_groundwater_level,
+  double *lateral_flow_subtimestep_cm)
+{
+  if (requested_lateral_flux_cm <= 0.0 || head == NULL || *head == NULL) {
+    return 0.0;
+  }
+
+  const std::vector<struct wetting_front *> chain =
+    lgar_surface_supported_TO_chain(*head);
+  if (chain.empty()) {
+    return 0.0;
+  }
+
+  std::vector<lgarto_surface_TO_merge_front_state> saved_states;
+  double psi_low_cm = 0.0;
+  for (struct wetting_front *front : chain) {
+    if (mobile_groundwater_level &&
+        lgar_lateral_front_is_mobile_CR_chain(front, *head, num_layers,
+                                              cum_layer_thickness_cm,
+                                              soil_type, soil_properties)) {
+      return 0.0;
+    }
+    saved_states.push_back({front, front->psi_cm, front->theta, front->K_cm_per_h});
+    psi_low_cm = fmax(psi_low_cm, front->psi_cm);
+  }
+  const double psi_high_cm = lgar_lateral_flow_psi_cap_cm(lateral_flow_psi_threshold_cm);
+  if (psi_high_cm <= psi_low_cm) {
+    return 0.0;
+  }
+
+  const double mass_before_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  auto trial_mass = [&](double psi_cm) -> double {
+    if (!lgarto_apply_shared_psi_to_fronts(chain, psi_cm, num_layers, soil_type,
+                                           frozen_factor, soil_properties)) {
+      return NAN;
+    }
+    return lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  };
+
+  double mass_low_cm = trial_mass(psi_low_cm);
+  const double mass_high_cm = trial_mass(psi_high_cm);
+  if (!std::isfinite(mass_low_cm) || !std::isfinite(mass_high_cm) ||
+      mass_low_cm > mass_before_cm + MBAL_ITERATIVE_TOLERANCE ||
+      mass_high_cm > mass_low_cm + MBAL_ITERATIVE_TOLERANCE) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return 0.0;
+  }
+
+  const double target_mass_cm =
+    fmax(mass_high_cm, mass_before_cm - requested_lateral_flux_cm);
+  if (mass_low_cm < target_mass_cm - MBAL_ITERATIVE_TOLERANCE) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return 0.0;
+  }
+
+  double low_cm = psi_low_cm;
+  double high_cm = psi_high_cm;
+  double best_psi_cm = fabs(mass_low_cm - target_mass_cm) <
+                         fabs(mass_high_cm - target_mass_cm)
+                       ? low_cm : high_cm;
+  double best_mass_error_cm =
+    fmin(fabs(mass_low_cm - target_mass_cm), fabs(mass_high_cm - target_mass_cm));
+  for (int iter = 0; iter < 80 && mass_high_cm < target_mass_cm; iter++) {
+    const double mid_cm = 0.5 * (low_cm + high_cm);
+    const double mass_mid_cm = trial_mass(mid_cm);
+    if (!std::isfinite(mass_mid_cm)) {
+      lgarto_restore_front_hydraulic_states(saved_states);
+      return 0.0;
+    }
+    const double mass_error_cm = fabs(mass_mid_cm - target_mass_cm);
+    if (mass_error_cm < best_mass_error_cm) {
+      best_psi_cm = mid_cm;
+      best_mass_error_cm = mass_error_cm;
+    }
+    if (mass_error_cm <= MBAL_ITERATIVE_TOLERANCE) {
+      best_psi_cm = mid_cm;
+      break;
+    }
+    if (mass_mid_cm > target_mass_cm) {
+      low_cm = mid_cm;
+    }
+    else {
+      high_cm = mid_cm;
+    }
+  }
+
+  const double final_mass_cm = trial_mass(best_psi_cm);
+  const double applied_cm =
+    std::isfinite(final_mass_cm) ? fmax(0.0, mass_before_cm - final_mass_cm) : 0.0;
+  if (applied_cm <= MBAL_ITERATIVE_TOLERANCE ||
+      applied_cm > requested_lateral_flux_cm + 10.0 * MBAL_ITERATIVE_TOLERANCE) {
+    lgarto_restore_front_hydraulic_states(saved_states);
+    return 0.0;
+  }
+  if (lateral_flow_subtimestep_cm != NULL) {
+    *lateral_flow_subtimestep_cm += applied_cm;
+  }
+  if (verbosity.compare("high") == 0) {
+    printf("Surface-supported TO interflow extracted %.17lf cm by drying front %d "
+           "and its connected boundary chain to psi %.17lf cm.\n",
+           applied_cm, chain.front()->front_num, best_psi_cm);
+  }
+  return applied_cm;
 }
 
 static double lgar_apply_lateral_flux_to_prior_mass(double requested_lateral_flux_cm,
@@ -5269,6 +5469,19 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
           front_by_num[front->front_num] = front;
         }
       }
+	    std::vector<double> TO_lateral_flux_cm_by_front(updated_wetting_front_count + 1, 0.0);
+	    for (int wf = 1; wf < updated_wetting_front_count; wf++) {
+	      TO_lateral_flux_cm_by_front[wf] =
+	        lgarto_movable_TO_lateral_flux_candidate_cm(
+	          timestep_h, num_layers, lateral_flow_psi_threshold_cm,
+	          lateral_flow_factor, cum_layer_thickness_cm, *head,
+	          front_by_num[wf], mobile_groundwater_level, soil_type, soil_properties);
+	    }
+	    const double surface_supported_TO_lateral_flux_cm =
+	      lgar_surface_supported_TO_lateral_flux_candidate_cm(
+	        timestep_h, num_layers, lateral_flow_psi_threshold_cm,
+	        lateral_flow_factor, cum_layer_thickness_cm, *head,
+	        mobile_groundwater_level, soil_type, soil_properties);
 	    bool TO_WFs_above_surface_WFs_flag = false;
 	    for (int wf = updated_wetting_front_count - 1; wf >= 1; wf--) {
 	      current = front_by_num[wf];
@@ -5285,27 +5498,9 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	        continue;
 	      }
 
-      double requested_TO_lateral_flux_cm = 0.0;
-      // Dense TO chains can contain many dry fronts.  Check the cheap lateral
-      // eligibility tests before doing the linked-list previous-front lookup;
-      // otherwise interflow-on runs pay O(N^2) list-walk cost for fronts that
-      // lgarto_lateral_flux_candidate_cm would immediately reject by psi/K/factor.
-      if (lateral_flow_factor > 0.0 &&
-          current->psi_cm <= lateral_flow_psi_threshold_cm &&
-          std::isfinite(current->K_cm_per_h) && current->K_cm_per_h > 0.0) {
-        requested_TO_lateral_flux_cm =
-          lgarto_lateral_flux_candidate_cm(timestep_h, num_layers,
-                                           lateral_flow_psi_threshold_cm,
-                                           lateral_flow_factor,
-                                           cum_layer_thickness_cm,
-                                           *head,
-                                           current->front_num > 1 ?
-                                             front_by_num[current->front_num - 1] : NULL,
-                                           current,
-                                           mobile_groundwater_level,
-                                           soil_type,
-                                           soil_properties);
-      }
+	      // Freeze simultaneous donor requests before deeper fronts change geometry.
+	      const double requested_TO_lateral_flux_cm =
+	        TO_lateral_flux_cm_by_front[current->front_num];
       if (requested_TO_lateral_flux_cm > 0.0) {
         (void) lgar_apply_lateral_flux_to_TO_front_by_depth(
           requested_TO_lateral_flux_cm, current, num_layers,
@@ -5849,6 +6044,14 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       "lgarto_truncate_last_layer_GW_overshoot",
       "net last-layer TO/GW overshoot truncation across correction loop",
       *head);
+
+    // The uppermost TO interval has no movable TO boundary above it, so remove
+    // its frozen interflow demand through a mass-aware shared-psi update.
+    (void) lgar_apply_lateral_flux_to_surface_supported_TO_chain(
+      surface_supported_TO_lateral_flux_cm, lateral_flow_psi_threshold_cm,
+      num_layers, cum_layer_thickness_cm, soil_type, frozen_factor,
+      soil_properties, head, mobile_groundwater_level,
+      lateral_flow_subtimestep_cm);
 
 	    if (verbosity.compare("high") == 0) {
 	      printf("mass after TO/general correction loop: %lf \n", lgar_calc_mass_bal(cum_layer_thickness_cm, *head));

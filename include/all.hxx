@@ -439,6 +439,16 @@ extern double lgarto_lateral_flux_candidate_cm(double timestep_h, int num_layers
                                                int *soil_type,
                                                struct soil_properties_ *soil_properties,
                                                const bool *cached_is_mobile_CR_chain = nullptr);
+extern double lgarto_movable_TO_lateral_flux_candidate_cm(double timestep_h, int num_layers,
+                                                          double lateral_flow_psi_threshold_cm,
+                                                          double lateral_flow_factor,
+                                                          double *cum_layer_thickness_cm,
+                                                          struct wetting_front *head,
+                                                          struct wetting_front *target,
+                                                          bool mobile_groundwater_level,
+                                                          int *soil_type,
+                                                          struct soil_properties_ *soil_properties,
+                                                          const bool *cached_donor_is_mobile_CR_chain = nullptr);
 extern bool lgar_lateral_front_is_mobile_CR_chain(struct wetting_front *front,
                                                   struct wetting_front *head,
                                                   int num_layers,

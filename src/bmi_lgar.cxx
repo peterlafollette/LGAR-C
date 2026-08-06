@@ -1785,16 +1785,15 @@ static bool lgarto_project_mobile_TO_packet_depths_after_interflow(
 
     if (params.lateral_flow_enabled && params.lateral_flow_factor > 0.0 &&
         current->next->layer_num == layer_num) {
-      const bool is_mobile_CR_chain =
-        workspace->is_mobile_CR_chain_by_num[wf] != 0;
+      const bool donor_is_mobile_CR_chain =
+        workspace->is_mobile_CR_chain_by_num[current->next->front_num] != 0;
       const double requested_lateral_flux_cm =
-        lgarto_lateral_flux_candidate_cm(
+        lgarto_movable_TO_lateral_flux_candidate_cm(
           subtimestep_h, params.num_layers,
           params.lateral_flow_psi_threshold_cm, params.lateral_flow_factor,
-          params.cum_layer_thickness_cm, state->head,
-          wf > 1 ? front_by_num[wf - 1] : NULL, current,
+          params.cum_layer_thickness_cm, state->head, current,
           params.mobile_groundwater_level, params.layer_soil_type,
-          state->soil_properties, &is_mobile_CR_chain);
+          state->soil_properties, &donor_is_mobile_CR_chain);
       current_depth_cm =
         lgarto_project_TO_interflow_depth_cm(
           requested_lateral_flux_cm, current_depth_cm, layer_bottom_cm,
