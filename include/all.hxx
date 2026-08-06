@@ -43,6 +43,13 @@ extern string verbosity;
 // Keep conservative TO coarsening from undoing the minimum AET resolution.
 static constexpr int TO_AET_ROOT_ZONE_MIN_POPULATION_FRONTS = 2;
 
+// Treat roundoff-scale wetting-front depths consistently as the same zero-depth state.
+static constexpr double LGARTO_ZERO_DEPTH_TOLERANCE_CM = 1.0e-10;
+static inline bool lgarto_is_zero_depth(double depth_cm)
+{
+  return std::isfinite(depth_cm) && std::fabs(depth_cm) <= LGARTO_ZERO_DEPTH_TOLERANCE_CM;
+}
+
 
 // Define a data structure to hold everything that describes a wetting front
 struct wetting_front

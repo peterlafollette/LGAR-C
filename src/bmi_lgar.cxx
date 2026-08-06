@@ -990,11 +990,11 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
                            mass_after_cm);
   }
 
+  const double live_chain_storage_cm =
+    lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
+                                            soil_type, state->head,
+                                            state->soil_properties);
   if (!sync_usable) {
-    const double live_chain_storage_cm =
-      lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
-                                              soil_type, state->head,
-                                              state->soil_properties);
     const double maintained_trial_tol_cm =
       fmax(1.0e-2, 1.0e-3 * fmax(1.0, target_CR_storage_cm));
     if (live_chain_storage_cm <= storage_tol_cm &&
@@ -1017,15 +1017,17 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
              current_groundwater_depth_cm);
     }
     listDelete(trial_head);
-	    if (chain_storage_before_cm > storage_tol_cm) {
-	      if (verbosity.compare("high") == 0) {
-	        printf("Mobile groundwater CR-chain sync preserving existing support chain "
-	               "instead of applying proxy depth fallback.\n");
-	      }
-	      return lgarto_cleanup_redundant_colocated_psi0_support_stacks(
-	        cum_layer_thickness_cm, soil_type, &state->head,
-	        state->soil_properties);
-	    }
+    // Keep an existing explicit chain and its scalar proxy atomic when a
+    // trial is rejected.
+    if (live_chain_storage_cm > SMALL_EPS) {
+      if (verbosity.compare("high") == 0) {
+        printf("Mobile groundwater CR-chain sync preserving existing support chain "
+               "instead of applying proxy depth fallback.\n");
+      }
+      return lgarto_cleanup_redundant_colocated_psi0_support_stacks(
+        cum_layer_thickness_cm, soil_type, &state->head,
+        state->soil_properties);
+    }
 	    lgar_update_mobile_groundwater_depth_from_CR_storage(state);
 	    return lgarto_cleanup_redundant_colocated_psi0_support_stacks(
 	      cum_layer_thickness_cm, soil_type, &state->head,
@@ -1918,7 +1920,7 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   double limiting_projected_next_depth_cm = 0.0;
   double limiting_current_dzdt_cm_per_h = 0.0;
   double limiting_next_dzdt_cm_per_h = 0.0;
-  bool limiting_event_is_interflow_aware = false;
+  bool limiting_event_uses_duration_projection = false;
   lgarto_mobile_TO_projection_workspace projection_workspace;
   const bool projection_workspace_valid =
     lgarto_prepare_mobile_TO_projection_workspace(state, &projection_workspace);
@@ -1929,11 +1931,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
                state, proposed_subtimestep_h,
                projection_workspace_valid
                  ? &projection_workspace.front_by_num : NULL));
-  const bool interflow_enabled =
-    state->lgar_bmi_params.lateral_flow_enabled &&
-    state->lgar_bmi_params.lateral_flow_factor > 0.0;
   const bool proposed_projection_valid =
-    interflow_enabled && projection_workspace_valid &&
+    projection_workspace_valid &&
     lgarto_project_mobile_TO_packet_depths_after_interflow(
       proposed_subtimestep_h, state, &projection_workspace,
       proposed_upward_TO_supply_scale, 0, 0);
@@ -2018,9 +2017,9 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     double event_projected_next_depth_cm =
       ordered_projection_valid ? ordered_projected_next_depth_cm :
                                  projected_next_depth_cm;
-    bool event_is_interflow_aware = false;
+    bool event_uses_duration_projection = false;
 
-    if (interflow_enabled) {
+    if (projection_workspace_valid) {
       double interflow_projected_current_depth_cm =
         ordered_projected_current_depth_cm;
       double interflow_projected_next_depth_cm =
@@ -2036,10 +2035,10 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       if (!projected) {
         /*
           A full-step projection can leave the current layer before the packet
-          would meet.  Recheck the earlier dzdt-only contact time with the actual
-          interflow-before-dzdt operator.  If the pair is still separated there,
-          this is not a packet event; the normal mover/correction pass will handle
-          any later layer-boundary crossing.
+          would meet. Recheck the earlier dzdt-only contact time with the actual
+          ordered motion operator, including the duration-specific CR cap and
+          interflow when enabled. If the pair is still separated there, this is
+          not a packet event; normal correction handles a later boundary crossing.
         */
         const bool candidate_projected =
           lgarto_project_mobile_TO_packet_gap_after_interflow(
@@ -2089,7 +2088,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
 
         if (projection_valid && safe_dt_h > 0.0) {
           event_subtimestep_h = safe_dt_h;
-          event_is_interflow_aware = true;
+          // Reproject each trial duration so its CR cap matches the actual mover.
+          event_uses_duration_projection = true;
         }
       }
     }
@@ -2108,7 +2108,7 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     limiting_projected_next_depth_cm = event_projected_next_depth_cm;
     limiting_current_dzdt_cm_per_h = current_dzdt_cm_per_h;
     limiting_next_dzdt_cm_per_h = next_dzdt_cm_per_h;
-    limiting_event_is_interflow_aware = event_is_interflow_aware;
+    limiting_event_uses_duration_projection = event_uses_duration_projection;
   }
 
   if (limiting_current == NULL || limiting_next == NULL) {
@@ -2173,7 +2173,7 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
            "depth_cm=%.17lf next_depth_cm=%.17lf projected_depth_cm=%.17lf "
            "projected_next_depth_cm=%.17lf dzdt_cm_per_h=%.17lf "
            "next_dzdt_cm_per_h=%.17lf min_spacing_cm=%.17lf "
-           "interflow_aware=%d\n",
+           "duration_projected=%d\n",
            limiting_current->front_num,
            limiting_next->front_num,
            limiting_current->layer_num,
@@ -2186,7 +2186,7 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
            limiting_current_dzdt_cm_per_h,
            limiting_next_dzdt_cm_per_h,
            min_spacing_cm,
-           limiting_event_is_interflow_aware ? 1 : 0);
+           limiting_event_uses_duration_projection ? 1 : 0);
   }
 
   return limited_subtimestep_h;

@@ -611,6 +611,13 @@ extern void listSendToTop(struct wetting_front *head)
   struct wetting_front *current;
   struct wetting_front *next;
 
+  // Canonicalize roundoff-scale depths before the existing zero-depth reorder.
+  for (current = head; current != NULL; current = current->next) {
+    if (lgarto_is_zero_depth(current->depth_cm)) {
+      current->depth_cm = 0.0;
+    }
+  }
+
   int size = listLength(head);
   k = size;
 
