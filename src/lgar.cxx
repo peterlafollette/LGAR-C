@@ -13994,7 +13994,21 @@ static void lgar_normalize_after_surface_front_creation(int num_layers,
   }
 
   const double column_depth = cum_layer_thickness_cm[num_layers];
-  (void) lgar_reset_overtaken_groundwater_fronts_to_surface(*head, new_surface_front);
+  const bool created_front_joins_TO_packet =
+    new_surface_front != NULL && new_surface_front->next != NULL &&
+    new_surface_front->next->is_WF_GW && new_surface_front->next->to_bottom &&
+    new_surface_front->layer_num == new_surface_front->next->layer_num &&
+    std::fabs(new_surface_front->depth_cm - new_surface_front->next->depth_cm) <=
+      CREATION_COLOCATED_TOLERANCE_CM &&
+    new_surface_front->theta < new_surface_front->next->theta;
+  if (created_front_joins_TO_packet) {
+    // A dry-over-wet boundary insertion is already TO; do not zero the packet above it.
+    new_surface_front->is_WF_GW = TRUE;
+    new_surface_front->dzdt_cm_per_h = 0.0;
+  }
+  else {
+    (void) lgar_reset_overtaken_groundwater_fronts_to_surface(*head, new_surface_front);
+  }
   bool delayed_surface_creation_gw_conversion = false;
 
   for (int phase = 0; phase < 8; phase++) {
