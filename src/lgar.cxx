@@ -12447,6 +12447,38 @@ static double lgar_saturated_pressure_head_cm(const struct wetting_front *front,
    in the current timestep, that is precipitation in the current and previous
    timesteps was greater than zero */
 // ############################################################################################
+static bool lgar_all_TO_storage_intervals_are_saturated(int num_layers,
+                                                        double *cum_layer_thickness_cm,
+                                                        int *soil_type,
+                                                        struct wetting_front *head,
+                                                        struct soil_properties_ *soil_properties)
+{
+  double interval_top = 0.0;
+  int completed_layers = 0;
+  for (struct wetting_front *front = head; front != NULL; front = front->next) {
+    if (!front->is_WF_GW || front->layer_num < 1 || front->layer_num > num_layers) {
+      return false;
+    }
+    if (front->depth_cm < interval_top - LOWER_BOUNDARY_FINAL_TOL_CM ||
+        front->depth_cm > cum_layer_thickness_cm[front->layer_num] + LOWER_BOUNDARY_FINAL_TOL_CM ||
+        (front->depth_cm > interval_top + LOWER_BOUNDARY_FINAL_TOL_CM &&
+         front->theta < soil_properties[soil_type[front->layer_num]].theta_e - 1.0e-8)) {
+      return false;
+    }
+    interval_top = fmax(interval_top, front->depth_cm); // Colocated dry supports carry no storage.
+    if (front->to_bottom) {
+      if (front->layer_num != completed_layers + 1 ||
+          std::fabs(front->depth_cm - cum_layer_thickness_cm[front->layer_num]) >
+            LOWER_BOUNDARY_FINAL_TOL_CM) {
+        return false;
+      }
+      completed_layers++;
+    }
+  }
+  return completed_layers == num_layers &&
+         interval_top >= cum_layer_thickness_cm[num_layers] - LOWER_BOUNDARY_FINAL_TOL_CM;
+}
+
 extern double lgar_insert_water(bool use_closed_form_G, int nint, double timestep_h, double AET_demand_cm, double free_drainage_subtimestep_cm, double *ponded_depth_cm,
 				double *volin_this_timestep, double precip_timestep_cm, int wf_free_drainage_demand,
 			        int num_layers, double ponded_depth_max_cm, int *soil_type,
@@ -12497,10 +12529,15 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 
   double Geff;
 
-  if (number_of_wetting_fronts == num_layers) {
+  const bool saturated_terminal_TO_column =
+    current_free_drainage_next == NULL &&
+    lgar_all_TO_storage_intervals_are_saturated(num_layers, cum_layer_thickness_cm,
+                                                soil_type, head, soil_properties);
+  if (number_of_wetting_fronts == num_layers || saturated_terminal_TO_column) {
     Geff = 0.0; // i.e., case of no capillary suction, dz/dt is also zero for all wetting fronts
     soil_num = soil_type[layer_num_fp];
-    Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[current->layer_num]; //23 feb 2024
+    const int frozen_layer = saturated_terminal_TO_column ? layer_num_fp : current->layer_num;
+    Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[frozen_layer];
   }
   else {
     if (current_free_drainage_next == NULL) {

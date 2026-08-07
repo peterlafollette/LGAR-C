@@ -551,7 +551,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   int *repeat_front_num,
   int *repeat_next_front_num,
   int *repeat_layer_num,
-  int *repeat_count);
+  int *repeat_count,
+  int *repeat_pair_shift = nullptr);
 
 // the subroutine merges the wetting fronts; called from lgar_move_wetting_fronts
 extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, struct wetting_front** head,

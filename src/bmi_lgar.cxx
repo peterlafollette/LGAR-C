@@ -1891,7 +1891,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   int *repeat_front_num,
   int *repeat_next_front_num,
   int *repeat_layer_num,
-  int *repeat_count)
+  int *repeat_count,
+  int *repeat_pair_shift)
 {
   if (state == NULL || proposed_subtimestep_h <= 0.0 ||
       state->head == NULL ||
@@ -2118,6 +2119,9 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       *repeat_next_front_num = -1;
       *repeat_layer_num = -1;
       *repeat_count = 0;
+      if (repeat_pair_shift != NULL) {
+        *repeat_pair_shift = 0;
+      }
     }
     return limited_subtimestep_h;
   }
@@ -2130,7 +2134,17 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     const bool same_nearby_layer_cluster =
       *repeat_layer_num == limiting_current->layer_num &&
       limiting_current_gap_cm <= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_MAX_GAP_CM;
-    if (same_pair || same_nearby_layer_cluster) {
+    const int pair_shift = limiting_current->front_num - *repeat_front_num;
+    // Surface creation can renumber one stalled three-front packet as
+    // (i,i+1) then (i+1,i+2); count only a direction-reversing alternation.
+    const bool alternating_adjacent_triplet =
+      repeat_pair_shift != NULL &&
+      *repeat_layer_num == limiting_current->layer_num &&
+      std::abs(pair_shift) == 1 && *repeat_pair_shift == -pair_shift &&
+      *repeat_next_front_num - *repeat_front_num == 1 &&
+      limiting_next->front_num - limiting_current->front_num == 1 &&
+      limiting_current->psi_cm > SMALL_EPS && limiting_next->psi_cm > SMALL_EPS;
+    if (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet) {
       (*repeat_count)++;
     }
     else {
@@ -2139,11 +2153,14 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     *repeat_front_num = limiting_current->front_num;
     *repeat_next_front_num = limiting_next->front_num;
     *repeat_layer_num = limiting_current->layer_num;
+    if (repeat_pair_shift != NULL) {
+      *repeat_pair_shift = std::abs(pair_shift) == 1 ? pair_shift : 0;
+    }
 
     // A correction can recreate the exact numbered pair with a wider gap; retain
     // the gap guard only for the looser same-layer-cluster stall match.
     if (*repeat_count >= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_COUNT &&
-        (same_pair || same_nearby_layer_cluster)) {
+        (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet)) {
       // A repeated split is a stall. Step just past contact so
       // the existing TO/GW merge/correction logic resolves the local overtake.
       limited_subtimestep_h =
@@ -2589,6 +2606,7 @@ Update()
   int repeated_mobile_TO_packet_next_front_num = -1;
   int repeated_mobile_TO_packet_layer_num = -1;
   int repeated_mobile_TO_packet_split_count = 0;
+  int repeated_mobile_TO_packet_pair_shift = 0;
   int previous_compound_handoff_signature = 0;
   int alternating_compound_handoff_events = 0;
   while (remaining_forcing_h > SMALL_EPS) {
@@ -2625,7 +2643,8 @@ Update()
           &repeated_mobile_TO_packet_front_num,
           &repeated_mobile_TO_packet_next_front_num,
           &repeated_mobile_TO_packet_layer_num,
-          &repeated_mobile_TO_packet_split_count);
+          &repeated_mobile_TO_packet_split_count,
+          &repeated_mobile_TO_packet_pair_shift);
 
       if (event_limited_subtimestep_h + SMALL_EPS < subtimestep_h) {
         lgarto_event_splits_this_forcing++;
