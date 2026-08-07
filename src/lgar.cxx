@@ -12965,7 +12965,7 @@ static void lgarto_cap_zero_depth_TO_psi(int num_layers,
 {
   for (struct wetting_front *current = head; current != NULL; current = current->next) {
     if (!current->is_WF_GW ||
-        !lgarto_is_zero_depth(current->depth_cm) ||
+        !lgarto_should_canonicalize_zero_depth(current) ||
         current->layer_num < 1 ||
         current->layer_num > num_layers) {
       continue;

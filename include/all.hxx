@@ -66,6 +66,17 @@ struct wetting_front
   struct wetting_front *next;  // pointer to the next wetting front.
 };
 
+static inline bool lgarto_should_canonicalize_zero_depth(const struct wetting_front *front)
+{
+  if (front == nullptr || !lgarto_is_zero_depth(front->depth_cm)) {
+    return false;
+  }
+  // Preserve positive progress by movable fronts; stationary top-layer TO metadata is support.
+  return front->depth_cm <= 0.0 ||
+         (front->is_WF_GW && !front->to_bottom && front->layer_num == 1 &&
+          front->dzdt_cm_per_h == 0.0);
+}
+
 /* head is a GLOBALLY defined pointer to the first link in the wetting front list.
    Making it a local variable in main() makes all linked list operations
    in subroutines a pain of referencing.  Since it is just one thing,
