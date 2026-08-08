@@ -138,6 +138,10 @@ static double lgar_theta_mass_balance_correction_with_min_psi(
   bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head,
   double *cum_layer_thickness_cm, int *soil_type,
   struct soil_properties_ *soil_properties, double min_psi_cm);
+static void lgar_theta_mass_balance_correction_with_max_psi(
+  bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head,
+  double *cum_layer_thickness_cm, int *soil_type,
+  struct soil_properties_ *soil_properties, double max_psi_cm);
 static double lgarto_repair_negative_depth_fronts_to_lower_boundary_flux(
   int num_layers, double *cum_layer_thickness_cm, int *soil_type,
   double *frozen_factor, struct soil_properties_ *soil_properties,
@@ -8573,6 +8577,18 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
           });
         }
         const double residual_before_psi_repair = target_mass - current_mass;
+        double max_repair_psi_cm = 1.E300;
+        if (psi_repair_front->front_num > 1) {
+          struct wetting_front *shallower =
+            listFindFront(psi_repair_front->front_num - 1, *head, NULL);
+          if (shallower != NULL && shallower->is_WF_GW && psi_repair_front->is_WF_GW &&
+              shallower->layer_num == psi_repair_front->layer_num &&
+              shallower->depth_cm < psi_repair_front->depth_cm &&
+              std::isfinite(shallower->psi_cm)) {
+            // A local mass repair must not make a deeper TO front drier than its shallower neighbor.
+            max_repair_psi_cm = shallower->psi_cm;
+          }
+        }
         if (verbosity.compare("high") == 0) {
           printf("TO depth-based merge bounded depth solve left residual %.12e cm; "
                  "adjusting connected TO/to_bottom chain starting at front %d.\n",
@@ -8580,9 +8596,9 @@ extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_de
                  front_num_to_repair);
         }
 
-        lgar_theta_mass_balance_correction(false, front_num_to_repair, target_mass, head,
-                                           cum_layer_thickness_cm, soil_type,
-                                           soil_properties);
+        lgar_theta_mass_balance_correction_with_max_psi(
+          false, front_num_to_repair, target_mass, head, cum_layer_thickness_cm,
+          soil_type, soil_properties, max_repair_psi_cm);
         current = listFindFront(merged_front_num, *head, NULL);
         current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         const double residual_after_psi_repair = target_mass - current_mass;
@@ -17291,7 +17307,7 @@ static double lgar_theta_mass_balance_correction_with_min_psi(
   return residual_cm;
 }
 
-extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties){
+static void lgar_theta_mass_balance_correction_with_max_psi(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties, double max_psi_cm){
   struct wetting_front *current;
   current = listFindFront(front_num, *head, NULL);
 
@@ -17319,7 +17335,8 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
 
   const double original_psi_cm = current->psi_cm;
   const double psi_dry_bound_cm =
-    fmax(PSI_UPPER_LIM, std::isfinite(original_psi_cm) ? original_psi_cm : 0.0);
+    fmin(fmax(PSI_UPPER_LIM, std::isfinite(original_psi_cm) ? original_psi_cm : 0.0),
+         fmax(0.0, std::isfinite(max_psi_cm) ? max_psi_cm : 0.0));
   const double mass_at_saturation =
     lgar_apply_theta_mass_balance_correction_psi(use_dry_over_wet, 0.0, current,
                                                  head, cum_layer_thickness_cm,
@@ -17410,6 +17427,12 @@ extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_
            prior_mass - lgar_calc_mass_bal(cum_layer_thickness_cm, *head),
            mass_at_saturation, mass_at_dry_limit, prior_mass);
   }
+}
+
+extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties){
+  lgar_theta_mass_balance_correction_with_max_psi(
+    use_dry_over_wet, front_num, prior_mass, head, cum_layer_thickness_cm,
+    soil_type, soil_properties, 1.E300);
 }
 
 #endif
