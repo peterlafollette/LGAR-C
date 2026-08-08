@@ -516,6 +516,9 @@ extern double lgarto_sync_mobile_groundwater_support_to_CR_storage(double target
 								   struct soil_properties_ *soil_properties,
 								   double *updated_groundwater_depth_cm,
 								   double *explicit_mass_change_cm);
+extern bool lgarto_reconcile_CR_sync_trial_boundaries(
+  double target_mass_cm, double *cum_layer_thickness_cm, int *soil_type,
+  struct wetting_front **head, struct soil_properties_ *soil_properties);
 extern double lgarto_rewet_receded_groundwater_zone(double previous_groundwater_depth_cm,
 						    double groundwater_depth_cm,
 						    int num_layers,

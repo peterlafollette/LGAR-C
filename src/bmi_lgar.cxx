@@ -892,7 +892,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
   auto sync_trial_is_usable = [&](double chain_storage_after_cm,
                                   double actual_chain_storage_change_cm,
                                   double explicit_mass_change_cm,
-                                  double trial_mass_after_cm) -> bool {
+                                  double trial_mass_after_cm,
+                                  bool boundaries_are_atomic) -> bool {
     const double explicit_chain_mismatch_tol_cm =
       fmax(1.0e-6, 1.0e-4 * fmax(1.0, target_CR_storage_cm));
     const bool near_zero_chain_change =
@@ -901,7 +902,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
       near_zero_chain_change &&
       fabs(explicit_mass_change_cm - actual_chain_storage_change_cm) >
         explicit_chain_mismatch_tol_cm;
-    return std::isfinite(actual_chain_storage_change_cm) &&
+    return boundaries_are_atomic &&
+           std::isfinite(actual_chain_storage_change_cm) &&
            std::isfinite(trial_mass_after_cm) &&
            fabs(chain_storage_after_cm - target_CR_storage_cm) <=
              storage_tol_cm &&
@@ -932,16 +934,26 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
       state->soil_properties,
       &updated_groundwater_depth_cm,
       &trial_explicit_mass_change_cm);
+  bool support_sync_is_finite = std::isfinite(actual_chain_storage_change_cm);
+  // Reconcile the disposable trial before it can replace the live list; a
+  // failed mass-aware boundary solve makes the whole CR trial unusable.
+  bool boundaries_are_atomic =
+    support_sync_is_finite && lgarto_reconcile_CR_sync_trial_boundaries(
+      mass_before_cm, cum_layer_thickness_cm, soil_type, &trial_head,
+      state->soil_properties);
   double chain_storage_after_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, trial_head,
                                             state->soil_properties);
   double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, trial_head);
+  actual_chain_storage_change_cm = chain_storage_after_cm - chain_storage_before_cm;
+  trial_explicit_mass_change_cm = mass_after_cm - mass_before_cm;
   bool sync_usable =
     sync_trial_is_usable(chain_storage_after_cm,
                          actual_chain_storage_change_cm,
                          trial_explicit_mass_change_cm,
-                         mass_after_cm);
+                         mass_after_cm,
+                         boundaries_are_atomic);
 
   if (!sync_usable) {
     listDelete(trial_head);
@@ -978,26 +990,40 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
         state->soil_properties,
         &updated_groundwater_depth_cm,
         &trial_explicit_mass_change_cm);
+    support_sync_is_finite = std::isfinite(actual_chain_storage_change_cm);
+    boundaries_are_atomic =
+      support_sync_is_finite && lgarto_reconcile_CR_sync_trial_boundaries(
+        mass_before_cm, cum_layer_thickness_cm, soil_type, &trial_head,
+        state->soil_properties);
     chain_storage_after_cm =
       lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                               soil_type, trial_head,
                                               state->soil_properties);
     mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, trial_head);
+    actual_chain_storage_change_cm = chain_storage_after_cm - chain_storage_before_cm;
+    trial_explicit_mass_change_cm = mass_after_cm - mass_before_cm;
     sync_usable =
       sync_trial_is_usable(chain_storage_after_cm,
                            actual_chain_storage_change_cm,
                            trial_explicit_mass_change_cm,
-                           mass_after_cm);
+                           mass_after_cm,
+                           boundaries_are_atomic);
   }
 
   const double live_chain_storage_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, state->head,
                                             state->soil_properties);
+  if (!sync_usable && !boundaries_are_atomic) {
+    // A rejected hydraulic trial must not leak support cleanup or proxy-depth
+    // changes into the live state.
+    listDelete(trial_head);
+    return 0.0;
+  }
   if (!sync_usable) {
     const double maintained_trial_tol_cm =
       fmax(1.0e-2, 1.0e-3 * fmax(1.0, target_CR_storage_cm));
-    if (live_chain_storage_cm <= storage_tol_cm &&
+    if (boundaries_are_atomic && live_chain_storage_cm <= storage_tol_cm &&
         chain_storage_before_cm > storage_tol_cm &&
         std::isfinite(chain_storage_after_cm) &&
         std::isfinite(mass_after_cm) &&

@@ -7645,6 +7645,58 @@ extern void lgar_assert_to_psi_monotonic_with_depth(struct wetting_front *head)
   }
 }
 
+extern bool lgarto_reconcile_CR_sync_trial_boundaries(
+  double target_mass_cm, double *cum_layer_thickness_cm, int *soil_type,
+  struct wetting_front **head, struct soil_properties_ *soil_properties)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL ||
+      soil_type == NULL || soil_properties == NULL ||
+      !std::isfinite(target_mass_cm)) {
+    return false;
+  }
+
+  bool reconciled = false;
+  const std::vector<struct wetting_front *> boundaries =
+    lgar_collect_boundary_upper_fronts(*head);
+  for (auto boundary = boundaries.rbegin(); boundary != boundaries.rend(); ++boundary) {
+    struct wetting_front *upper = *boundary;
+    if (!lgar_boundary_psi_snap_candidate(
+          upper, upper->next, soil_type, soil_properties)) {
+      continue;
+    }
+    const std::vector<struct wetting_front *> chain =
+      lgarto_boundary_snap_chain(*head, upper);
+    if (!lgarto_mass_aware_to_bottom_snap(
+          target_mass_cm, cum_layer_thickness_cm, soil_type,
+          soil_properties, head, chain)) {
+      return false;
+    }
+    reconciled = true;
+  }
+
+  if (!reconciled ||
+      std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) -
+                target_mass_cm) > MBAL_ITERATIVE_TOLERANCE) {
+    return !reconciled;
+  }
+
+  // A mass-preserving boundary solve is usable only if it does not create a
+  // dry-over-wet reversal elsewhere in the same TO/GW chain.
+  for (struct wetting_front *current = *head;
+       current != NULL && current->next != NULL; current = current->next) {
+    struct wetting_front *next = current->next;
+    if (current->is_WF_GW && next->is_WF_GW &&
+        current->layer_num == next->layer_num &&
+        next->depth_cm > current->depth_cm + 1.0e-10 &&
+        next->psi_cm > current->psi_cm +
+          lgar_psi_assertion_tolerance_cm(current->psi_cm, next->psi_cm) &&
+        !lgarto_same_layer_TO_reversal_is_surface_supported_bridge(*head, current)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 extern void lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(struct wetting_front *head)
 {
   const lgarto_surface_TO_support_ordering_state state =
