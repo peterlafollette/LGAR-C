@@ -7660,8 +7660,15 @@ extern bool lgarto_reconcile_CR_sync_trial_boundaries(
     lgar_collect_boundary_upper_fronts(*head);
   for (auto boundary = boundaries.rbegin(); boundary != boundaries.rend(); ++boundary) {
     struct wetting_front *upper = *boundary;
-    if (!lgar_boundary_psi_snap_candidate(
-          upper, upper->next, soil_type, soil_properties)) {
+    struct wetting_front *lower = upper->next;
+    const bool assertion_visible_mismatch =
+      std::fabs(upper->psi_cm - lower->psi_cm) >
+        lgar_boundary_roundtrip_psi_tolerance_cm(upper->psi_cm, lower->psi_cm) &&
+      upper->psi_cm > 0.1;
+    // CR support can replace a finite lower-chain psi with zero; reconcile
+    // every mismatch the final boundary invariant would reject.
+    if (!assertion_visible_mismatch && !lgar_boundary_psi_snap_candidate(
+          upper, lower, soil_type, soil_properties)) {
       continue;
     }
     const std::vector<struct wetting_front *> chain =

@@ -1632,6 +1632,25 @@ static double lgarto_limit_subtimestep_for_surface_front_contact(
   for (const wetting_front *current = head; current != NULL && current->next != NULL;
        current = current->next) {
     const wetting_front *next = current->next;
+    const wetting_front *support = next->next;
+    if (!current->is_WF_GW && !next->is_WF_GW && !current->to_bottom &&
+        !next->to_bottom && support != NULL && support->is_WF_GW &&
+        support->to_bottom && support->next == NULL &&
+        current->layer_num == next->layer_num && next->layer_num == support->layer_num &&
+        next->dzdt_cm_per_h > 0.0 && next->depth_cm < support->depth_cm &&
+        next->depth_cm + next->dzdt_cm_per_h * proposed_subtimestep_h > support->depth_cm &&
+        current->depth_cm + current->dzdt_cm_per_h * proposed_subtimestep_h > support->depth_cm) {
+      // Split before the mover caps the deeper surface front at terminal TO/GW support;
+      // otherwise its upstream neighbor can overtake the newly capped front in this step.
+      const double support_contact_h =
+        (support->depth_cm + LGARTO_EVENT_SPLIT_BOUNDARY_EPS_CM - next->depth_cm) /
+        next->dzdt_cm_per_h;
+      if (support_contact_h > 0.0 && support_contact_h < limited_subtimestep_h) {
+        limited_subtimestep_h = support_contact_h;
+        if (limiting_front_num != NULL) *limiting_front_num = next->front_num;
+        if (limiting_next_front_num != NULL) *limiting_next_front_num = support->front_num;
+      }
+    }
     if (current->is_WF_GW || next->is_WF_GW || current->to_bottom || next->to_bottom ||
         current->layer_num != next->layer_num || next->next == NULL ||
         next->depth_cm <= current->depth_cm) {
@@ -2162,14 +2181,15 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       limiting_current_gap_cm <= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_MAX_GAP_CM;
     const int pair_shift = limiting_current->front_num - *repeat_front_num;
     // Surface creation can renumber one stalled three-front packet as
-    // (i,i+1) then (i+1,i+2); count only a direction-reversing alternation.
+    // (i,i+1) then (i+1,i+2); count only a direction-reversing alternation
+    // with at least one unsaturated endpoint, excluding all-psi=0 CR supports.
     const bool alternating_adjacent_triplet =
       repeat_pair_shift != NULL &&
       *repeat_layer_num == limiting_current->layer_num &&
       std::abs(pair_shift) == 1 && *repeat_pair_shift == -pair_shift &&
       *repeat_next_front_num - *repeat_front_num == 1 &&
       limiting_next->front_num - limiting_current->front_num == 1 &&
-      limiting_current->psi_cm > SMALL_EPS && limiting_next->psi_cm > SMALL_EPS;
+      (limiting_current->psi_cm > SMALL_EPS || limiting_next->psi_cm > SMALL_EPS);
     if (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet) {
       (*repeat_count)++;
     }
