@@ -21,7 +21,8 @@ A detailed description of the parameters for model configuration (i.e., initiali
 | field_capacity_psi | double (scalar) | >0 and <wilting_point_psi | cm | state variable | - | capillary head corresponding to volumetric water content at which gravity drainage becomes slower, used in computing AET. Suggested value is 340.9 cm for most soils, corresponding to 1/3 atm, and 103.3 cm for sands, corresponding to 1/10 atm. |
 | use_closed_form_G | bool | true or false | - | - | - | determines whether the numeric integral or closed form for G is used; a value of true will use the closed form. This defaults to false. |
 | giuh_ordinates | double (1D array)| - | - | state parameter | - | GIUH ordinates (for giuh based surface runoff) |
-| verbosity | string | high, low, none | - | debugging | - | controls IO (screen outputs and writing to disk) |
+| verbosity | string | high, low, none | - | debugging | - | controls diagnostic screen output |
+| standalone_output_mode | string | fluxes, full | - | standalone output | - | Controls CSV output from `lasam_standalone`. The default `fluxes` mode writes only `data_variables.csv`. The `full` mode additionally writes `data_layers.csv`, `data_non_vadose_state.csv`, and `data_giuh_state.csv` at every forcing step for restart and wetting-front diagnostics. This setting does not affect BMI use inside NextGen. |
 | sft_coupled | Boolean | true, false | - | model coupling | impacts hydraulic conductivity | couples CASAM to SFT. Coupling to SFT reduces hydraulic conducitivity, and hence infiltration, when soil is frozen|
 | soil_z | double (1D array) | - | cm | spatial resolution | - | vertical resolution of the soil column (computational domain of the SFT model) |
 | calib_params | Boolean | true, false | - | calibratable params flag | impacts soil properties | If set to true,carious parameters can be calibrated. Defualt is false.|

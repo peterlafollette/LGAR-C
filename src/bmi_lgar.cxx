@@ -2200,7 +2200,9 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
     *repeat_next_front_num = limiting_next->front_num;
     *repeat_layer_num = limiting_current->layer_num;
     if (repeat_pair_shift != NULL) {
-      *repeat_pair_shift = std::abs(pair_shift) == 1 ? pair_shift : 0;
+      // A repeated phase is neutral; retain its last direction so A,A,B remains one packet.
+      if (std::abs(pair_shift) == 1) *repeat_pair_shift = pair_shift;
+      else if (!same_pair) *repeat_pair_shift = 0;
     }
 
     // A correction can recreate the exact numbered pair with a wider gap; retain

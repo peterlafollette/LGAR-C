@@ -26,6 +26,13 @@ std::string GetForcingFile(std::string config_file);
 // module read forcings (precipitation and PET)
 void ReadForcingData(std::string config_file, std::vector<std::string>& time, std::vector<double>& precip, std::vector<double>& pet);
 
+enum class StandaloneOutputMode {
+  Fluxes,
+  Full
+};
+
+StandaloneOutputMode ReadStandaloneOutputMode(const std::string& config_file);
+
 
 #define SUCCESS 0
 
@@ -34,14 +41,15 @@ int main(int argc, char *argv[])
 
   BmiLGAR model_state;
 
-  bool is_IO_supress = false; // if true no output files will be written
-
   if (argc != 2) {
     printf("Usage: ./build/xlgar CONFIGURATION_FILE \n");
     printf("Run the LASAM (Lumped Arid/semi-aric Model through its BMI with a configuration file.\n");
-    printf("Outputs are written to files `variables_data.csv and layers_data.csv`.\n");
+    printf("Fluxes are written to `data_variables.csv`. Set standalone_output_mode=full to also write restart state files.\n");
     return SUCCESS;
   }
+
+  const StandaloneOutputMode output_mode = ReadStandaloneOutputMode(argv[1]);
+  const bool write_full_state = output_mode == StandaloneOutputMode::Full;
 
   clock_t start_time, end_time;
   double elapsed;
@@ -52,12 +60,9 @@ int main(int argc, char *argv[])
 
   std::string var_name_precip = "precipitation_rate";
   std::string var_name_pet    = "potential_evapotranspiration_rate";
-  std::string var_name_wf     = "soil_moisture_wetting_fronts";
-  std::string var_name_thickness_wf = "soil_depth_wetting_fronts";
 
   int num_output_var = 14;
   std::vector<std::string> output_var_names(num_output_var);
-  std::vector<double> output_var_data(num_output_var);
 
   output_var_names[0]  = "precipitation";
   output_var_names[1]  = "potential_evapotranspiration";
@@ -90,9 +95,11 @@ int main(int argc, char *argv[])
 
   assert (nsteps <= int(PET.size()) ); // assertion to ensure that nsteps are less or equal than the input data
   
-  if (verbosity.compare("high") == 0 && !is_IO_supress) {
+  if (verbosity.compare("high") == 0) {
     std::cout<<"Variables are written to file           : \'data_variables.csv\' \n";
-    std::cout<<"Wetting fronts state is written to file : \'data_layers.csv\' \n";
+    if (write_full_state) {
+      std::cout<<"Wetting fronts state is written to file : \'data_layers.csv\' \n";
+    }
   }
 
   FILE *outdata_fptr = NULL;
@@ -100,14 +107,23 @@ int main(int argc, char *argv[])
   FILE *outnonvadose_fptr = NULL;
   FILE *outgiuh_fptr = NULL;
 
-  if (!is_IO_supress) {
-    outdata_fptr = fopen("data_variables.csv", "w");  // write output variables (e.g. infiltration, storage etc.) to this file pointer
+  outdata_fptr = fopen("data_variables.csv", "w");  // write output variables (e.g. infiltration, storage etc.) to this file pointer
+  if (!outdata_fptr) {
+    throw std::runtime_error("Could not open data_variables.csv for writing");
+  }
+
+  if (write_full_state) {
     outlayer_fptr = fopen("data_layers.csv", "w");    // write output layers to this file pointer
     outnonvadose_fptr = fopen("data_non_vadose_state.csv", "w"); //writes reservoir states and other states that are not realted to the vadose zone but required for a restart 
     outgiuh_fptr = fopen("data_giuh_state.csv", "w"); // writes the GIUH queue
+    if (!outlayer_fptr || !outnonvadose_fptr || !outgiuh_fptr) {
+      throw std::runtime_error("Could not open standalone restart state files for writing");
+    }
+  }
 
-    // write heading (variable names)
-    fprintf(outdata_fptr,"Time,");
+  // write heading (variable names)
+  fprintf(outdata_fptr,"Time,");
+  if (write_full_state) {
     if (model_state.get_model()->lgar_bmi_params.mobile_groundwater_level) {
       fprintf(outnonvadose_fptr,
           "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm,groundwater_depth_cm,explicit_gw_storage_cm\n");
@@ -116,14 +132,14 @@ int main(int argc, char *argv[])
       fprintf(outnonvadose_fptr,
           "Time,CR_fast_storage_cm,CR_slow_storage_cm,volon_timestep_cm,runoff_in_prev_step,precip_previous_timestep_cm\n");
     }
-    for (int j = 0; j < num_output_var; j++) {
-      fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
-      if (j == num_output_var-1)
-	fprintf(outdata_fptr,"\n");
-      else
-      fprintf(outdata_fptr,",");
-    }
+  }
 
+  for (int j = 0; j < num_output_var; j++) {
+    fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
+    if (j == num_output_var-1)
+      fprintf(outdata_fptr,"\n");
+    else
+      fprintf(outdata_fptr,",");
   }
 
   // model timestep and forcing timestep are read from a config file in lgar.cxx
@@ -143,28 +159,21 @@ int main(int argc, char *argv[])
 
     model_state.Update(); // Update model
 
-    if (!is_IO_supress) {
-      int num_wetting_fronts =  model_state.get_model()->lgar_bmi_params.num_wetting_fronts;
+    // write bmi output variables to file
+    fprintf(outdata_fptr,"%s,",time[i].c_str());
 
-      double *soil_moisture_wetting_front = new double[num_wetting_fronts];
-      double *soil_thickness_wetting_front = new double[num_wetting_fronts];
+    for (int j = 0; j < num_output_var; j++) {
+      std::string name = output_var_names[j];
+      double value = 0.0;
+      model_state.GetValue(name,&value);
+      fprintf(outdata_fptr,"%6.15f",value);
+      if (j == num_output_var-1)
+        fprintf(outdata_fptr,"\n");
+      else
+        fprintf(outdata_fptr,",");
+    }
 
-      model_state.GetValue(var_name_wf,&soil_moisture_wetting_front[0]);
-      model_state.GetValue(var_name_thickness_wf,&soil_thickness_wetting_front[0]);
-
-      // write bmi output variables to file
-      fprintf(outdata_fptr,"%s,",time[i].c_str());
-
-      for (int j = 0; j < num_output_var; j++) {
-	std::string name = output_var_names[j];
-	double value = 0.0;
-	model_state.GetValue(name,&value);
-	fprintf(outdata_fptr,"%6.15f",value);
-	if (j == num_output_var-1)
-	  fprintf(outdata_fptr,"\n");
-	else
-	  fprintf(outdata_fptr,",");
-      }
+    if (write_full_state) {
       fprintf(outnonvadose_fptr, "%s,", time[i].c_str());
       write_non_vadose_state(outnonvadose_fptr, model_state.get_model());
 
@@ -178,20 +187,16 @@ int main(int argc, char *argv[])
       // write layers data to file
       fprintf(outlayer_fptr,"# Timestep = %d, %s \n", i, time[i].c_str());
       write_state(outlayer_fptr, model_state.get_model()->head);
-      delete [] soil_moisture_wetting_front;
-      delete [] soil_thickness_wetting_front;
     }
 
   }
 
   // do final mass balance ( inside Finalize() ) and finish the simulation
   model_state.Finalize();
-  if (outdata_fptr) {
-    fclose(outdata_fptr);
-    fclose(outlayer_fptr);
-    fclose(outnonvadose_fptr);
-    fclose(outgiuh_fptr);
-  }
+  if (outdata_fptr) fclose(outdata_fptr);
+  if (outlayer_fptr) fclose(outlayer_fptr);
+  if (outnonvadose_fptr) fclose(outnonvadose_fptr);
+  if (outgiuh_fptr) fclose(outgiuh_fptr);
 
   end_time = clock();
 
@@ -201,6 +206,46 @@ int main(int argc, char *argv[])
   std::cout<<"Time                        =   "<< elapsed <<" sec \n";
 
   return SUCCESS;
+}
+
+
+std::string TrimConfigToken(const std::string& token)
+{
+  const size_t first = token.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return "";
+  const size_t last = token.find_last_not_of(" \t\r\n");
+  return token.substr(first, last - first + 1);
+}
+
+
+StandaloneOutputMode
+ReadStandaloneOutputMode(const std::string& config_file)
+{
+  std::ifstream file(config_file);
+  if (!file) {
+    throw std::runtime_error(config_file + " does not exist");
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    const size_t comment = line.find('#');
+    if (comment != std::string::npos) line.erase(comment);
+
+    const size_t delimiter = line.find('=');
+    if (delimiter == std::string::npos) continue;
+
+    const std::string key = TrimConfigToken(line.substr(0, delimiter));
+    if (key != "standalone_output_mode") continue;
+
+    const std::string value = TrimConfigToken(line.substr(delimiter + 1));
+    if (value == "fluxes") return StandaloneOutputMode::Fluxes;
+    if (value == "full") return StandaloneOutputMode::Full;
+
+    throw std::runtime_error(
+        "Invalid standalone_output_mode '" + value + "'; expected fluxes or full");
+  }
+
+  return StandaloneOutputMode::Fluxes;
 }
 
 
