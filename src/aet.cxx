@@ -1,6 +1,7 @@
 #ifndef AET_CXX_INCLUDE
 #define AET_CXX_INCLUDE
 
+#include <limits>
 #include "../include/all.hxx"
 
 static constexpr double ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM = 1.0e-10;
