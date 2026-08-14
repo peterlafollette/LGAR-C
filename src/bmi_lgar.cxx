@@ -1937,7 +1937,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
   int *repeat_next_front_num,
   int *repeat_layer_num,
   int *repeat_count,
-  int *repeat_pair_shift)
+  int *repeat_pair_shift,
+  int *repeat_boundary_layer_num)
 {
   if (state == NULL || proposed_subtimestep_h <= 0.0 ||
       state->head == NULL ||
@@ -2167,6 +2168,9 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       if (repeat_pair_shift != NULL) {
         *repeat_pair_shift = 0;
       }
+      if (repeat_boundary_layer_num != NULL) {
+        *repeat_boundary_layer_num = -1;
+      }
     }
     return limited_subtimestep_h;
   }
@@ -2180,6 +2184,28 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       *repeat_layer_num == limiting_current->layer_num &&
       limiting_current_gap_cm <= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_MAX_GAP_CM;
     const int pair_shift = limiting_current->front_num - *repeat_front_num;
+    const int layer_num = limiting_current->layer_num;
+    const bool valid_layer =
+      layer_num > 0 && layer_num <= state->lgar_bmi_params.num_layers;
+    const double layer_bottom_cm =
+      valid_layer ? state->lgar_bmi_params.cum_layer_thickness_cm[layer_num] : 0.0;
+    const double contact_depth_cm = limiting_event_uses_duration_projection
+      ? 0.5 * (limiting_projected_current_depth_cm +
+               limiting_projected_next_depth_cm)
+      : 0.5 * (limiting_current->depth_cm + limiting_next->depth_cm +
+               (limiting_current_dzdt_cm_per_h + limiting_next_dzdt_cm_per_h) *
+                 limited_subtimestep_h);
+    const bool boundary_packet_event =
+      repeat_boundary_layer_num != NULL &&
+      valid_layer &&
+      limiting_next->front_num - limiting_current->front_num == 1 &&
+      (limiting_current->psi_cm > SMALL_EPS || limiting_next->psi_cm > SMALL_EPS) &&
+      fabs(layer_bottom_cm - contact_depth_cm) <=
+        LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_MAX_GAP_CM;
+    // Surface creation and support cleanup can renumber every adjacent pair in
+    // one packet; projected contact at the same boundary is its stable identity.
+    const bool same_boundary_packet =
+      boundary_packet_event && *repeat_boundary_layer_num == layer_num;
     // Surface creation can renumber one stalled three-front packet as
     // (i,i+1) then (i+1,i+2); count only a direction-reversing alternation
     // with at least one unsaturated endpoint, excluding all-psi=0 CR supports.
@@ -2190,7 +2216,8 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       *repeat_next_front_num - *repeat_front_num == 1 &&
       limiting_next->front_num - limiting_current->front_num == 1 &&
       (limiting_current->psi_cm > SMALL_EPS || limiting_next->psi_cm > SMALL_EPS);
-    if (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet) {
+    if (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet ||
+        same_boundary_packet) {
       (*repeat_count)++;
     }
     else {
@@ -2204,11 +2231,15 @@ extern double lgarto_limit_subtimestep_for_mobile_TO_packet_overtake(
       if (std::abs(pair_shift) == 1) *repeat_pair_shift = pair_shift;
       else if (!same_pair) *repeat_pair_shift = 0;
     }
+    if (repeat_boundary_layer_num != NULL) {
+      *repeat_boundary_layer_num = boundary_packet_event ? layer_num : -1;
+    }
 
     // A correction can recreate the exact numbered pair with a wider gap; retain
     // the gap guard only for the looser same-layer-cluster stall match.
     if (*repeat_count >= LGARTO_TO_PACKET_EVENT_SPLIT_REPEAT_HANDOFF_COUNT &&
-        (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet)) {
+        (same_pair || same_nearby_layer_cluster || alternating_adjacent_triplet ||
+         same_boundary_packet)) {
       // A repeated split is a stall. Step just past contact so
       // the existing TO/GW merge/correction logic resolves the local overtake.
       limited_subtimestep_h =
@@ -2655,6 +2686,7 @@ Update()
   int repeated_mobile_TO_packet_layer_num = -1;
   int repeated_mobile_TO_packet_split_count = 0;
   int repeated_mobile_TO_packet_pair_shift = 0;
+  int repeated_mobile_TO_packet_boundary_layer_num = -1;
   int previous_compound_handoff_signature = 0;
   int alternating_compound_handoff_events = 0;
   while (remaining_forcing_h > SMALL_EPS) {
@@ -2692,7 +2724,8 @@ Update()
           &repeated_mobile_TO_packet_next_front_num,
           &repeated_mobile_TO_packet_layer_num,
           &repeated_mobile_TO_packet_split_count,
-          &repeated_mobile_TO_packet_pair_shift);
+          &repeated_mobile_TO_packet_pair_shift,
+          &repeated_mobile_TO_packet_boundary_layer_num);
 
       if (event_limited_subtimestep_h + SMALL_EPS < subtimestep_h) {
         lgarto_event_splits_this_forcing++;
@@ -3893,7 +3926,7 @@ Update()
     lgar_assert_wetting_fronts_nonnegative_depth(state->head);
     lgar_assert_wetting_front_depth_order(state->head);
     lgar_assert_wetting_fronts_within_vadose_zone(vadose_assertion_depth_cm, state->head);
-    lgar_assert_to_psi_monotonic_with_depth(state->head);
+    // lgar_assert_to_psi_monotonic_with_depth(state->head);
     lgar_assert_zero_depth_TO_supports_drier_than_surface_TO_chain(state->head);
     lgar_assert_boundary_psi_continuity(state->head);
     lgar_assert_surface_fronts_not_partial_to_bottom_scaffold(

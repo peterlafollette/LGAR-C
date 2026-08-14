@@ -10382,9 +10382,13 @@ static bool lgarto_find_mobile_groundwater_storage_pair(struct wetting_front *he
 
   double deepest_pair_depth_cm = -HUGE_VAL;
   bool found_pair = false;
+  bool found_dry_vadose_pair = false;
   for (struct wetting_front *current = head; current != NULL && current->next != NULL;
        current = current->next) {
     struct wetting_front *next = current->next;
+    const bool dry_vadose_pair =
+      std::isfinite(current->psi_cm) &&
+      current->psi_cm > BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM;
     if (current->is_WF_GW && next->is_WF_GW &&
         !current->to_bottom && !next->to_bottom &&
         // Zero-depth TO/GW metadata is not a physical mobile-GW storage pair.
@@ -10392,9 +10396,14 @@ static bool lgarto_find_mobile_groundwater_storage_pair(struct wetting_front *he
         current->layer_num == next->layer_num &&
         std::fabs(current->depth_cm - next->depth_cm) <= depth_tol_cm &&
         next->psi_cm <= BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM &&
-        current->depth_cm > deepest_pair_depth_cm + depth_tol_cm) {
+        ((!found_dry_vadose_pair && dry_vadose_pair) ||
+         (dry_vadose_pair == found_dry_vadose_pair &&
+          current->depth_cm > deepest_pair_depth_cm + depth_tol_cm))) {
+      // A positive-psi vadose member identifies the active pair more reliably
+      // than nearby saturated contacts left by a rising-GW surface promotion.
       deepest_pair_depth_cm = current->depth_cm;
       found_pair = true;
+      found_dry_vadose_pair = dry_vadose_pair;
       if (vadose_side_front != NULL) {
         *vadose_side_front = current;
       }
