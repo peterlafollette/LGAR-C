@@ -377,8 +377,9 @@ extern double lgarto_explicit_groundwater_storage_cm(int num_layers, double *cum
                                                      int *soil_type, struct wetting_front *head,
                                                      struct soil_properties_ *soil_properties);
 extern double lgarto_mobile_groundwater_CR_storage_cm(int num_layers, double *cum_layer_thickness_cm,
-						      int *soil_type, struct wetting_front *head,
-						      struct soil_properties_ *soil_properties);
+							      int *soil_type, struct wetting_front *head,
+							      struct soil_properties_ *soil_properties,
+							      double expected_pair_depth_cm = NAN);
 extern void lgarto_assert_mobile_groundwater_CR_chain_consistency(double target_CR_storage_cm,
                                                                   double groundwater_depth_cm,
                                                                   int num_layers,
@@ -721,7 +722,8 @@ extern double lgar_theta_mass_balance(int layer_num, int soil_num, double psi_cm
 				      double prior_mass, double precip_mass_to_add, double *AET_demand_cm, double *delta_theta, double *layer_thickness_cm,
 				      int *soil_type, struct soil_properties_ *soil_properties,
 				      bool allow_legacy_aet_bookkeeping_adjustment,
-				      double psi_upper_limit_cm = 1.E7);
+				      double psi_upper_limit_cm = 1.E7,
+				      double *solved_psi_cm = NULL);
 
 // computes updated theta (soil moisture content) after fixing a dry over wet front or after layer boundary crossing to address edge cases 
 extern void lgar_theta_mass_balance_correction(bool use_dry_over_wet, int front_num, double prior_mass, struct wetting_front** head, double *cum_layer_thickness_cm, int *soil_type, struct soil_properties_ *soil_properties);

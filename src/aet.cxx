@@ -1417,6 +1417,10 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
     calc_theta_from_h(TO_AET_MAX_PSI_CM, current_soil.vg_alpha_per_cm, current_soil.vg_m,
                       current_soil.vg_n, current_soil.theta_e, current_soil.theta_r));
   const double mass_before = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  struct SavedFrontState { wetting_front *front; double psi_cm, theta, K_cm_per_h; };
+  std::vector<SavedFrontState> saved_states;
+  for (wetting_front *front = *head; front != NULL; front = front->next)
+    saved_states.push_back({front, front->psi_cm, front->theta, front->K_cm_per_h});
 
   if (current->layer_num == 1) {
     if (current->depth_cm > 0.0) {
@@ -1466,20 +1470,33 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
     prior_mass -= missing_to_aet_cm;
 
     double aet_demand_cm = missing_to_aet_cm;
-    const double theta_new =
+    double solved_psi_cm = current->psi_cm;
+    (void)
       lgar_theta_mass_balance(layer_num, soil_num, current->psi_cm, new_mass, prior_mass, 0.0,
                               &aet_demand_cm, delta_thetas, delta_thickness, soil_type,
-                              soil_properties, true);
-    current->theta =
-      fmax(theta_floor, fmin(theta_new, soil_properties[soil_num].theta_e));
-    refresh_front_state_from_theta(current, soil_type, frozen_factor, soil_properties);
+                              soil_properties, true, fmax(TO_AET_MAX_PSI_CM, current->psi_cm),
+                              &solved_psi_cm);
+    // Preserve the shared psi when this layer's saturated theta cannot encode it uniquely.
+    current->psi_cm = std::isfinite(solved_psi_cm) ? fmax(current->psi_cm, solved_psi_cm) : current->psi_cm;
+    refresh_front_state_from_psi(current, soil_type, frozen_factor, soil_properties);
 
     free(delta_thetas);
     free(delta_thickness);
   }
 
   propagate_surface_chain_psi_from_below(soil_type, frozen_factor, soil_properties, head);
-  return fmax(0.0, mass_before - lgar_calc_mass_bal(cum_layer_thickness_cm, *head));
+  const double extracted_cm = mass_before - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (extracted_cm <= ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM ||
+      extracted_cm > missing_to_aet_cm + ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM) {
+    // A rejected surface trial must not leave a wetter or over-extracted boundary chain live.
+    for (const SavedFrontState &saved : saved_states) {
+      saved.front->psi_cm = saved.psi_cm;
+      saved.front->theta = saved.theta;
+      saved.front->K_cm_per_h = saved.K_cm_per_h;
+    }
+    return 0.0;
+  }
+  return extracted_cm;
 }
 
 static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_front,

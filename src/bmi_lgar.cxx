@@ -919,7 +919,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
   double chain_storage_before_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, trial_head,
-                                            state->soil_properties);
+                                            state->soil_properties,
+                                            current_groundwater_depth_cm);
   double updated_groundwater_depth_cm = current_groundwater_depth_cm;
   double trial_explicit_mass_change_cm = 0.0;
   double actual_chain_storage_change_cm =
@@ -944,7 +945,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
   double chain_storage_after_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, trial_head,
-                                            state->soil_properties);
+                                            state->soil_properties,
+                                            updated_groundwater_depth_cm);
   double mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, trial_head);
   actual_chain_storage_change_cm = chain_storage_after_cm - chain_storage_before_cm;
   trial_explicit_mass_change_cm = mass_after_cm - mass_before_cm;
@@ -975,7 +977,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
     chain_storage_before_cm =
       lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                               soil_type, trial_head,
-                                              state->soil_properties);
+                                              state->soil_properties,
+                                              current_groundwater_depth_cm);
     updated_groundwater_depth_cm = current_groundwater_depth_cm;
     trial_explicit_mass_change_cm = 0.0;
     actual_chain_storage_change_cm =
@@ -998,7 +1001,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
     chain_storage_after_cm =
       lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                               soil_type, trial_head,
-                                              state->soil_properties);
+                                              state->soil_properties,
+                                              updated_groundwater_depth_cm);
     mass_after_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, trial_head);
     actual_chain_storage_change_cm = chain_storage_after_cm - chain_storage_before_cm;
     trial_explicit_mass_change_cm = mass_after_cm - mass_before_cm;
@@ -1013,7 +1017,8 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
   const double live_chain_storage_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, state->head,
-                                            state->soil_properties);
+                                            state->soil_properties,
+                                            current_groundwater_depth_cm);
   if (!sync_usable && !boundaries_are_atomic) {
     // A rejected hydraulic trial must not leak support cleanup or proxy-depth
     // changes into the live state.
