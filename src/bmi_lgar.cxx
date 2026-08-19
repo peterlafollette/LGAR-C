@@ -2366,6 +2366,7 @@ static int lgarto_compound_surface_TO_handoff_boundary_layer(
 BmiLGAR::~BmiLGAR(){
   delete [] giuh_ordinates;
   delete [] giuh_runoff_queue;
+  delete [] dual_scratch_giuh_runoff_queue;
 }
 
 /* The `head` pointer stores the address in memory of the first member of the linked list containing
@@ -2405,6 +2406,109 @@ Initialize (std::string config_file)
     }
   }
 
+  if (state->lgar_bmi_params.dual_perm) {
+    InitializeDualPermeabilityRuntime();
+  }
+
+}
+
+static lgar_mass_balance_variables lgar_initial_domain_mass_balance(
+  double initial_storage_cm)
+{
+  lgar_mass_balance_variables mass_balance = {};
+  mass_balance.volstart_timestep_cm = initial_storage_cm;
+  mass_balance.volend_timestep_cm = initial_storage_cm;
+  mass_balance.volstart_cm = initial_storage_cm;
+  mass_balance.volend_cm = initial_storage_cm;
+  return mass_balance;
+}
+
+void BmiLGAR::InitializeDualPermeabilityRuntime()
+{
+  const lgar_bmi_parameters& params = state->lgar_bmi_params;
+  if (params.is_invalid_soil_type || params.sft_coupled ||
+      params.calib_params_flag || params.PET_affects_precip ||
+      params.lower_bdy_flux_to_CR || params.mobile_groundwater_level ||
+      params.lateral_flow_enabled || params.frac_to_CR > 0.0 ||
+      params.initial_CR_fast_storage_cm > 0.0 ||
+      params.initial_CR_slow_storage_cm > 0.0) {
+    throw std::runtime_error(
+      "dual_perm Update does not yet support invalid-soil bypass, calibration, SFT, "
+      "PET-precipitation subtraction, conceptual reservoirs, mobile groundwater, "
+      "simple preferential flow, or lateral flow.");
+  }
+
+  bool exchange_enabled = false;
+  for (int layer = 1; layer <= params.num_layers; layer++) {
+    const int soil = params.layer_soil_type[layer];
+    const double A_Gamma =
+      state->mass_transfer_soil_properties[soil].A_Gamma_per_cm_h;
+    if (!std::isfinite(A_Gamma) || A_Gamma < 0.0) {
+      throw std::runtime_error("dual_perm requires finite, nonnegative A_Gamma values.");
+    }
+    exchange_enabled = exchange_enabled || A_Gamma > 0.0;
+  }
+  // Keep dual-LGARTO on the established surface-routing path while its TO
+  // profiles use the same conservative exchange operator as dual-LGAR.
+  if (params.TO_enabled && params.dual_surface_capacity_limited) {
+    throw std::runtime_error(
+      "dual-permeability LGARTO currently requires "
+      "dual_surface_boundary=legacy_handoff.");
+  }
+  if (exchange_enabled &&
+      std::fabs(params.forcing_resolution_h - params.timestep_h) > 1.0e-12) {
+    throw std::runtime_error(
+      "Exchange-enabled dual_perm currently requires timestep=forcing_resolution "
+      "so the matrix and fracture states exchange at every hydrologic step.");
+  }
+
+  const double fracture_fraction = params.ratio_fracture_vol_to_total_vol;
+  const double matrix_storage_cm =
+    lgar_calc_mass_bal(params.cum_layer_thickness_cm, state->head);
+  const double fracture_storage_cm =
+    lgar_calc_mass_bal(params.cum_layer_thickness_cm, state->head_frac);
+
+  dual_matrix_params = params;
+  dual_matrix_params.dual_perm = false;
+  dual_matrix_mass_balance = lgar_initial_domain_mass_balance(matrix_storage_cm);
+
+  dual_fracture_state = new model_state;
+  *dual_fracture_state = *state;
+  dual_fracture_state->head = state->head_frac;
+  dual_fracture_state->state_previous = NULL;
+  dual_fracture_state->head_frac = NULL;
+  dual_fracture_state->state_previous_frac = NULL;
+  dual_fracture_state->soil_properties = state->soil_properties_frac;
+  dual_fracture_state->soil_properties_frac = NULL;
+  dual_fracture_state->mass_transfer_soil_properties = NULL;
+  dual_fracture_state->lgar_bmi_params.dual_perm = false;
+  dual_fracture_state->lgar_bmi_params.soil_depth_wetting_fronts =
+    new double[dual_fracture_state->lgar_bmi_params.num_wetting_fronts];
+  dual_fracture_state->lgar_bmi_params.soil_moisture_wetting_fronts =
+    new double[dual_fracture_state->lgar_bmi_params.num_wetting_fronts];
+  dual_fracture_state->lgar_bmi_input_params = new lgar_bmi_input_parameters;
+  *dual_fracture_state->lgar_bmi_input_params = *state->lgar_bmi_input_params;
+  dual_fracture_state->lgar_mass_balance =
+    lgar_initial_domain_mass_balance(fracture_storage_cm);
+
+  wetting_front *front = dual_fracture_state->head;
+  for (int i = 0; i < dual_fracture_state->lgar_bmi_params.num_wetting_fronts; i++) {
+    dual_fracture_state->lgar_bmi_params.soil_depth_wetting_fronts[i] =
+      front->depth_cm * dual_fracture_state->units.cm_to_m;
+    dual_fracture_state->lgar_bmi_params.soil_moisture_wetting_fronts[i] = front->theta;
+    front = front->next;
+  }
+
+  dual_scratch_giuh_runoff_queue = new double[num_giuh_ordinates + 1]();
+  dual_cumulative_handoff_cm = 0.0;
+  dual_cumulative_exchange_cm = 0.0;
+  dual_runtime_initialized = true;
+
+  // Keep the public state as a total-area ledger while each solver retains an
+  // unweighted local-domain ledger.
+  state->lgar_mass_balance = lgar_initial_domain_mass_balance(
+    (1.0 - fracture_fraction) * matrix_storage_cm +
+    fracture_fraction * fracture_storage_cm);
 }
 
 /**
@@ -2428,6 +2532,369 @@ void BmiLGAR::realloc_soil(){
 void BmiLGAR::
 Update()
 {
+  if (dual_runtime_initialized) {
+    UpdateDualPermeabilityLGAR();
+    return;
+  }
+
+  UpdateSingleDomain();
+}
+
+static double lgar_weighted_domain_value(double matrix_value,
+                                         double fracture_value,
+                                         double fracture_fraction)
+{
+  return (1.0 - fracture_fraction) * matrix_value +
+         fracture_fraction * fracture_value;
+}
+
+static void lgar_refresh_domain_bmi_outputs(struct model_state *domain)
+{
+  domain->lgar_bmi_params.num_wetting_fronts = listLength(domain->head);
+  delete [] domain->lgar_bmi_params.soil_depth_wetting_fronts;
+  delete [] domain->lgar_bmi_params.soil_moisture_wetting_fronts;
+  domain->lgar_bmi_params.soil_depth_wetting_fronts =
+    new double[domain->lgar_bmi_params.num_wetting_fronts];
+  domain->lgar_bmi_params.soil_moisture_wetting_fronts =
+    new double[domain->lgar_bmi_params.num_wetting_fronts];
+  struct wetting_front *front = domain->head;
+  for (int index = 0; index < domain->lgar_bmi_params.num_wetting_fronts; index++) {
+    domain->lgar_bmi_params.soil_depth_wetting_fronts[index] =
+      front->depth_cm * domain->units.cm_to_m;
+    domain->lgar_bmi_params.soil_moisture_wetting_fronts[index] = front->theta;
+    front = front->next;
+  }
+}
+
+static void lgar_refresh_domain_conductivity(struct model_state *domain)
+{
+  for (struct wetting_front *front = domain->head;
+       front != NULL; front = front->next) {
+    const int soil = domain->lgar_bmi_params.layer_soil_type[front->layer_num];
+    const double Se = fmax(0.0, fmin(1.0, calc_Se_from_theta(
+      front->theta, domain->soil_properties[soil].theta_e,
+      domain->soil_properties[soil].theta_r)));
+    front->K_cm_per_h = calc_K_from_Se(
+      Se, domain->soil_properties[soil].Ksat_cm_per_h,
+      domain->soil_properties[soil].vg_m);
+  }
+}
+
+static double lgar_dual_surface_capacity_cm(struct model_state *domain,
+                                            double local_supply_cm,
+                                            double timestep_h)
+{
+  if (local_supply_cm <= 0.0) {
+    return 0.0;
+  }
+
+  const lgar_bmi_parameters& params = domain->lgar_bmi_params;
+  const int top_soil = params.layer_soil_type[1];
+  // Before a surface front exists, the normal LGAR update can create one and
+  // accept the supplied water; lgar_insert_water alone only sees Ksat here.
+  if (listLength(domain->head) == params.num_layers &&
+      domain->head->theta < domain->soil_properties[top_soil].theta_e - 1.0e-12) {
+    return local_supply_cm;
+  }
+
+  double ponded_depth_cm = local_supply_cm;
+  double accepted_cm = 0.0;
+  (void) lgar_insert_water(
+    params.use_closed_form_G, params.nint, timestep_h, 0.0, 0.0,
+    &ponded_depth_cm, &accepted_cm, local_supply_cm / timestep_h,
+    wetting_front_free_drainage(domain->head), params.num_layers, 0.0,
+    params.layer_soil_type, params.cum_layer_thickness_cm,
+    params.frozen_factor, domain->head, domain->soil_properties,
+    NULL, NULL, NULL, false);
+  return fmax(0.0, fmin(local_supply_cm, accepted_cm));
+}
+
+void BmiLGAR::UpdateDualPermeabilityLGAR()
+{
+  if (!dual_runtime_initialized || dual_fracture_state == NULL) {
+    throw std::runtime_error("dual_perm runtime state was not initialized.");
+  }
+
+  model_state *matrix_state = state;
+  const lgar_bmi_parameters public_params = matrix_state->lgar_bmi_params;
+  const lgar_mass_balance_variables public_mass_before =
+    matrix_state->lgar_mass_balance;
+  const double precipitation_mm_per_h =
+    matrix_state->lgar_bmi_input_params->precipitation_mm_per_h;
+  const double PET_mm_per_h = matrix_state->lgar_bmi_input_params->PET_mm_per_h;
+  const double fracture_fraction = public_params.ratio_fracture_vol_to_total_vol;
+  const double surface_fraction = public_params.frac_to_pref;
+  const double forcing_h = public_params.forcing_resolution_h;
+  const bool capacity_limited_surface =
+    public_params.dual_surface_capacity_limited;
+  const double external_precip_cm =
+    precipitation_mm_per_h * matrix_state->units.mm_to_cm * forcing_h;
+  double matrix_surface_input_cm = (1.0 - surface_fraction) * external_precip_cm;
+  double fracture_surface_input_cm = surface_fraction * external_precip_cm;
+  double shared_surface_runoff_cm = 0.0;
+  const double matrix_start_storage_cm = lgar_calc_mass_bal(
+    public_params.cum_layer_thickness_cm, matrix_state->head);
+  const double fracture_start_storage_cm = lgar_calc_mass_bal(
+    public_params.cum_layer_thickness_cm, dual_fracture_state->head);
+  double *system_giuh_runoff_queue = giuh_runoff_queue;
+
+  if (capacity_limited_surface && external_precip_cm > 0.0) {
+    // qTop/frac_to_pref assigns the first claim on the common atmospheric
+    // supply. Only capacity left after that claim can accept the other
+    // domain's excess; anything still unaccepted becomes surface runoff.
+    const double matrix_capacity_cm = (1.0 - fracture_fraction) *
+      lgar_dual_surface_capacity_cm(
+        matrix_state, external_precip_cm / (1.0 - fracture_fraction), forcing_h);
+    const double fracture_capacity_cm = fracture_fraction *
+      lgar_dual_surface_capacity_cm(
+        dual_fracture_state, external_precip_cm / fracture_fraction, forcing_h);
+    const double matrix_direct_cm = matrix_surface_input_cm;
+    const double fracture_direct_cm = fracture_surface_input_cm;
+
+    matrix_surface_input_cm = fmin(matrix_direct_cm, matrix_capacity_cm);
+    fracture_surface_input_cm = fmin(fracture_direct_cm, fracture_capacity_cm);
+    fracture_surface_input_cm += fmin(
+      fmax(0.0, matrix_direct_cm - matrix_surface_input_cm),
+      fmax(0.0, fracture_capacity_cm - fracture_surface_input_cm));
+    matrix_surface_input_cm += fmin(
+      fmax(0.0, fracture_direct_cm - fracture_surface_input_cm),
+      fmax(0.0, matrix_capacity_cm - matrix_surface_input_cm));
+    shared_surface_runoff_cm = fmax(
+      0.0, external_precip_cm - matrix_surface_input_cm - fracture_surface_input_cm);
+  }
+
+  // Surface inputs are total-area depths.  Convert each assigned share to a
+  // local-domain depth before invoking the unchanged single-domain solver.
+  matrix_state->lgar_bmi_params = dual_matrix_params;
+  matrix_state->lgar_mass_balance = dual_matrix_mass_balance;
+  matrix_state->lgar_bmi_input_params->precipitation_mm_per_h =
+    matrix_surface_input_cm * matrix_state->units.cm_to_mm /
+    ((1.0 - fracture_fraction) * forcing_h);
+  matrix_state->lgar_bmi_input_params->PET_mm_per_h =
+    PET_mm_per_h / (1.0 - fracture_fraction);
+  std::fill(dual_scratch_giuh_runoff_queue,
+            dual_scratch_giuh_runoff_queue + num_giuh_ordinates + 1, 0.0);
+  giuh_runoff_queue = dual_scratch_giuh_runoff_queue;
+
+  dual_domain_update_in_progress = true;
+  try {
+    UpdateSingleDomain();
+  }
+  catch (...) {
+    dual_domain_update_in_progress = false;
+    giuh_runoff_queue = system_giuh_runoff_queue;
+    matrix_state->lgar_bmi_input_params->precipitation_mm_per_h =
+      precipitation_mm_per_h;
+    matrix_state->lgar_bmi_input_params->PET_mm_per_h = PET_mm_per_h;
+    matrix_state->lgar_bmi_params = public_params;
+    matrix_state->lgar_mass_balance = public_mass_before;
+    throw;
+  }
+  dual_domain_update_in_progress = false;
+
+  giuh_runoff_queue = system_giuh_runoff_queue;
+  dual_matrix_params = matrix_state->lgar_bmi_params;
+  dual_matrix_params.dual_perm = false;
+  dual_matrix_mass_balance = matrix_state->lgar_mass_balance;
+
+  const double matrix_runoff_cm =
+    dual_matrix_mass_balance.volrunoff_timestep_cm;
+  const double runoff_handoff_cm = capacity_limited_surface ? 0.0 :
+    (1.0 - fracture_fraction) * matrix_runoff_cm;
+  const double runoff_handoff_local_fracture_mm_per_h =
+    runoff_handoff_cm * matrix_state->units.cm_to_mm /
+    (fracture_fraction * forcing_h);
+
+  dual_fracture_state->lgar_bmi_input_params->precipitation_mm_per_h =
+    fracture_surface_input_cm * matrix_state->units.cm_to_mm /
+    (fracture_fraction * forcing_h) + runoff_handoff_local_fracture_mm_per_h;
+  dual_fracture_state->lgar_bmi_input_params->PET_mm_per_h = 0.0;
+  std::fill(dual_scratch_giuh_runoff_queue,
+            dual_scratch_giuh_runoff_queue + num_giuh_ordinates + 1, 0.0);
+  state = dual_fracture_state;
+  giuh_runoff_queue = dual_scratch_giuh_runoff_queue;
+
+  dual_domain_update_in_progress = true;
+  try {
+    UpdateSingleDomain();
+  }
+  catch (...) {
+    dual_domain_update_in_progress = false;
+    state = matrix_state;
+    giuh_runoff_queue = system_giuh_runoff_queue;
+    matrix_state->lgar_bmi_input_params->precipitation_mm_per_h =
+      precipitation_mm_per_h;
+    matrix_state->lgar_bmi_input_params->PET_mm_per_h = PET_mm_per_h;
+    matrix_state->lgar_bmi_params = public_params;
+    matrix_state->lgar_mass_balance = public_mass_before;
+    throw;
+  }
+  dual_domain_update_in_progress = false;
+
+  state = matrix_state;
+  giuh_runoff_queue = system_giuh_runoff_queue;
+
+  if (std::fabs(dual_matrix_params.time_s -
+                dual_fracture_state->lgar_bmi_params.time_s) > 1.0e-8) {
+    throw std::runtime_error(
+      "dual_perm matrix and fracture clocks diverged during Update.");
+  }
+
+  const dual_permeability_profile_exchange_result exchange =
+    lgar_dual_permeability_exchange_profiles(
+      matrix_state->lgar_bmi_params.num_layers, fracture_fraction, forcing_h,
+      matrix_state->lgar_bmi_params.cum_layer_thickness_cm,
+      matrix_state->lgar_bmi_params.layer_soil_type,
+      matrix_state->soil_properties, dual_fracture_state->soil_properties,
+      matrix_state->mass_transfer_soil_properties,
+      &matrix_state->head, &dual_fracture_state->head);
+  dual_cumulative_exchange_cm += exchange.transfer_cm;
+
+  // Exchange is internal to the total-area ledger, but each local solver must
+  // carry its post-exchange storage into the next synchronized step.
+  dual_matrix_mass_balance.volend_timestep_cm = lgar_calc_mass_bal(
+    matrix_state->lgar_bmi_params.cum_layer_thickness_cm, matrix_state->head);
+  dual_matrix_mass_balance.volend_cm =
+    dual_matrix_mass_balance.volend_timestep_cm;
+  dual_fracture_state->lgar_mass_balance.volend_timestep_cm = lgar_calc_mass_bal(
+    matrix_state->lgar_bmi_params.cum_layer_thickness_cm,
+    dual_fracture_state->head);
+  dual_fracture_state->lgar_mass_balance.volend_cm =
+    dual_fracture_state->lgar_mass_balance.volend_timestep_cm;
+  if (exchange.region_count > 0) {
+    lgar_refresh_domain_bmi_outputs(matrix_state);
+    lgar_refresh_domain_bmi_outputs(dual_fracture_state);
+    dual_matrix_params = matrix_state->lgar_bmi_params;
+    dual_matrix_params.dual_perm = false;
+  }
+
+  const lgar_mass_balance_variables& matrix_mass = dual_matrix_mass_balance;
+  const lgar_mass_balance_variables& fracture_mass =
+    dual_fracture_state->lgar_mass_balance;
+
+  const double fracture_runoff_cm = fracture_mass.volrunoff_timestep_cm;
+  const double system_runoff_cm = shared_surface_runoff_cm +
+    (capacity_limited_surface ?
+      (1.0 - fracture_fraction) * matrix_runoff_cm : 0.0) +
+    fracture_fraction * fracture_runoff_cm;
+  const double system_giuh_runoff_cm = giuh_convolution_integral(
+    system_runoff_cm, num_giuh_ordinates, giuh_ordinates,
+    system_giuh_runoff_queue);
+  if (!capacity_limited_surface) {
+    dual_cumulative_handoff_cm += runoff_handoff_cm;
+  }
+
+  lgar_mass_balance_variables aggregate = {};
+  aggregate.volstart_timestep_cm = lgar_weighted_domain_value(
+    matrix_start_storage_cm, fracture_start_storage_cm, fracture_fraction);
+  aggregate.volend_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volend_timestep_cm, fracture_mass.volend_timestep_cm,
+    fracture_fraction);
+  aggregate.volprecip_timestep_cm = capacity_limited_surface ? external_precip_cm :
+    lgar_weighted_domain_value(
+      matrix_mass.volprecip_timestep_cm, fracture_mass.volprecip_timestep_cm,
+      fracture_fraction) - runoff_handoff_cm;
+  aggregate.volin_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volin_timestep_cm, fracture_mass.volin_timestep_cm,
+    fracture_fraction);
+  aggregate.volon_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volon_timestep_cm, fracture_mass.volon_timestep_cm,
+    fracture_fraction);
+  aggregate.volrunoff_timestep_cm = system_runoff_cm;
+  aggregate.volAET_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volAET_timestep_cm, fracture_mass.volAET_timestep_cm,
+    fracture_fraction);
+  aggregate.volPET_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volPET_timestep_cm, fracture_mass.volPET_timestep_cm,
+    fracture_fraction);
+  aggregate.volrech_timestep_cm = lgar_weighted_domain_value(
+    matrix_mass.volrech_timestep_cm, fracture_mass.volrech_timestep_cm,
+    fracture_fraction);
+  aggregate.volrunoff_giuh_timestep_cm = system_giuh_runoff_cm;
+  aggregate.volQ_timestep_cm = system_giuh_runoff_cm;
+
+  aggregate.volstart_cm = lgar_weighted_domain_value(
+    matrix_mass.volstart_cm, fracture_mass.volstart_cm, fracture_fraction);
+  aggregate.volend_cm = lgar_weighted_domain_value(
+    matrix_mass.volend_cm, fracture_mass.volend_cm, fracture_fraction);
+  aggregate.volprecip_cm = capacity_limited_surface ?
+    public_mass_before.volprecip_cm + external_precip_cm :
+    lgar_weighted_domain_value(
+      matrix_mass.volprecip_cm, fracture_mass.volprecip_cm,
+      fracture_fraction) - dual_cumulative_handoff_cm;
+  aggregate.volin_cm = lgar_weighted_domain_value(
+    matrix_mass.volin_cm, fracture_mass.volin_cm, fracture_fraction);
+  aggregate.volon_cm = lgar_weighted_domain_value(
+    matrix_mass.volon_cm, fracture_mass.volon_cm, fracture_fraction);
+  aggregate.volrunoff_cm = capacity_limited_surface ?
+    public_mass_before.volrunoff_cm + system_runoff_cm :
+    fracture_fraction * fracture_mass.volrunoff_cm;
+  aggregate.volAET_cm = lgar_weighted_domain_value(
+    matrix_mass.volAET_cm, fracture_mass.volAET_cm, fracture_fraction);
+  aggregate.volPET_cm = lgar_weighted_domain_value(
+    matrix_mass.volPET_cm, fracture_mass.volPET_cm, fracture_fraction);
+  aggregate.volrech_cm = lgar_weighted_domain_value(
+    matrix_mass.volrech_cm, fracture_mass.volrech_cm, fracture_fraction);
+  aggregate.volrunoff_giuh_cm =
+    public_mass_before.volrunoff_giuh_cm + system_giuh_runoff_cm;
+  aggregate.volQ_cm = public_mass_before.volQ_cm + system_giuh_runoff_cm;
+  aggregate.volchange_calib_cm = lgar_weighted_domain_value(
+    matrix_mass.volchange_calib_cm, fracture_mass.volchange_calib_cm,
+    fracture_fraction);
+  aggregate.local_mass_balance = lgar_weighted_domain_value(
+    matrix_mass.local_mass_balance, fracture_mass.local_mass_balance,
+    fracture_fraction);
+  aggregate.previous_AET = lgar_weighted_domain_value(
+    matrix_mass.previous_AET, fracture_mass.previous_AET, fracture_fraction);
+  aggregate.previous_PET = lgar_weighted_domain_value(
+    matrix_mass.previous_PET, fracture_mass.previous_PET, fracture_fraction);
+  aggregate.previous_lower_boundary_flux_cm = lgar_weighted_domain_value(
+    matrix_mass.previous_lower_boundary_flux_cm,
+    fracture_mass.previous_lower_boundary_flux_cm, fracture_fraction);
+
+  matrix_state->lgar_bmi_params = dual_matrix_params;
+  matrix_state->lgar_bmi_params.dual_perm = true;
+  matrix_state->lgar_mass_balance = aggregate;
+  matrix_state->head_frac = dual_fracture_state->head;
+  matrix_state->state_previous_frac = dual_fracture_state->state_previous;
+  matrix_state->dual_matrix_runoff_timestep_cm = matrix_runoff_cm;
+  matrix_state->dual_fracture_runoff_timestep_cm = fracture_runoff_cm;
+  matrix_state->dual_runoff_handoff_timestep_cm = runoff_handoff_cm;
+  matrix_state->dual_matrix_infiltration_timestep_cm =
+    (1.0 - fracture_fraction) * matrix_mass.volin_timestep_cm;
+  matrix_state->dual_fracture_infiltration_timestep_cm =
+    fracture_fraction * fracture_mass.volin_timestep_cm;
+  matrix_state->dual_matrix_recharge_timestep_cm =
+    (1.0 - fracture_fraction) * matrix_mass.volrech_timestep_cm;
+  matrix_state->dual_fracture_recharge_timestep_cm =
+    fracture_fraction * fracture_mass.volrech_timestep_cm;
+  matrix_state->dual_mass_transfer_timestep_cm = exchange.transfer_cm;
+  matrix_state->dual_mass_transfer_cm = dual_cumulative_exchange_cm;
+  matrix_state->lgar_bmi_input_params->precipitation_mm_per_h =
+    precipitation_mm_per_h;
+  matrix_state->lgar_bmi_input_params->PET_mm_per_h = PET_mm_per_h;
+
+  bmi_unit_conv.mass_balance_m = aggregate.local_mass_balance * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volprecip_timestep_m = aggregate.volprecip_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volin_timestep_m = aggregate.volin_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volend_timestep_m = aggregate.volend_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volCRend_timestep_m = 0.0;
+  bmi_unit_conv.volAET_timestep_m = aggregate.volAET_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volrech_timestep_m = aggregate.volrech_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volrunoff_timestep_m = aggregate.volrunoff_timestep_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volrunoff_giuh_timestep_m = system_giuh_runoff_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volQ_timestep_m = system_giuh_runoff_cm * matrix_state->units.cm_to_m;
+  bmi_unit_conv.volQ_CR_timestep_m = 0.0;
+  bmi_unit_conv.volpref_flow_to_CR_timestep_m = 0.0;
+  bmi_unit_conv.vollgarto_domain_to_CR_timestep_m = 0.0;
+  bmi_unit_conv.vollateral_flow_timestep_m = 0.0;
+  bmi_unit_conv.volPET_timestep_m = aggregate.volPET_timestep_cm * matrix_state->units.cm_to_m;
+}
+
+void BmiLGAR::
+UpdateSingleDomain()
+{
+
   if (verbosity.compare("none") != 0) {
     std::cerr<<"---------------------------------------------------------\n";
     std::cerr<<"|****************** LASAM BMI Update... ******************|\n";
@@ -3848,6 +4315,23 @@ Update()
     double local_mb = volstart_subtimestep_cm + precip_subtimestep_cm + volon_timestep_cm + mobile_groundwater_explicit_mass_change_subtimestep_cm - volrunoff_subtimestep_cm - volQ_CR_subtimestep_cm - volCRend_subtimestep_cm + volCRstart_subtimestep_cm
                       - AET_subtimestep_cm - volon_subtimestep_cm - volrech_subtimestep_cm - lateral_flow_subtimestep_cm - volend_subtimestep_cm;
 
+    if (dual_domain_update_in_progress && std::fabs(local_mb) > SMALL_EPS) {
+      // Matrix-fracture exchange perturbs theta between hydrologic steps.
+      // Reconcile the next LGAR substep to its own flux ledger before the
+      // configured mass-balance check, without changing front topology.
+      const double target_storage_cm = volend_subtimestep_cm + local_mb;
+      lgar_theta_mass_balance_correction(
+        false, listLength(state->head), target_storage_cm, &state->head,
+        state->lgar_bmi_params.cum_layer_thickness_cm,
+        state->lgar_bmi_params.layer_soil_type, state->soil_properties);
+      lgar_refresh_domain_conductivity(state);
+      const double corrected_storage_cm = lgar_calc_mass_bal(
+        state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
+      local_mb -= corrected_storage_cm - volend_subtimestep_cm;
+      volend_subtimestep_cm = corrected_storage_cm;
+      volend_timestep_cm = corrected_storage_cm;
+    }
+
     /*----------------------------------------------------------------------*/
 
     ///////
@@ -4274,10 +4758,28 @@ Finalize()
            "LGARTO flux caching is experimental; check global mass balance and hydrograph outputs.\n");
     fflush(stdout);
   }
+
+  if (dual_fracture_state != NULL) {
+    // The linked lists and static soil arrays are still owned by the public
+    // model state; only the fracture solver's private BMI storage is released here.
+    state->head_frac = dual_fracture_state->head;
+    state->state_previous_frac = dual_fracture_state->state_previous;
+    delete [] dual_fracture_state->lgar_bmi_params.soil_depth_wetting_fronts;
+    delete [] dual_fracture_state->lgar_bmi_params.soil_moisture_wetting_fronts;
+    delete dual_fracture_state->lgar_bmi_input_params;
+    delete dual_fracture_state;
+    dual_fracture_state = NULL;
+    dual_runtime_initialized = false;
+  }
+
   listDelete(state->head);
   listDelete(state->state_previous);
+  listDelete(state->head_frac);
+  listDelete(state->state_previous_frac);
 
   delete [] state->soil_properties;
+  delete [] state->soil_properties_frac;
+  delete [] state->mass_transfer_soil_properties;
 
   delete [] state->lgar_bmi_params.soil_depth_wetting_fronts;
   delete [] state->lgar_bmi_params.soil_moisture_wetting_fronts;

@@ -4,6 +4,7 @@
 #include "../include/all.hxx"
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <string.h>
 #include <sstream>
 
@@ -2058,6 +2059,10 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   state->lgar_bmi_params.allow_flux_caching    = false;
   state->lgar_bmi_params.log_mode              = false;
   state->lgar_bmi_params.TO_enabled            = false;
+  state->lgar_bmi_params.dual_perm             = false;
+  state->lgar_bmi_params.dual_surface_capacity_limited = false;
+  state->lgar_bmi_params.frac_to_pref          = 0.0;
+  state->lgar_bmi_params.ratio_fracture_vol_to_total_vol = 0.0;
   state->lgar_bmi_params.free_drainage_enabled = false;
   state->lgar_bmi_params.lower_bdy_flux_to_CR  = false;
   state->lgar_bmi_params.mobile_groundwater_level = false;
@@ -2095,6 +2100,10 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_lateral_flow_psi_threshold_set = false;
   bool is_lateral_flow_factor_set   = false;
   bool is_soil_params_file_set      = false;
+  bool is_soil_params_file_mfi_set  = false;
+  bool is_dual_surface_boundary_set = false;
+  bool is_frac_to_pref_set          = false;
+  bool is_ratio_fracture_vol_to_total_vol_set = false;
   bool is_max_valid_soil_types_set  = false;
   bool is_giuh_ordinates_set        = false;
   bool is_soil_z_set                = false;
@@ -2104,6 +2113,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_giuh_state_path_set       = false;
 
   string soil_params_file;
+  string soil_params_file_mfi;
 
   // a temporary array to store the original (hourly based) giuh values
   std::vector<double> giuh_ordinates_temp;
@@ -2237,6 +2247,16 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 	std::cerr<<"          *****         \n";
       }
 
+      continue;
+    }
+    else if (param_key == "soil_params_file_mfi") {
+      soil_params_file_mfi = param_value;
+      is_soil_params_file_mfi_set = true;
+
+      if (verbosity.compare("high") == 0) {
+	std::cerr<<"Matrix/fracture interface parameter file : "<<soil_params_file_mfi<<"\n";
+	std::cerr<<"          *****         \n";
+      }
       continue;
     }
     else if (param_key == "wilting_point_psi") {
@@ -2475,6 +2495,16 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
       }
       continue;
     }
+    else if (param_key == "frac_to_pref") {
+      state->lgar_bmi_params.frac_to_pref = stod(param_value);
+      is_frac_to_pref_set = true;
+      continue;
+    }
+    else if (param_key == "ratio_fracture_vol_to_total_vol") {
+      state->lgar_bmi_params.ratio_fracture_vol_to_total_vol = stod(param_value);
+      is_ratio_fracture_vol_to_total_vol_set = true;
+      continue;
+    }
     else if (param_key == "use_closed_form_G") { 
       if (param_value == "false") {
         state->lgar_bmi_params.use_closed_form_G = false;
@@ -2659,6 +2689,34 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       continue;
     }
+    else if (param_key == "dual_perm" || param_key == "dual_permeability_enabled") {
+      if ((param_value == "false") || (param_value == "0")) {
+        state->lgar_bmi_params.dual_perm = false;
+      }
+      else if ((param_value == "true") || (param_value == "1")) {
+        state->lgar_bmi_params.dual_perm = true;
+      }
+      else {
+	std::cerr<<"Invalid option: dual_perm must be true or false. \n";
+        abort();
+      }
+
+      continue;
+    }
+    else if (param_key == "dual_surface_boundary") {
+      if (param_value == "legacy_handoff") {
+        state->lgar_bmi_params.dual_surface_capacity_limited = false;
+      }
+      else if (param_value == "capacity_limited_shared") {
+        state->lgar_bmi_params.dual_surface_capacity_limited = true;
+      }
+      else {
+        throw runtime_error(
+          "dual_surface_boundary must be legacy_handoff or capacity_limited_shared.");
+      }
+      is_dual_surface_boundary_set = true;
+      continue;
+    }
     else if (param_key == "timestep") {
       state->lgar_bmi_params.timestep_h = stod(param_value);
 
@@ -2839,23 +2897,82 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     state->lgar_bmi_params.lateral_flow_enabled = true;
   }
 
+  if (state->lgar_bmi_params.dual_perm) {
+    const double fracture_fraction =
+      state->lgar_bmi_params.ratio_fracture_vol_to_total_vol;
+    if (!is_frac_to_pref_set || state->lgar_bmi_params.frac_to_pref < 0.0 ||
+        state->lgar_bmi_params.frac_to_pref > 1.0) {
+      throw runtime_error(
+        "dual_perm requires frac_to_pref in the closed interval [0, 1].");
+    }
+    // Keep both local-domain forcings numerically well scaled.
+    if (!is_ratio_fracture_vol_to_total_vol_set || fracture_fraction < 1.0e-4 ||
+        fracture_fraction > 0.9999) {
+      throw runtime_error(
+        "dual_perm requires ratio_fracture_vol_to_total_vol in [1.E-4, 0.9999].");
+    }
+    if (!is_soil_params_file_mfi_set) {
+      throw runtime_error("dual_perm requires soil_params_file_mfi.");
+    }
+    if (is_state_path_set) {
+      throw runtime_error(
+        "Dual-permeability restart loading is not enabled yet; initialize both domains from initial_psi.");
+    }
+    if (state->lgar_bmi_params.allow_flux_caching) {
+      throw runtime_error(
+        "Dual-permeability flux caching is disabled until the two-domain cache ledger is implemented.");
+    }
+    if (is_ponded_depth_max_cm_set && state->lgar_bmi_params.ponded_depth_max_cm > 0.0) {
+      throw runtime_error(
+        "The initial dual-permeability implementation requires ponded_depth_max=0.");
+    }
+    if (is_frac_to_CR_set && state->lgar_bmi_params.frac_to_CR > 0.0) {
+      throw runtime_error(
+        "dual_perm and simple preferential flow (frac_to_CR) are mutually exclusive.");
+    }
+  }
+  else if (is_dual_surface_boundary_set || is_frac_to_pref_set ||
+           is_ratio_fracture_vol_to_total_vol_set ||
+           is_soil_params_file_mfi_set) {
+    throw runtime_error(
+      "Dual-permeability parameters were supplied while dual_perm is false.");
+  }
+
   if(is_soil_params_file_set) {
     //allocate memory to create an array of structures to hold the soils properties data.
     //state->soil_properties = (struct soil_properties_*) malloc((state->lgar_bmi_params.num_layers+1)*sizeof(struct soil_properties_));
 
 
     state->soil_properties = new soil_properties_[state->lgar_bmi_params.num_soil_types+1];
+    if (state->lgar_bmi_params.dual_perm) {
+      state->soil_properties_frac =
+        new soil_properties_[state->lgar_bmi_params.num_soil_types+1];
+    }
     int num_soil_types = state->lgar_bmi_params.num_soil_types;
     double wilting_point_psi_cm = state->lgar_bmi_params.wilting_point_psi_cm;
-    lgar_read_vG_param_file(soil_params_file.c_str(), num_soil_types,
-						    wilting_point_psi_cm, state->soil_properties, state->lgar_bmi_params.log_mode);
+    const int hydraulic_soil_count = lgar_read_vG_param_file(
+      soil_params_file.c_str(), num_soil_types, wilting_point_psi_cm,
+      state->soil_properties, state->lgar_bmi_params.log_mode,
+      state->soil_properties_frac);
+
+    int interface_soil_count = 0;
+    if (state->lgar_bmi_params.dual_perm) {
+      state->mass_transfer_soil_properties =
+        new mass_transfer_soil_properties_[state->lgar_bmi_params.num_soil_types+1];
+      interface_soil_count = lgar_read_vG_param_file_mass_transfer(
+        soil_params_file_mfi.c_str(), num_soil_types,
+        state->mass_transfer_soil_properties);
+    }
 
     // check if soil layers provided are within the range
     state->lgar_bmi_params.is_invalid_soil_type = false; // model not valid for soil types = waterbody, glacier, lava, etc.
     for (int layer=1; layer <= state->lgar_bmi_params.num_layers; layer++) {
       //assert (state->lgar_bmi_params.layer_soil_type[layer] <= state->lgar_bmi_params.num_soil_types);
       //assert (state->lgar_bmi_params.layer_soil_type[layer] <= max_num_soil_in_file);
-      if (state->lgar_bmi_params.layer_soil_type[layer] > state->lgar_bmi_params.num_soil_types) {
+      const int layer_soil = state->lgar_bmi_params.layer_soil_type[layer];
+      if (layer_soil < 1 || layer_soil > state->lgar_bmi_params.num_soil_types ||
+          layer_soil > hydraulic_soil_count ||
+          (state->lgar_bmi_params.dual_perm && layer_soil > interface_soil_count)) {
 	state->lgar_bmi_params.is_invalid_soil_type = true;
 	if (verbosity.compare("high") == 0) {
 	  std::cerr << "Invalid soil type: "
@@ -3032,6 +3149,20 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
           state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.layer_thickness_cm,
           state->lgar_bmi_params.frozen_factor, state->lgar_bmi_params.initial_extra_moisture_factor_cm,
           state->lgar_bmi_params.mobile_groundwater_level, &state->head, state->soil_properties);
+
+    if (state->lgar_bmi_params.dual_perm) {
+      InitializeWettingFronts(state->lgar_bmi_params.TO_enabled,
+          state->lgar_bmi_params.num_layers,
+          state->lgar_bmi_params.initial_wetting_fronts_per_layer,
+          state->lgar_bmi_params.initial_psi_cm,
+          state->lgar_bmi_params.layer_soil_type,
+          state->lgar_bmi_params.cum_layer_thickness_cm,
+          state->lgar_bmi_params.layer_thickness_cm,
+          state->lgar_bmi_params.frozen_factor,
+          state->lgar_bmi_params.initial_extra_moisture_factor_cm,
+          state->lgar_bmi_params.mobile_groundwater_level,
+          &state->head_frac, state->soil_properties_frac);
+    }
   }
   else {
     InitializeWettingFrontsFromCSV( //note that loading can yield a small mass balance error if theta and psi values were not recorded to high precision
@@ -3154,7 +3285,12 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   }
 
   // initial mass in the system
-  state->lgar_mass_balance.volstart_cm      = lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
+  state->lgar_mass_balance.volstart_cm = state->lgar_bmi_params.dual_perm
+    ? lgar_dual_permeability_storage_cm(
+        state->lgar_bmi_params.ratio_fracture_vol_to_total_vol,
+        state->lgar_bmi_params.cum_layer_thickness_cm,
+        state->head, state->head_frac)
+    : lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
 
   state->lgar_bmi_params.ponded_depth_cm    = 0.0; // initially we start with a dry surface (no surface ponding)
   state->lgar_bmi_params.nint               = 120; // hacked, not needed to be an input option
@@ -3447,7 +3583,7 @@ extern void lgar_global_mass_balance(struct model_state *state, double *giuh_run
   printf("------------------------ Mass balance ------------------- \n");
   printf("Initial water in soil       = %14.10f cm\n", volstart);
   printf("Total precipitation         = %14.10f cm\n", volprecip);
-  printf("Total infiltration (matrix) = %14.10f cm\n", volin);
+  printf("Total infiltration          = %14.10f cm\n", volin);
   printf("Final water in soil         = %14.10f cm\n", volend);
   printf("Surface ponded water        = %14.10f cm\n", volon);
   printf("Surface runoff              = %14.10f cm\n", volrunoff);
@@ -14774,6 +14910,422 @@ double lgar_calc_mass_bal(double *cum_layer_thickness, struct wetting_front* hea
   return sum;
 }
 
+extern double lgar_dual_permeability_storage_cm(
+  double ratio_fracture_vol_to_total_vol,
+  double *cum_layer_thickness_cm,
+  struct wetting_front *head_matrix,
+  struct wetting_front *head_fracture)
+{
+  const double fracture_fraction = ratio_fracture_vol_to_total_vol;
+  if (fracture_fraction < 0.0 || fracture_fraction > 1.0) {
+    throw runtime_error("Fracture volume fraction must be between zero and one.");
+  }
+  return (1.0 - fracture_fraction) *
+           lgar_calc_mass_bal(cum_layer_thickness_cm, head_matrix) +
+         fracture_fraction *
+           lgar_calc_mass_bal(cum_layer_thickness_cm, head_fracture);
+}
+
+static double lgar_dual_permeability_relative_conductivity(
+  double theta,
+  const struct soil_properties_ *soil)
+{
+  const double Se = fmax(0.0, fmin(1.0,
+    calc_Se_from_theta(theta, soil->theta_e, soil->theta_r)));
+  return calc_K_from_Se(Se, 1.0, soil->vg_m);
+}
+
+static double lgar_dual_permeability_psi_from_theta(
+  double theta,
+  const struct soil_properties_ *soil)
+{
+  if (theta <= soil->theta_r) return 1.0e20;
+  if (theta >= soil->theta_e) return 0.0;
+  const double Se = fmax(1.0e-15, fmin(1.0,
+    calc_Se_from_theta(theta, soil->theta_e, soil->theta_r)));
+  return calc_h_from_Se(Se, soil->vg_alpha_per_cm, soil->vg_m, soil->vg_n);
+}
+
+extern struct dual_permeability_exchange_result lgar_dual_permeability_exchange_region(
+  double ratio_fracture_vol_to_total_vol,
+  double subtimestep_h,
+  double A_Gamma_per_cm_h,
+  double psi_matrix_cm,
+  double psi_fracture_cm,
+  double theta_matrix,
+  double theta_fracture,
+  const struct soil_properties_ *soil_matrix,
+  const struct soil_properties_ *soil_fracture)
+{
+  struct dual_permeability_exchange_result result = {
+    0.0, theta_matrix, theta_fracture, false, false
+  };
+  const double fracture_fraction = ratio_fracture_vol_to_total_vol;
+  const double matrix_fraction = 1.0 - fracture_fraction;
+  if (soil_matrix == NULL || soil_fracture == NULL ||
+      fracture_fraction <= 0.0 || fracture_fraction >= 1.0 ||
+      subtimestep_h < 0.0 || A_Gamma_per_cm_h < 0.0 ||
+      !std::isfinite(subtimestep_h) || !std::isfinite(A_Gamma_per_cm_h) ||
+      !std::isfinite(psi_matrix_cm) || !std::isfinite(psi_fracture_cm) ||
+      !std::isfinite(theta_matrix) || !std::isfinite(theta_fracture)) {
+    throw runtime_error("Invalid input to dual-permeability exchange region.");
+  }
+  if (subtimestep_h == 0.0 || A_Gamma_per_cm_h == 0.0 ||
+      psi_matrix_cm == psi_fracture_cm) {
+    return result;
+  }
+
+  const double relative_K_matrix =
+    lgar_dual_permeability_relative_conductivity(theta_matrix, soil_matrix);
+  const double relative_K_fracture =
+    lgar_dual_permeability_relative_conductivity(theta_fracture, soil_fracture);
+  const double relative_K_interface =
+    0.5 * (relative_K_matrix + relative_K_fracture);
+  const double raw_transfer = A_Gamma_per_cm_h * relative_K_interface *
+    (psi_fracture_cm - psi_matrix_cm) * subtimestep_h;
+
+  // Intersect donor and receiver capacity bounds in total-system water-content units.
+  const double minimum_transfer = fmax(
+    matrix_fraction * (theta_matrix - soil_matrix->theta_e),
+    fracture_fraction * (soil_fracture->theta_r - theta_fracture));
+  const double maximum_transfer = fmin(
+    matrix_fraction * (theta_matrix - soil_matrix->theta_r),
+    fracture_fraction * (soil_fracture->theta_e - theta_fracture));
+  if (minimum_transfer > maximum_transfer) {
+    throw runtime_error("Dual-permeability exchange states lie outside hydraulic capacity bounds.");
+  }
+
+  double transfer = fmax(minimum_transfer, fmin(maximum_transfer, raw_transfer));
+  result.capacity_limited = transfer != raw_transfer;
+
+  const double theta_matrix_trial = theta_matrix - transfer / matrix_fraction;
+  const double theta_fracture_trial = theta_fracture + transfer / fracture_fraction;
+  const double gradient_initial = psi_fracture_cm - psi_matrix_cm;
+  const double gradient_trial =
+    lgar_dual_permeability_psi_from_theta(theta_fracture_trial, soil_fracture) -
+    lgar_dual_permeability_psi_from_theta(theta_matrix_trial, soil_matrix);
+
+  // A large step must stop at equal pressure heads instead of reversing the
+  // exchange direction and oscillating on the next substep.
+  if (transfer != 0.0 && gradient_initial * gradient_trial < 0.0) {
+    double bracket_a = 0.0;
+    double bracket_b = transfer;
+    double gradient_a = gradient_initial;
+    for (int iteration = 0; iteration < 100; iteration++) {
+      const double midpoint = 0.5 * (bracket_a + bracket_b);
+      const double theta_matrix_mid = theta_matrix - midpoint / matrix_fraction;
+      const double theta_fracture_mid = theta_fracture + midpoint / fracture_fraction;
+      const double gradient_mid =
+        lgar_dual_permeability_psi_from_theta(theta_fracture_mid, soil_fracture) -
+        lgar_dual_permeability_psi_from_theta(theta_matrix_mid, soil_matrix);
+      if (gradient_a * gradient_mid <= 0.0) {
+        bracket_b = midpoint;
+      }
+      else {
+        bracket_a = midpoint;
+        gradient_a = gradient_mid;
+      }
+    }
+    transfer = 0.5 * (bracket_a + bracket_b);
+    result.equilibrium_limited = true;
+  }
+
+  result.transfer_water_content = transfer;
+  result.theta_matrix = theta_matrix - transfer / matrix_fraction;
+  result.theta_fracture = theta_fracture + transfer / fracture_fraction;
+  return result;
+}
+
+struct lgar_dual_permeability_block
+{
+  struct wetting_front *front;
+  double thickness_cm;
+  double transfer_cm;
+};
+
+static void lgar_dual_permeability_refresh_conductivity(
+  struct wetting_front *head,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  for (struct wetting_front *front = head; front != NULL; front = front->next) {
+    const int soil = layer_soil_type[front->layer_num];
+    const double Se = fmax(0.0, fmin(1.0,
+      calc_Se_from_theta(front->theta, soil_properties[soil].theta_e,
+                         soil_properties[soil].theta_r)));
+    front->K_cm_per_h = calc_K_from_Se(
+      Se, soil_properties[soil].Ksat_cm_per_h, soil_properties[soil].vg_m);
+  }
+}
+
+static std::vector<lgar_dual_permeability_block>
+lgar_dual_permeability_blocks(
+  struct wetting_front *head,
+  double *cum_layer_thickness_cm,
+  int num_layers)
+{
+  std::vector<lgar_dual_permeability_block> blocks;
+  struct wetting_front *previous = NULL;
+  for (struct wetting_front *front = head; front != NULL; front = front->next) {
+    if (lgarto_is_zero_depth(front->depth_cm)) continue;
+    if (front->layer_num < 1 || front->layer_num > num_layers) {
+      throw runtime_error("Invalid layer in dual-permeability wetting-front profile.");
+    }
+    double start_depth_cm = cum_layer_thickness_cm[front->layer_num - 1];
+    if (previous != NULL && previous->layer_num == front->layer_num) {
+      start_depth_cm = fmax(start_depth_cm, previous->depth_cm);
+    }
+    const double thickness_cm = front->depth_cm - start_depth_cm;
+    if (thickness_cm > 1.0e-12) {
+      blocks.push_back({front, thickness_cm, 0.0});
+    }
+    else if (thickness_cm < -1.0e-10) {
+      throw runtime_error("Invalid depth order in dual-permeability profile.");
+    }
+    previous = front;
+  }
+  return blocks;
+}
+
+static void lgar_dual_permeability_add_transfer(
+  std::vector<lgar_dual_permeability_block>& blocks,
+  struct wetting_front *front,
+  double transfer_cm)
+{
+  for (lgar_dual_permeability_block& block : blocks) {
+    if (block.front == front) {
+      block.transfer_cm += transfer_cm;
+      return;
+    }
+  }
+  throw runtime_error(
+    "Dual-permeability exchange region has no finite-storage wetting front.");
+}
+
+extern struct dual_permeability_profile_exchange_result
+lgar_dual_permeability_exchange_profiles(
+  int num_layers,
+  double ratio_fracture_vol_to_total_vol,
+  double subtimestep_h,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties_matrix,
+  struct soil_properties_ *soil_properties_fracture,
+  struct mass_transfer_soil_properties_ *mass_transfer_soil_properties,
+  struct wetting_front **head_matrix,
+  struct wetting_front **head_fracture)
+{
+  struct dual_permeability_profile_exchange_result result = {0.0, 0.0, 0};
+  if (num_layers <= 0 || subtimestep_h < 0.0 ||
+      ratio_fracture_vol_to_total_vol <= 0.0 ||
+      ratio_fracture_vol_to_total_vol >= 1.0 ||
+      cum_layer_thickness_cm == NULL || layer_soil_type == NULL ||
+      soil_properties_matrix == NULL || soil_properties_fracture == NULL ||
+      mass_transfer_soil_properties == NULL || head_matrix == NULL ||
+      head_fracture == NULL || *head_matrix == NULL || *head_fracture == NULL) {
+    throw runtime_error("Invalid input to dual-permeability profile exchange.");
+  }
+
+  bool exchange_enabled = false;
+  for (int layer = 1; layer <= num_layers; layer++) {
+    const int soil = layer_soil_type[layer];
+    const double A_Gamma = mass_transfer_soil_properties[soil].A_Gamma_per_cm_h;
+    if (!std::isfinite(A_Gamma) || A_Gamma < 0.0) {
+      throw runtime_error("Invalid A_Gamma in dual-permeability profile exchange.");
+    }
+    exchange_enabled = exchange_enabled || A_Gamma > 0.0;
+  }
+  if (!exchange_enabled || subtimestep_h == 0.0) return result;
+
+  const double initial_matrix_storage_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head_matrix);
+  const double initial_fracture_storage_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head_fracture);
+  const double initial_total_storage_cm = lgar_dual_permeability_storage_cm(
+    ratio_fracture_vol_to_total_vol, cum_layer_thickness_cm,
+    *head_matrix, *head_fracture);
+
+  std::vector<double> depths;
+  depths.push_back(0.0);
+  for (int layer = 1; layer <= num_layers; layer++) {
+    depths.push_back(cum_layer_thickness_cm[layer]);
+  }
+  for (struct wetting_front *front = *head_matrix;
+       front != NULL; front = front->next) {
+    if (front->depth_cm > LGARTO_ZERO_DEPTH_TOLERANCE_CM) {
+      depths.push_back(front->depth_cm);
+    }
+  }
+  for (struct wetting_front *front = *head_fracture;
+       front != NULL; front = front->next) {
+    if (front->depth_cm > LGARTO_ZERO_DEPTH_TOLERANCE_CM) {
+      depths.push_back(front->depth_cm);
+    }
+  }
+  std::sort(depths.begin(), depths.end());
+  std::vector<double> unique_depths;
+  for (double depth : depths) {
+    for (int layer = 1; layer <= num_layers; layer++) {
+      if (std::fabs(depth - cum_layer_thickness_cm[layer]) <= 1.0e-10) {
+        depth = cum_layer_thickness_cm[layer];
+        break;
+      }
+    }
+    if (unique_depths.empty() ||
+        std::fabs(depth - unique_depths.back()) > 1.0e-10) {
+      unique_depths.push_back(depth);
+    }
+  }
+
+  struct wetting_front *matrix_front = *head_matrix;
+  struct wetting_front *fracture_front = *head_fracture;
+  std::vector<lgar_dual_permeability_block> matrix_blocks =
+    lgar_dual_permeability_blocks(
+      *head_matrix, cum_layer_thickness_cm, num_layers);
+  std::vector<lgar_dual_permeability_block> fracture_blocks =
+    lgar_dual_permeability_blocks(
+      *head_fracture, cum_layer_thickness_cm, num_layers);
+  double transfer_from_regions_cm = 0.0;
+  int layer = 1;
+  for (std::size_t index = 0; index + 1 < unique_depths.size(); index++) {
+    const double start_depth_cm = unique_depths[index];
+    const double end_depth_cm = unique_depths[index + 1];
+    const double thickness_cm = end_depth_cm - start_depth_cm;
+    if (thickness_cm <= 1.0e-12) continue;
+    while (layer < num_layers &&
+           start_depth_cm >= cum_layer_thickness_cm[layer] - 1.0e-10) {
+      layer++;
+    }
+    while (matrix_front != NULL &&
+           (lgarto_is_zero_depth(matrix_front->depth_cm) ||
+            matrix_front->depth_cm < end_depth_cm - 1.0e-10)) {
+      matrix_front = matrix_front->next;
+    }
+    while (fracture_front != NULL &&
+           (lgarto_is_zero_depth(fracture_front->depth_cm) ||
+            fracture_front->depth_cm < end_depth_cm - 1.0e-10)) {
+      fracture_front = fracture_front->next;
+    }
+    if (matrix_front == NULL || fracture_front == NULL ||
+        matrix_front->layer_num != layer || fracture_front->layer_num != layer) {
+      throw runtime_error(
+        "Dual-permeability profiles do not cover the same valid soil column.");
+    }
+
+    const int soil = layer_soil_type[layer];
+    const dual_permeability_exchange_result region_exchange =
+      lgar_dual_permeability_exchange_region(
+        ratio_fracture_vol_to_total_vol, subtimestep_h,
+        mass_transfer_soil_properties[soil].A_Gamma_per_cm_h,
+        matrix_front->psi_cm, fracture_front->psi_cm,
+        matrix_front->theta, fracture_front->theta,
+        &soil_properties_matrix[soil], &soil_properties_fracture[soil]);
+    const double region_transfer_cm =
+      region_exchange.transfer_water_content * thickness_cm;
+    transfer_from_regions_cm += region_transfer_cm;
+    lgar_dual_permeability_add_transfer(
+      matrix_blocks, matrix_front, region_transfer_cm);
+    lgar_dual_permeability_add_transfer(
+      fracture_blocks, fracture_front, region_transfer_cm);
+    result.region_count++;
+  }
+
+  const double matrix_fraction = 1.0 - ratio_fracture_vol_to_total_vol;
+  for (lgar_dual_permeability_block& block : matrix_blocks) {
+    block.front->theta -=
+      block.transfer_cm / (matrix_fraction * block.thickness_cm);
+  }
+  for (lgar_dual_permeability_block& block : fracture_blocks) {
+    block.front->theta += block.transfer_cm /
+      (ratio_fracture_vol_to_total_vol * block.thickness_cm);
+  }
+  for (lgar_dual_permeability_block& block : matrix_blocks) {
+    const int soil = layer_soil_type[block.front->layer_num];
+    block.front->psi_cm = lgar_dual_permeability_psi_from_theta(
+      block.front->theta, &soil_properties_matrix[soil]);
+  }
+  for (lgar_dual_permeability_block& block : fracture_blocks) {
+    const int soil = layer_soil_type[block.front->layer_num];
+    block.front->psi_cm = lgar_dual_permeability_psi_from_theta(
+      block.front->theta, &soil_properties_fracture[soil]);
+  }
+
+  // Keep the existing front topology and kinematics. In particular, LGAR can
+  // carry two fronts at one layer boundary; rebuilding from unique depths
+  // would discard that state and can lose subsequent infiltration.
+  const double target_matrix_storage_cm = initial_matrix_storage_cm -
+    transfer_from_regions_cm / matrix_fraction;
+  const double target_fracture_storage_cm = initial_fracture_storage_cm +
+    transfer_from_regions_cm / ratio_fracture_vol_to_total_vol;
+  lgar_global_psi_update(cum_layer_thickness_cm, layer_soil_type,
+                         soil_properties_matrix, head_matrix);
+  lgar_global_psi_update(cum_layer_thickness_cm, layer_soil_type,
+                         soil_properties_fracture, head_fracture);
+  if (std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head_matrix) -
+                target_matrix_storage_cm) > MBAL_ITERATIVE_TOLERANCE) {
+    lgar_theta_mass_balance_correction(
+      false, listLength(*head_matrix), target_matrix_storage_cm, head_matrix,
+      cum_layer_thickness_cm, layer_soil_type, soil_properties_matrix);
+  }
+  if (std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head_fracture) -
+                target_fracture_storage_cm) > MBAL_ITERATIVE_TOLERANCE) {
+    lgar_theta_mass_balance_correction(
+      false, listLength(*head_fracture), target_fracture_storage_cm,
+      head_fracture, cum_layer_thickness_cm, layer_soil_type,
+      soil_properties_fracture);
+  }
+  lgar_dual_permeability_refresh_conductivity(
+    *head_matrix, layer_soil_type, soil_properties_matrix);
+  lgar_dual_permeability_refresh_conductivity(
+    *head_fracture, layer_soil_type, soil_properties_fracture);
+  lgar_assert_wetting_fronts_nonnegative_depth(*head_matrix);
+  lgar_assert_wetting_fronts_nonnegative_depth(*head_fracture);
+  lgar_assert_wetting_front_depth_order(*head_matrix);
+  lgar_assert_wetting_front_depth_order(*head_fracture);
+  lgar_assert_to_bottom_scaffold(
+    num_layers, cum_layer_thickness_cm, *head_matrix);
+  lgar_assert_to_bottom_scaffold(
+    num_layers, cum_layer_thickness_cm, *head_fracture);
+  lgar_assert_boundary_psi_continuity(*head_matrix);
+  lgar_assert_boundary_psi_continuity(*head_fracture);
+
+  const double final_total_storage_cm = lgar_dual_permeability_storage_cm(
+    ratio_fracture_vol_to_total_vol, cum_layer_thickness_cm,
+    *head_matrix, *head_fracture);
+  const double final_fracture_storage_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head_fracture);
+  result.mass_balance_error_cm =
+    final_total_storage_cm - initial_total_storage_cm;
+  result.transfer_cm = ratio_fracture_vol_to_total_vol *
+    (final_fracture_storage_cm - initial_fracture_storage_cm);
+
+  const double tolerance_cm = 1.0e-10 *
+    fmax(1.0, std::fabs(initial_total_storage_cm));
+  if (std::fabs(result.mass_balance_error_cm) > tolerance_cm ||
+      std::fabs(result.transfer_cm - transfer_from_regions_cm) > tolerance_cm) {
+    std::ostringstream message;
+    message << "Dual-permeability profile exchange failed its conservative storage check: "
+            << "mass_error_cm=" << std::setprecision(17)
+            << result.mass_balance_error_cm
+            << " transfer_storage_cm=" << result.transfer_cm
+            << " transfer_regions_cm=" << transfer_from_regions_cm
+            << " tolerance_cm=" << tolerance_cm;
+    throw runtime_error(message.str());
+  }
+  const double final_matrix_storage_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head_matrix);
+  const double weighted_domain_change_cm =
+    (1.0 - ratio_fracture_vol_to_total_vol) *
+      (final_matrix_storage_cm - initial_matrix_storage_cm) +
+    ratio_fracture_vol_to_total_vol *
+      (final_fracture_storage_cm - initial_fracture_storage_cm);
+  if (std::fabs(weighted_domain_change_cm) > tolerance_cm) {
+    throw runtime_error(
+      "Dual-permeability profile exchange changed total domain storage.");
+  }
+  return result;
+}
+
 double lgarto_explicit_groundwater_storage_cm(int num_layers, double *cum_layer_thickness_cm,
                                              int *soil_type, struct wetting_front *head,
                                              struct soil_properties_ *soil_properties)
@@ -14825,12 +15377,51 @@ double lgarto_explicit_groundwater_storage_cm(int num_layers, double *cum_layer_
   return storage_cm;
 }
 
+static void lgar_set_soil_properties(const char *soil_name,
+                                     double theta_r,
+                                     double theta_e,
+                                     double vg_alpha_per_cm,
+                                     double vg_n,
+                                     double Ksat_cm_per_h,
+                                     double wilting_point_psi_cm,
+                                     struct soil_properties_ *soil)
+{
+  if (soil == NULL || soil_name == NULL || strlen(soil_name) >= MAX_SOIL_NAME_CHARS ||
+      theta_r < 0.0 || theta_e <= theta_r || vg_alpha_per_cm <= 0.0 ||
+      vg_n <= 1.0 || Ksat_cm_per_h <= 0.0) {
+    throw runtime_error("Invalid van Genuchten soil parameter row.");
+  }
+
+  strcpy(soil->soil_name, soil_name);
+  soil->theta_r = theta_r;
+  soil->theta_e = theta_e;
+  soil->vg_alpha_per_cm = vg_alpha_per_cm;
+  soil->vg_n = vg_n;
+  soil->vg_m = 1.0 - 1.0 / vg_n;
+  soil->Ksat_cm_per_h = Ksat_cm_per_h;
+  soil->theta_wp = calc_theta_from_h(wilting_point_psi_cm, vg_alpha_per_cm,
+                                     soil->vg_m, vg_n, theta_e, theta_r);
+
+  const double p = 1.0 + 2.0 / soil->vg_m;
+  soil->bc_lambda = 2.0 / (p - 3.0);
+  soil->bc_psib_cm =
+    (p + 3.0) * (147.8 + 8.1 * p + 0.092 * p * p) /
+    (2.0 * vg_alpha_per_cm * p * (p - 1.0) * (55.6 + 7.4 * p + p * p));
+  if (!std::isfinite(soil->bc_psib_cm) || soil->bc_psib_cm <= 0.0) {
+    throw runtime_error("Invalid Brooks-Corey parameters derived from van Genuchten row.");
+  }
+  soil->h_min_cm = soil->bc_psib_cm *
+    (2.0 + 3.0 / soil->bc_lambda) / (1.0 + 3.0 / soil->bc_lambda);
+}
+
 // ############################################################################################
-/* The module reads the soil parameters.
-   Open file to read in the van Genuchten parameters for standard soil types*/
+/* Reads either the six-column matrix format or the legacy eleven-column
+   matrix-plus-fracture format. */
 // ############################################################################################
-extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_types, double wilting_point_psi_cm,
-				    struct soil_properties_ *soil_properties, bool log_mode)
+extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_types,
+                                    double wilting_point_psi_cm,
+				    struct soil_properties_ *soil_properties, bool log_mode,
+                                    struct soil_properties_ *soil_properties_frac)
 {
 
   if (verbosity.compare("high") == 0) {
@@ -14841,12 +15432,10 @@ extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_
   FILE *in_vG_params_fptr = NULL;
   char jstr[256];
   char soil_name[30];
-  // bool error;
-  int length;
   int num_soils_in_file = 0;             // soil counter
   int soil = 1;
-  double theta_e,theta_r,vg_n,vg_m,vg_alpha_per_cm,Ksat_cm_per_h;  // shorthand variable names
-  double m,p,lambda;
+  double theta_e,theta_r,vg_n,vg_alpha_per_cm,Ksat_cm_per_h;
+  double theta_e_f,theta_r_f,vg_n_f,vg_alpha_per_cm_f,Ksat_cm_per_h_f;
 
   // open the file
   if((in_vG_params_fptr=fopen(vG_param_file_name,"r"))==NULL) {
@@ -14858,50 +15447,42 @@ extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_
   //for(soil=1;soil<=num_soil_types;soil++) {// read the num_soil_types lines with data
   while (fgets(jstr,255,in_vG_params_fptr) != NULL) {
 
-    sscanf(jstr,"%s %lf %lf %lf %lf %lf",soil_name,&theta_r,&theta_e,&vg_alpha_per_cm,&vg_n,&Ksat_cm_per_h);
-    length=strlen(soil_name);
-
-    if(length>MAX_SOIL_NAME_CHARS) {
-      printf("While reading vG soil parameter file: %s, soil name longer than allowed.  Increase MAX_SOIL_NAME_CHARS\n",
-	     vG_param_file_name);
-      printf("Program stopped.\n");
-      exit(0);
+    std::istringstream row(jstr);
+    std::string parsed_soil_name;
+    row >> std::quoted(parsed_soil_name)
+        >> theta_r >> theta_e >> vg_alpha_per_cm >> vg_n >> Ksat_cm_per_h;
+    const bool matrix_fields_valid = !row.fail();
+    bool fracture_fields_valid = true;
+    if (soil_properties_frac != NULL) {
+      row >> theta_r_f >> theta_e_f >> vg_alpha_per_cm_f >> vg_n_f >> Ksat_cm_per_h_f;
+      fracture_fields_valid = !row.fail();
     }
+    if (!matrix_fields_valid || !fracture_fields_valid ||
+        parsed_soil_name.size() >= sizeof(soil_name)) {
+      fclose(in_vG_params_fptr);
+      throw runtime_error(
+        soil_properties_frac == NULL
+          ? "Soil parameter rows require six fields after the name."
+          : "dual_perm soil parameter rows require matrix and fracture fields (ten values after the name).");
+    }
+    strcpy(soil_name, parsed_soil_name.c_str());
 
-    strcpy(soil_properties[soil].soil_name,soil_name);
     if (log_mode){
       vg_alpha_per_cm = pow(10.0, vg_alpha_per_cm);
       Ksat_cm_per_h   = pow(10.0, Ksat_cm_per_h);
+      if (soil_properties_frac != NULL) {
+        vg_alpha_per_cm_f = pow(10.0, vg_alpha_per_cm_f);
+        Ksat_cm_per_h_f = pow(10.0, Ksat_cm_per_h_f);
+      }
     }
-    vg_m = 1-1/vg_n;
-    soil_properties[soil].theta_r         = theta_r;
-    soil_properties[soil].theta_e         = theta_e;
-    soil_properties[soil].vg_alpha_per_cm = vg_alpha_per_cm; // cm^(-1)
-    soil_properties[soil].vg_n            = vg_n;
-    soil_properties[soil].vg_m            = vg_m;
-    soil_properties[soil].Ksat_cm_per_h   = Ksat_cm_per_h;
-    soil_properties[soil].theta_wp = calc_theta_from_h(wilting_point_psi_cm, vg_alpha_per_cm,
-						       vg_m, vg_n, theta_e, theta_r);
-
-    // Given van Genuchten parameters calculate estimates of Brooks & Corey bc_lambda and bc_psib
-    if (1.0 < vg_n) {
-      m = 1.0 - 1.0 / vg_n;
-      p = 1.0 + 2.0 / m;
-      soil_properties[soil].bc_lambda  = 2.0 / (p - 3.0);
-      soil_properties[soil].bc_psib_cm = (p + 3.0) * (147.8 + 8.1 * p + 0.092 * p * p) /
-	(2.0 * vg_alpha_per_cm * p * (p - 1.0) * (55.6 + 7.4 * p + p * p));
-      assert(0.0 < soil_properties[soil].bc_psib_cm);
+    lgar_set_soil_properties(soil_name, theta_r, theta_e, vg_alpha_per_cm,
+                             vg_n, Ksat_cm_per_h, wilting_point_psi_cm,
+                             &soil_properties[soil]);
+    if (soil_properties_frac != NULL) {
+      lgar_set_soil_properties(soil_name, theta_r_f, theta_e_f, vg_alpha_per_cm_f,
+                               vg_n_f, Ksat_cm_per_h_f, wilting_point_psi_cm,
+                               &soil_properties_frac[soil]);
     }
-    else {
-      fprintf(stderr, "ERROR: van Genuchten parameter n must be greater than 1\n");
-      //error = TRUE;  // TODO FIXME - what todo in this ccase?
-    }
-
-    /* this is the effective capillary drive after */
-    /* Morel-Seytoux et al. (1996) eqn. 13 or 15 */
-    /* psi should not be less than this value.  */
-    lambda=soil_properties[soil].bc_lambda;
-    soil_properties[soil].h_min_cm = soil_properties[soil].bc_psib_cm*(2.0+3.0/lambda)/(1.0+3.0/lambda);
     num_soils_in_file++;
     soil++;
 
@@ -14913,6 +15494,57 @@ extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_
   fclose(in_vG_params_fptr);      // close the file, we're done with it
 
   return num_soils_in_file;
+}
+
+extern int lgar_read_vG_param_file_mass_transfer(
+  char const* frac_matrix_interface_param_file_name,
+  int num_soil_types,
+  struct mass_transfer_soil_properties_ *mass_transfer_soil_properties)
+{
+  FILE *input = fopen(frac_matrix_interface_param_file_name, "r");
+  if (input == NULL) {
+    throw runtime_error("Cannot open matrix/fracture interface parameter file.");
+  }
+
+  char row[256];
+  char soil_name[30];
+  int soil = 1;
+  int count = 0;
+  fgets(row, 255, input); // header
+  while (count < num_soil_types && fgets(row, 255, input) != NULL) {
+    double a_f, beta_f, K_sa_f, gamma_f;
+    std::istringstream row_stream(row);
+    std::string parsed_soil_name;
+    row_stream >> std::quoted(parsed_soil_name) >> a_f >> beta_f >> K_sa_f >> gamma_f;
+    if (row_stream.fail() || parsed_soil_name.size() >= sizeof(soil_name)) {
+      fclose(input);
+      throw runtime_error("Matrix/fracture interface rows require four values after the name.");
+    }
+    strcpy(soil_name, parsed_soil_name.c_str());
+    if (strlen(soil_name) >= MAX_SOIL_NAME_CHARS || a_f <= 0.0 || beta_f < 0.0 ||
+        K_sa_f < 0.0 || gamma_f < 0.0) {
+      fclose(input);
+      throw runtime_error("Invalid matrix/fracture interface parameter row.");
+    }
+
+    struct mass_transfer_soil_properties_ *properties =
+      &mass_transfer_soil_properties[soil];
+    strcpy(properties->soil_name, soil_name);
+    properties->a_f = a_f;
+    properties->beta_f = beta_f;
+    properties->K_sa_f = K_sa_f;
+    properties->gamma_f = gamma_f;
+    properties->A_Gamma_per_cm_h = beta_f * gamma_f * K_sa_f / (a_f * a_f);
+    if (!std::isfinite(properties->A_Gamma_per_cm_h)) {
+      fclose(input);
+      throw runtime_error("Non-finite A_Gamma derived from interface parameters.");
+    }
+    soil++;
+    count++;
+  }
+
+  fclose(input);
+  return count;
 }
 
 // ############################################################################################

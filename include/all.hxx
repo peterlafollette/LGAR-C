@@ -100,6 +100,37 @@ struct soil_properties_  /* note the trailing underscore on the name.  It is jus
   double theta_wp;         // water content at wilting point [-]
 };
 
+// Parameters for the matrix/fracture exchange coefficient
+// A_Gamma = beta_f * gamma_f * K_sa_f / a_f^2 [1/(cm h)].
+struct mass_transfer_soil_properties_
+{
+  char soil_name[MAX_SOIL_NAME_CHARS];
+  double a_f;
+  double beta_f;
+  double K_sa_f;
+  double gamma_f;
+  double A_Gamma_per_cm_h;
+};
+
+struct dual_permeability_exchange_result
+{
+  // Positive transfer moves water from the matrix to the fracture domain.
+  double transfer_water_content;
+  double theta_matrix;
+  double theta_fracture;
+  bool capacity_limited;
+  bool equilibrium_limited;
+};
+
+struct dual_permeability_profile_exchange_result
+{
+  // Positive transfer moves water from the matrix to the fracture domain [cm
+  // over the total model area].
+  double transfer_cm;
+  double mass_balance_error_cm;
+  int region_count;
+};
+
 
 // Define a struct for unit conversion
 struct unit_conversion
@@ -162,6 +193,10 @@ struct lgar_bmi_parameters
   bool   PET_affects_precip = false;     // set to true in config file if you want PET to be taken from precip 
   bool   adaptive_timestep = false;      // if set to true, model uses adaptive timestep. In this case, the minimum timestep is the timestep specified in the config file. The maximum time step will be equal to the forcing resolution.
   bool   TO_enabled = false;             // if true, enable existence of TO WFs (that are in confact with a shallow water table), if false, no TO WFs are possible and the lower BC will be no flow or free drainage
+  bool   dual_perm = false;              // if true, simulate matrix and fracture flow domains
+  bool   dual_surface_capacity_limited = false; // share capacity-limited surface water instead of handing matrix runoff to fractures
+  double frac_to_pref = 0.0;             // fraction of surface input assigned to the fracture domain [0-1]
+  double ratio_fracture_vol_to_total_vol = 0.0; // fracture-domain volume fraction (0-1)
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
   bool   lower_bdy_flux_to_CR  = false;  // Send positive net lower-boundary drainage/exchange to the nonlinear conceptual reservoir. Defaults to false.
   bool   mobile_groundwater_level = false; // if true, update the effective depth to groundwater from lower-boundary flux and conceptual-reservoir discharge. Defaults to false.
@@ -313,9 +348,26 @@ struct model_state
   struct wetting_front*               head           = NULL; // head pointer to the current state
   struct wetting_front*               state_previous = NULL; // head pointer to the previous state,
                                                              // used in computing derivatives and mass balance
+  struct wetting_front*               head_frac = NULL; // fracture-domain state in dual-permeability mode
+  struct wetting_front*               state_previous_frac = NULL;
   struct soil_properties_*            soil_properties;       // dynamic allocation
+  struct soil_properties_*            soil_properties_frac = NULL;
+  struct mass_transfer_soil_properties_* mass_transfer_soil_properties = NULL;
   struct lgar_bmi_parameters          lgar_bmi_params;
   struct lgar_mass_balance_variables  lgar_mass_balance;
+  // Unweighted domain runoff diagnostics.  The handoff is expressed over the
+  // total model area and is internal to the dual-permeability water balance.
+  double dual_matrix_runoff_timestep_cm = 0.0;
+  double dual_fracture_runoff_timestep_cm = 0.0;
+  double dual_runoff_handoff_timestep_cm = 0.0;
+  // Total-area contributions, retained separately for diagnosing the two
+  // domain water ledgers without changing the public aggregate BMI fluxes.
+  double dual_matrix_infiltration_timestep_cm = 0.0;
+  double dual_fracture_infiltration_timestep_cm = 0.0;
+  double dual_matrix_recharge_timestep_cm = 0.0;
+  double dual_fracture_recharge_timestep_cm = 0.0;
+  double dual_mass_transfer_timestep_cm = 0.0;
+  double dual_mass_transfer_cm = 0.0;
   struct unit_conversion              units;
   struct lgar_bmi_input_parameters*   lgar_bmi_input_params;
   struct lgar_calib_parameters        lgar_calib_params;
@@ -413,7 +465,46 @@ extern double lgar_calc_dry_depth(bool TO_enabled, bool use_closed_form_G, int n
 
 // reads van Genuchten parameters from a file
 extern int lgar_read_vG_param_file(char const* vG_param_file_name, int num_soil_types, double wilting_point_psi_cm,
-                                    struct soil_properties_ *soil_properties, bool log_mode);
+                                    struct soil_properties_ *soil_properties, bool log_mode = false,
+                                    struct soil_properties_ *soil_properties_frac = NULL);
+
+// Reads legacy a_f, beta_f, K_sa_f, gamma_f values and stores their aggregate A_Gamma.
+extern int lgar_read_vG_param_file_mass_transfer(
+  char const* frac_matrix_interface_param_file_name,
+  int num_soil_types,
+  struct mass_transfer_soil_properties_ *mass_transfer_soil_properties);
+
+// Conservative exchange for one common-depth region. This pure numerical kernel
+// is shared by LGAR and LGARTO dual-domain drivers.
+extern struct dual_permeability_exchange_result lgar_dual_permeability_exchange_region(
+  double ratio_fracture_vol_to_total_vol,
+  double subtimestep_h,
+  double A_Gamma_per_cm_h,
+  double psi_matrix_cm,
+  double psi_fracture_cm,
+  double theta_matrix,
+  double theta_fracture,
+  const struct soil_properties_ *soil_matrix,
+  const struct soil_properties_ *soil_fracture);
+
+extern struct dual_permeability_profile_exchange_result
+lgar_dual_permeability_exchange_profiles(
+  int num_layers,
+  double ratio_fracture_vol_to_total_vol,
+  double subtimestep_h,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties_matrix,
+  struct soil_properties_ *soil_properties_fracture,
+  struct mass_transfer_soil_properties_ *mass_transfer_soil_properties,
+  struct wetting_front **head_matrix,
+  struct wetting_front **head_fracture);
+
+extern double lgar_dual_permeability_storage_cm(
+  double ratio_fracture_vol_to_total_vol,
+  double *cum_layer_thickness_cm,
+  struct wetting_front *head_matrix,
+  struct wetting_front *head_fracture);
 
 // creates a surficial front (new top most wetting front)
 extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double *ponded_depth_cm, double *volin, double dry_depth,

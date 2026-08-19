@@ -30,7 +30,13 @@ class NotImplemented : public std::logic_error {
 class BmiLGAR : public bmi::Bmi {
 public:
   ~BmiLGAR();
-  BmiLGAR():giuh_ordinates(nullptr), giuh_runoff_queue(nullptr) {
+  BmiLGAR():state(nullptr), num_giuh_ordinates(0), giuh_ordinates(nullptr),
+            giuh_runoff_queue(nullptr), dual_fracture_state(nullptr),
+            dual_scratch_giuh_runoff_queue(nullptr),
+            dual_runtime_initialized(false),
+            dual_domain_update_in_progress(false),
+            dual_cumulative_handoff_cm(0.0),
+            dual_cumulative_exchange_cm(0.0) {
     this->input_var_names[0] = "precipitation_rate";
     this->input_var_names[1] = "potential_evapotranspiration_rate";
     this->input_var_names[2] = "soil_temperature_profile";
@@ -155,6 +161,9 @@ public:
 
 private:
   void realloc_soil();
+  void InitializeDualPermeabilityRuntime();
+  void UpdateSingleDomain();
+  void UpdateDualPermeabilityLGAR();
   struct model_state* state;
   static const int input_var_name_count  = 3;
   static const int output_var_name_count = 18;
@@ -167,6 +176,17 @@ private:
   int num_giuh_ordinates;
   double *giuh_ordinates;
   double *giuh_runoff_queue;
+
+  // The fracture domain reuses the single-domain solver with independent
+  // mutable state; static layer and soil arrays remain owned by `state`.
+  struct model_state *dual_fracture_state;
+  struct lgar_bmi_parameters dual_matrix_params;
+  struct lgar_mass_balance_variables dual_matrix_mass_balance;
+  double *dual_scratch_giuh_runoff_queue;
+  bool dual_runtime_initialized;
+  bool dual_domain_update_in_progress;
+  double dual_cumulative_handoff_cm;
+  double dual_cumulative_exchange_cm;
 
   // unit conversion
   //struct unit_conversion units;

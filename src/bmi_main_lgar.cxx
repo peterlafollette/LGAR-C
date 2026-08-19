@@ -56,6 +56,8 @@ int main(int argc, char *argv[])
   start_time = clock();
 
   model_state.Initialize(argv[1]);
+  const bool dual_permeability =
+    model_state.get_model()->lgar_bmi_params.dual_perm;
 
 
   std::string var_name_precip = "precipitation_rate";
@@ -136,10 +138,16 @@ int main(int argc, char *argv[])
 
   for (int j = 0; j < num_output_var; j++) {
     fprintf(outdata_fptr,"%s",output_var_names[j].c_str());
-    if (j == num_output_var-1)
+    if (j == num_output_var-1 && !dual_permeability)
       fprintf(outdata_fptr,"\n");
     else
       fprintf(outdata_fptr,",");
+  }
+  if (dual_permeability) {
+    fprintf(outdata_fptr,
+      "matrix_storage,fracture_storage,matrix_fracture_transfer,"
+      "cumulative_matrix_fracture_transfer,matrix_infiltration,"
+      "fracture_infiltration,matrix_percolation,fracture_percolation\n");
   }
 
   // model timestep and forcing timestep are read from a config file in lgar.cxx
@@ -167,10 +175,29 @@ int main(int argc, char *argv[])
       double value = 0.0;
       model_state.GetValue(name,&value);
       fprintf(outdata_fptr,"%6.15f",value);
-      if (j == num_output_var-1)
+      if (j == num_output_var-1 && !dual_permeability)
         fprintf(outdata_fptr,"\n");
       else
         fprintf(outdata_fptr,",");
+    }
+    if (dual_permeability) {
+      struct model_state *dual_state = model_state.get_model();
+      const double cm_to_m = dual_state->units.cm_to_m;
+      const double matrix_storage_m = cm_to_m * lgar_calc_mass_bal(
+        dual_state->lgar_bmi_params.cum_layer_thickness_cm,
+        dual_state->head);
+      const double fracture_storage_m = cm_to_m * lgar_calc_mass_bal(
+        dual_state->lgar_bmi_params.cum_layer_thickness_cm,
+        dual_state->head_frac);
+      fprintf(outdata_fptr,
+        "%6.15f,%6.15f,%6.15f,%6.15f,%6.15f,%6.15f,%6.15f,%6.15f\n",
+        matrix_storage_m, fracture_storage_m,
+        cm_to_m * dual_state->dual_mass_transfer_timestep_cm,
+        cm_to_m * dual_state->dual_mass_transfer_cm,
+        cm_to_m * dual_state->dual_matrix_infiltration_timestep_cm,
+        cm_to_m * dual_state->dual_fracture_infiltration_timestep_cm,
+        cm_to_m * dual_state->dual_matrix_recharge_timestep_cm,
+        cm_to_m * dual_state->dual_fracture_recharge_timestep_cm);
     }
 
     if (write_full_state) {
