@@ -1,0 +1,4 @@
+Texture a_f_cm beta_f K_sa_f_cm_per_h gamma_f
+loam 1.0 3.0 0.005 0.4
+silt_loam 1.0 3.0 0.005 0.4
+clay_loam 1.0 3.0 0.005 0.4
