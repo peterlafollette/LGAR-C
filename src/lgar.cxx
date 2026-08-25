@@ -105,6 +105,7 @@ using namespace std;
 #define BOUNDARY_NEAR_SATURATION_PSI_SNAP_MAX_CM 1.E-2
 #define BOUNDARY_STORAGE_NEUTRAL_THETA_TOL 1.E-12
 #define BOUNDARY_PSI_SNAP_MASS_TOLERANCE_CM 1.E-3
+#define DUAL_PERMEABILITY_MAX_RECONSTRUCTION_RESIDUAL_CM 1.E-1
 #define MOBILE_GROUNDWATER_SUBMERGENCE_TOL_CM 1.E-6
 #ifndef LGARTO_TO_PACKET_EVENT_SPLIT_MERGE_READY_SPACING_CM
 // Keep this synchronized with the event splitter's handoff distance.
@@ -7177,9 +7178,11 @@ static bool lgarto_mass_aware_to_bottom_snap(
   int *soil_type,
   struct soil_properties_ *soil_properties,
   struct wetting_front **head,
-  const std::vector<struct wetting_front *> &snap_scaffold)
+  const std::vector<struct wetting_front *> &snap_scaffold,
+  double mass_tolerance_cm = MBAL_ITERATIVE_TOLERANCE)
 {
-  if (head == NULL || *head == NULL || snap_scaffold.empty()) {
+  if (head == NULL || *head == NULL || snap_scaffold.empty() ||
+      !std::isfinite(mass_tolerance_cm) || mass_tolerance_cm <= 0.0) {
     return false;
   }
 
@@ -7222,7 +7225,7 @@ static bool lgarto_mass_aware_to_bottom_snap(
     mass_high_cm = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
   }
 
-  const double bracket_tol_cm = fmax(MBAL_ITERATIVE_TOLERANCE, 1.0e-12);
+  const double bracket_tol_cm = fmax(mass_tolerance_cm, 1.0e-14);
   if (target_mass_cm > mass_low_cm + bracket_tol_cm ||
       target_mass_cm < mass_high_cm - bracket_tol_cm) {
     lgarto_restore_theta_snap_state(simple_snap_states);
@@ -7250,7 +7253,7 @@ static bool lgarto_mass_aware_to_bottom_snap(
       best_psi_cm = psi_mid_cm;
       best_mass_error_cm = fabs(mass_error_cm);
     }
-    if (fabs(mass_error_cm) <= MBAL_ITERATIVE_TOLERANCE) {
+    if (fabs(mass_error_cm) <= mass_tolerance_cm) {
       best_psi_cm = psi_mid_cm;
       break;
     }
@@ -7265,6 +7268,12 @@ static bool lgarto_mass_aware_to_bottom_snap(
 
   if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, best_psi_cm,
                                              soil_type, soil_properties)) {
+    lgarto_restore_theta_snap_state(simple_snap_states);
+    return false;
+  }
+
+  if (fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) - target_mass_cm) >
+      mass_tolerance_cm) {
     lgarto_restore_theta_snap_state(simple_snap_states);
     return false;
   }
@@ -12753,6 +12762,15 @@ static bool lgar_all_TO_storage_intervals_are_saturated(int num_layers,
          interval_top >= cum_layer_thickness_cm[num_layers] - LOWER_BOUNDARY_FINAL_TOL_CM;
 }
 
+static bool lgar_all_wetting_fronts_are_TO(struct wetting_front *head)
+{
+  if (head == NULL) return false;
+  for (struct wetting_front *front = head; front != NULL; front = front->next) {
+    if (!front->is_WF_GW) return false;
+  }
+  return true;
+}
+
 extern double lgar_insert_water(bool use_closed_form_G, int nint, double timestep_h, double AET_demand_cm, double free_drainage_subtimestep_cm, double *ponded_depth_cm,
 				double *volin_this_timestep, double precip_timestep_cm, int wf_free_drainage_demand,
 			        int num_layers, double ponded_depth_max_cm, int *soil_type,
@@ -12807,6 +12825,20 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
     current_free_drainage_next == NULL &&
     lgar_all_TO_storage_intervals_are_saturated(num_layers, cum_layer_thickness_cm,
                                                 soil_type, head, soil_properties);
+  const bool terminal_all_TO_free_drainage =
+    current_free_drainage_next == NULL &&
+    number_of_wetting_fronts > num_layers &&
+    current_free_drainage->is_WF_GW == TRUE &&
+    current_free_drainage->to_bottom == TRUE &&
+    layer_num_fp == num_layers &&
+    std::fabs(current_free_drainage->depth_cm -
+              cum_layer_thickness_cm[num_layers]) <= LOWER_BOUNDARY_FINAL_TOL_CM &&
+    std::isfinite(current_free_drainage->theta) &&
+    current_free_drainage->theta >=
+      soil_properties[soil_type[num_layers]].theta_r - 1.0e-12 &&
+    current_free_drainage->theta <=
+      soil_properties[soil_type[num_layers]].theta_e + 1.0e-12 &&
+    lgar_all_wetting_fronts_are_TO(head);
   if (number_of_wetting_fronts == num_layers || saturated_terminal_TO_column) {
     Geff = 0.0; // i.e., case of no capillary suction, dz/dt is also zero for all wetting fronts
     soil_num = soil_type[layer_num_fp];
@@ -12814,7 +12846,7 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
     Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[frozen_layer];
   }
   else {
-    if (current_free_drainage_next == NULL) {
+    if (current_free_drainage_next == NULL && !terminal_all_TO_free_drainage) {
       fprintf(stderr,
               "Error: infiltration/free-drainage selector returned terminal front.\n"
               "  requested_front=%d number_of_wetting_fronts=%d mobile_groundwater_level=%d\n",
@@ -12837,11 +12869,17 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
     vg_n     = soil_properties[soil_num].vg_n;
     double lambda = soil_properties[soil_num].bc_lambda;
     double bc_psib_cm = soil_properties[soil_num].bc_psib_cm;
-    Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[current->layer_num];
+    const int frozen_layer = terminal_all_TO_free_drainage
+      ? layer_num_fp
+      : current->layer_num;
+    Ksat_cm_per_h = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[frozen_layer];
 
-    //double theta = current_free_drainage->theta;
-    double theta_below = current_free_drainage_next->theta;
-    if (mobile_groundwater_level &&
+    // A terminal all-TO profile has no explicit block below the lower boundary.
+    // Continue its terminal water content into a zero-gradient ghost state.
+    double theta_below = terminal_all_TO_free_drainage
+      ? current_free_drainage->theta
+      : current_free_drainage_next->theta;
+    if (!terminal_all_TO_free_drainage && mobile_groundwater_level &&
         current_free_drainage->is_WF_GW == FALSE &&
         current_free_drainage->to_bottom == TRUE &&
         current_free_drainage_next->is_WF_GW == TRUE &&
@@ -14745,7 +14783,8 @@ extern void lgar_create_surficial_front(bool TO_enabled, int num_layers, double 
   Se = calc_Se_from_theta(theta_new,theta_e,theta_r);
   current->psi_cm = calc_h_from_Se(Se, vg_alpha_per_cm , vg_m, vg_n);
 
-  current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m) * frozen_factor[layer_num]; // AJ - K_temp in python version for 1st layer
+  // Ksat already includes the frozen reduction; do not apply it twice.
+  current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
 
   current->dzdt_cm_per_h = 0.0; //for now assign 0 to dzdt as it will be computed/updated in lgar_dzdt_calc function
 
@@ -15046,7 +15085,8 @@ struct lgar_dual_permeability_block
 static void lgar_dual_permeability_refresh_conductivity(
   struct wetting_front *head,
   int *layer_soil_type,
-  struct soil_properties_ *soil_properties)
+  struct soil_properties_ *soil_properties,
+  double *frozen_factor)
 {
   for (struct wetting_front *front = head; front != NULL; front = front->next) {
     const int soil = layer_soil_type[front->layer_num];
@@ -15054,7 +15094,8 @@ static void lgar_dual_permeability_refresh_conductivity(
       calc_Se_from_theta(front->theta, soil_properties[soil].theta_e,
                          soil_properties[soil].theta_r)));
     front->K_cm_per_h = calc_K_from_Se(
-      Se, soil_properties[soil].Ksat_cm_per_h, soil_properties[soil].vg_m);
+      Se, soil_properties[soil].Ksat_cm_per_h * frozen_factor[front->layer_num],
+      soil_properties[soil].vg_m);
   }
 }
 
@@ -15102,6 +15143,416 @@ static void lgar_dual_permeability_add_transfer(
     "Dual-permeability exchange region has no finite-storage wetting front.");
 }
 
+static bool lgar_dual_permeability_boundary_constrained_block(
+  struct wetting_front *head,
+  const struct wetting_front *front)
+{
+  if (front == NULL || front->to_bottom) return true;
+  struct wetting_front *previous = NULL;
+  for (struct wetting_front *probe = head;
+       probe != NULL && probe != front; probe = probe->next) {
+    previous = probe;
+  }
+  return previous != NULL && previous->to_bottom &&
+         previous->layer_num != front->layer_num;
+}
+
+static bool lgar_dual_permeability_boundary_reconstruction_candidate(
+  const struct wetting_front *upper,
+  const struct wetting_front *lower,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties)
+{
+  // Layered surface-front motion assumes a shared psi, including when the
+  // upper soil is numerically near saturation.
+  return (std::fabs(upper->psi_cm - lower->psi_cm) >
+            lgar_boundary_roundtrip_psi_tolerance_cm(
+              upper->psi_cm, lower->psi_cm)) ||
+         lgar_boundary_psi_snap_candidate(
+           upper, lower, layer_soil_type, soil_properties);
+}
+
+/*
+ * Restore cross-soil pressure continuity after exchange without changing the
+ * exact post-exchange storage.  Treat each connected to_bottom scaffold as a
+ * separate constraint; unrelated soil boundaries must not share one psi.
+ */
+static bool lgar_dual_permeability_mass_aware_boundary_reconstruction(
+  double target_storage_cm,
+  double tolerance_cm,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head)
+{
+  const std::vector<lgarto_global_theta_snap_state> post_exchange_states =
+    lgarto_snapshot_theta_snap_state(*head);
+  const std::vector<struct wetting_front *> boundary_upper_fronts =
+    lgar_collect_boundary_upper_fronts(*head);
+
+  for (auto boundary_it = boundary_upper_fronts.rbegin();
+       boundary_it != boundary_upper_fronts.rend(); ++boundary_it) {
+    struct wetting_front *upper = *boundary_it;
+    struct wetting_front *lower = upper->next;
+    if (!lgar_dual_permeability_boundary_reconstruction_candidate(
+          upper, lower, layer_soil_type, soil_properties)) {
+      continue;
+    }
+
+    const std::vector<struct wetting_front *> boundary_chain =
+      lgarto_boundary_snap_chain(*head, upper);
+    if (boundary_chain.empty() ||
+        !lgarto_mass_aware_to_bottom_snap(
+          target_storage_cm, cum_layer_thickness_cm, layer_soil_type,
+          soil_properties, head, boundary_chain, tolerance_cm)) {
+      // A later chain can fail after earlier chains succeeded; fallback must
+      // always start from the original independently inverted exchange state.
+      lgarto_restore_theta_snap_state(post_exchange_states);
+      return false;
+    }
+  }
+
+  if (fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) -
+           target_storage_cm) > tolerance_cm) {
+    lgarto_restore_theta_snap_state(post_exchange_states);
+    return false;
+  }
+  return true;
+}
+
+/*
+ * Numerical saturation can make psi -> theta non-injective in one soil but
+ * not its neighbor.  When the common-psi mass solve cannot be bracketed,
+ * restore the legacy lower-psi boundary state and let the residual projector
+ * recover the small storage change.
+ */
+static void lgar_dual_permeability_apply_boundary_fallback(
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front *head)
+{
+  const std::vector<struct wetting_front *> boundary_upper_fronts =
+    lgar_collect_boundary_upper_fronts(head);
+  for (auto boundary_it = boundary_upper_fronts.rbegin();
+       boundary_it != boundary_upper_fronts.rend(); ++boundary_it) {
+    struct wetting_front *upper = *boundary_it;
+    struct wetting_front *lower = upper->next;
+    if (!lgar_dual_permeability_boundary_reconstruction_candidate(
+          upper, lower, layer_soil_type, soil_properties)) {
+      continue;
+    }
+
+    const int soil = layer_soil_type[upper->layer_num];
+    upper->psi_cm = lower->psi_cm;
+    upper->theta = calc_theta_from_h(
+      upper->psi_cm, soil_properties[soil].vg_alpha_per_cm,
+      soil_properties[soil].vg_m, soil_properties[soil].vg_n,
+      soil_properties[soil].theta_e, soil_properties[soil].theta_r);
+  }
+}
+
+static double lgar_dual_permeability_apply_uniform_psi_projection(
+  const std::vector<lgarto_global_theta_snap_state>& states,
+  bool wetting_projection,
+  double projection_value,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front *head)
+{
+  for (const lgarto_global_theta_snap_state& state : states) {
+    const int soil = layer_soil_type[state.front->layer_num];
+    state.front->psi_cm = wetting_projection
+      ? fmax(0.0, state.psi_cm * projection_value)
+      : fmin(PSI_UPPER_LIM, state.psi_cm + projection_value);
+    state.front->theta = calc_theta_from_h(
+      state.front->psi_cm, soil_properties[soil].vg_alpha_per_cm,
+      soil_properties[soil].vg_m, soil_properties[soil].vg_n,
+      soil_properties[soil].theta_e, soil_properties[soil].theta_r);
+  }
+  return lgar_calc_mass_bal(cum_layer_thickness_cm, head);
+}
+
+static bool lgar_dual_permeability_project_storage_via_uniform_psi(
+  double target_storage_cm,
+  double tolerance_cm,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head)
+{
+  const std::vector<lgarto_global_theta_snap_state> original_states =
+    lgarto_snapshot_theta_snap_state(*head);
+  const double original_storage_cm =
+    lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  const bool wetting_projection = target_storage_cm > original_storage_cm;
+
+  double bracket_low = 0.0;
+  double bracket_high = wetting_projection ? 1.0 : 1.0;
+  double mass_low_cm;
+  double mass_high_cm;
+  if (wetting_projection) {
+    mass_low_cm = lgar_dual_permeability_apply_uniform_psi_projection(
+      original_states, true, bracket_low, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, *head);
+    mass_high_cm = lgar_dual_permeability_apply_uniform_psi_projection(
+      original_states, true, bracket_high, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, *head);
+    if (target_storage_cm > mass_low_cm + tolerance_cm ||
+        target_storage_cm < mass_high_cm - tolerance_cm) {
+      lgarto_restore_theta_snap_state(original_states);
+      return false;
+    }
+  }
+  else {
+    mass_low_cm = original_storage_cm;
+    mass_high_cm = lgar_dual_permeability_apply_uniform_psi_projection(
+      original_states, false, bracket_high, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, *head);
+    while (mass_high_cm > target_storage_cm + tolerance_cm &&
+           bracket_high < PSI_UPPER_LIM) {
+      bracket_high = fmin(PSI_UPPER_LIM, bracket_high * 2.0);
+      mass_high_cm = lgar_dual_permeability_apply_uniform_psi_projection(
+        original_states, false, bracket_high, cum_layer_thickness_cm,
+        layer_soil_type, soil_properties, *head);
+    }
+    if (target_storage_cm > mass_low_cm + tolerance_cm ||
+        target_storage_cm < mass_high_cm - tolerance_cm) {
+      lgarto_restore_theta_snap_state(original_states);
+      return false;
+    }
+  }
+
+  double best_value = wetting_projection ? bracket_high : bracket_low;
+  double best_error_cm = fabs(original_storage_cm - target_storage_cm);
+  for (int iteration = 0; iteration < 100; iteration++) {
+    const double midpoint = 0.5 * (bracket_low + bracket_high);
+    const double midpoint_mass_cm =
+      lgar_dual_permeability_apply_uniform_psi_projection(
+        original_states, wetting_projection, midpoint,
+        cum_layer_thickness_cm, layer_soil_type, soil_properties, *head);
+    const double midpoint_error_cm = midpoint_mass_cm - target_storage_cm;
+    if (fabs(midpoint_error_cm) < best_error_cm) {
+      best_error_cm = fabs(midpoint_error_cm);
+      best_value = midpoint;
+    }
+    if (fabs(midpoint_error_cm) <= tolerance_cm) {
+      best_value = midpoint;
+      break;
+    }
+
+    if (wetting_projection) {
+      // Larger factors are drier and therefore contain less water.
+      if (midpoint_mass_cm > target_storage_cm) bracket_low = midpoint;
+      else bracket_high = midpoint;
+    }
+    else {
+      // Larger additive shifts are drier and therefore contain less water.
+      if (midpoint_mass_cm > target_storage_cm) bracket_low = midpoint;
+      else bracket_high = midpoint;
+    }
+  }
+
+  (void) lgar_dual_permeability_apply_uniform_psi_projection(
+    original_states, wetting_projection, best_value,
+    cum_layer_thickness_cm, layer_soil_type, soil_properties, *head);
+  return fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) -
+              target_storage_cm) <= tolerance_cm;
+}
+
+/*
+ * Re-project a post-exchange profile onto an exact domain-storage target.
+ *
+ * Exchange first changes theta in the fixed wetting-front blocks.  The
+ * subsequent global psi update restores the cross-soil boundary invariants,
+ * but a boundary snap can make a small, unintended storage change.  The
+ * legacy repair varied only the deepest front; that front is commonly at (or
+ * very near) saturation in LGARTO, so the requested target was not always
+ * bracketed.
+ *
+ * As a fallback, correct the snap residual over all finite, non-boundary blocks.
+ * Storage is linear in each block theta, so moving every eligible block by
+ * the same fraction of its available wetting/drying capacity closes the
+ * target without moving a front or disturbing a shared boundary psi.  This
+ * is a numerical projection only: the physical exchange amount remains the
+ * sum of the region transfers calculated above.
+ */
+static double lgar_dual_permeability_project_domain_storage(
+  int num_layers,
+  double target_storage_cm,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head)
+{
+  if (head == NULL || *head == NULL || cum_layer_thickness_cm == NULL ||
+      layer_soil_type == NULL || soil_properties == NULL ||
+      !std::isfinite(target_storage_cm)) {
+    throw runtime_error("Invalid dual-permeability storage projection input.");
+  }
+
+  const double tolerance_cm = 1.0e-12 * fmax(1.0, fabs(target_storage_cm));
+  double residual_cm =
+    target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (fabs(residual_cm) <= tolerance_cm) return residual_cm;
+  if (!std::isfinite(residual_cm) ||
+      fabs(residual_cm) > DUAL_PERMEABILITY_MAX_RECONSTRUCTION_RESIDUAL_CM) {
+    std::ostringstream message;
+    message << "Dual-permeability boundary reconstruction residual exceeds "
+            << "the allowed fallback correction: residual_cm="
+            << std::setprecision(17) << residual_cm
+            << " limit_cm="
+            << DUAL_PERMEABILITY_MAX_RECONSTRUCTION_RESIDUAL_CM
+            << " target_storage_cm=" << target_storage_cm;
+    throw runtime_error(message.str());
+  }
+
+  std::vector<lgar_dual_permeability_block> blocks =
+    lgar_dual_permeability_blocks(*head, cum_layer_thickness_cm, num_layers);
+  double available_storage_cm = 0.0;
+  for (const lgar_dual_permeability_block& block : blocks) {
+    // A to_bottom front carries the shared pressure state at a soil boundary.
+    // Leave it untouched so projection cannot re-introduce a psi discontinuity.
+    if (lgar_dual_permeability_boundary_constrained_block(
+          *head, block.front)) continue;
+    const int soil = layer_soil_type[block.front->layer_num];
+    const double available_theta = residual_cm > 0.0
+      ? soil_properties[soil].theta_e - block.front->theta
+      : block.front->theta - soil_properties[soil].theta_r;
+    available_storage_cm += block.thickness_cm * fmax(0.0, available_theta);
+  }
+
+  if (available_storage_cm > tolerance_cm) {
+    const double capacity_fraction =
+      fmin(1.0, fabs(residual_cm) / available_storage_cm);
+    const double direction = residual_cm > 0.0 ? 1.0 : -1.0;
+    for (lgar_dual_permeability_block& block : blocks) {
+      if (lgar_dual_permeability_boundary_constrained_block(
+            *head, block.front)) continue;
+      const int soil = layer_soil_type[block.front->layer_num];
+      const double theta_limit = direction > 0.0
+        ? soil_properties[soil].theta_e
+        : soil_properties[soil].theta_r;
+      block.front->theta +=
+        capacity_fraction * (theta_limit - block.front->theta);
+      block.front->theta = fmax(
+        soil_properties[soil].theta_r,
+        fmin(soil_properties[soil].theta_e, block.front->theta));
+      block.front->psi_cm = lgar_dual_permeability_psi_from_theta(
+        block.front->theta, &soil_properties[soil]);
+    }
+  }
+
+  residual_cm =
+    target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+
+  // Close roundoff left by the distributed update on one independent block.
+  // Because block storage is exactly theta * thickness, this last update is
+  // linear and does not require another nonlinear iteration.
+  if (fabs(residual_cm) > tolerance_cm) {
+    for (lgar_dual_permeability_block& block : blocks) {
+      if (lgar_dual_permeability_boundary_constrained_block(
+            *head, block.front) || block.thickness_cm <= 0.0) continue;
+      const int soil = layer_soil_type[block.front->layer_num];
+      const double theta_delta = residual_cm / block.thickness_cm;
+      const double theta_trial = block.front->theta + theta_delta;
+      if (theta_trial < soil_properties[soil].theta_r - 1.0e-14 ||
+          theta_trial > soil_properties[soil].theta_e + 1.0e-14) {
+        continue;
+      }
+      block.front->theta = fmax(
+        soil_properties[soil].theta_r,
+        fmin(soil_properties[soil].theta_e, theta_trial));
+      block.front->psi_cm = lgar_dual_permeability_psi_from_theta(
+        block.front->theta, &soil_properties[soil]);
+      residual_cm =
+        target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+      break;
+    }
+  }
+
+  // If every finite block is part of a layer-boundary pair, solve a connected
+  // shared-psi chain instead of perturbing either member independently.
+  if (fabs(residual_cm) > tolerance_cm &&
+      available_storage_cm <= tolerance_cm) {
+    const std::vector<struct wetting_front *> boundary_upper_fronts =
+      lgar_collect_boundary_upper_fronts(*head);
+    for (auto boundary_it = boundary_upper_fronts.rbegin();
+         boundary_it != boundary_upper_fronts.rend(); ++boundary_it) {
+      const std::vector<struct wetting_front *> boundary_scaffold =
+        lgarto_boundary_snap_chain(*head, *boundary_it);
+      if (boundary_scaffold.empty()) continue;
+      if (lgarto_mass_aware_to_bottom_snap(
+            target_storage_cm, cum_layer_thickness_cm, layer_soil_type,
+            soil_properties, head, boundary_scaffold)) {
+        residual_cm =
+          target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+        if (fabs(residual_cm) <= tolerance_cm) break;
+      }
+    }
+  }
+
+
+  // Last resort for a profile whose independent blocks and individual
+  // boundary chains cannot bracket the target.  A monotone transformation of
+  // every psi preserves pressure ordering and all existing boundary
+  // equalities while providing the full profile's wetting/drying capacity.
+  if (fabs(residual_cm) > tolerance_cm) {
+    (void) lgar_dual_permeability_project_storage_via_uniform_psi(
+      target_storage_cm, tolerance_cm, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, head);
+    residual_cm =
+      target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  }
+  return residual_cm;
+}
+
+static void lgar_dual_permeability_reconstruct_domain_after_exchange(
+  int num_layers,
+  double target_storage_cm,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head)
+{
+  const double tolerance_cm =
+    1.0e-12 * fmax(1.0, fabs(target_storage_cm));
+  if (lgar_dual_permeability_mass_aware_boundary_reconstruction(
+        target_storage_cm, tolerance_cm, cum_layer_thickness_cm,
+        layer_soil_type, soil_properties, head)) {
+    return;
+  }
+
+  // Near a retention-curve plateau, a common-psi storage target may not be
+  // numerically bracketable.  Canonicalize the boundaries, then redistribute
+  // only the resulting small residual through the existing projection path.
+  lgar_dual_permeability_apply_boundary_fallback(
+    layer_soil_type, soil_properties, *head);
+  const double fallback_residual_cm =
+    target_storage_cm - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  if (verbosity.compare("high") == 0) {
+    printf("Dual-permeability exchange used residual reconstruction "
+           "(residual_cm=%.17g, limit_cm=%.17g).\n",
+           fallback_residual_cm,
+           DUAL_PERMEABILITY_MAX_RECONSTRUCTION_RESIDUAL_CM);
+  }
+
+  const double final_residual_cm =
+    lgar_dual_permeability_project_domain_storage(
+      num_layers, target_storage_cm, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, head);
+  if (!std::isfinite(final_residual_cm) ||
+      fabs(final_residual_cm) > tolerance_cm) {
+    std::ostringstream message;
+    message << "Dual-permeability residual reconstruction did not recover "
+            << "the domain storage target: residual_cm="
+            << std::setprecision(17) << final_residual_cm
+            << " tolerance_cm=" << tolerance_cm
+            << " target_storage_cm=" << target_storage_cm;
+    throw runtime_error(message.str());
+  }
+}
+
 extern struct dual_permeability_profile_exchange_result
 lgar_dual_permeability_exchange_profiles(
   int num_layers,
@@ -15112,6 +15563,7 @@ lgar_dual_permeability_exchange_profiles(
   struct soil_properties_ *soil_properties_matrix,
   struct soil_properties_ *soil_properties_fracture,
   struct mass_transfer_soil_properties_ *mass_transfer_soil_properties,
+  double *frozen_factor,
   struct wetting_front **head_matrix,
   struct wetting_front **head_fracture)
 {
@@ -15121,7 +15573,8 @@ lgar_dual_permeability_exchange_profiles(
       ratio_fracture_vol_to_total_vol >= 1.0 ||
       cum_layer_thickness_cm == NULL || layer_soil_type == NULL ||
       soil_properties_matrix == NULL || soil_properties_fracture == NULL ||
-      mass_transfer_soil_properties == NULL || head_matrix == NULL ||
+      mass_transfer_soil_properties == NULL || frozen_factor == NULL ||
+      head_matrix == NULL ||
       head_fracture == NULL || *head_matrix == NULL || *head_fracture == NULL) {
     throw runtime_error("Invalid input to dual-permeability profile exchange.");
   }
@@ -15257,27 +15710,16 @@ lgar_dual_permeability_exchange_profiles(
     transfer_from_regions_cm / matrix_fraction;
   const double target_fracture_storage_cm = initial_fracture_storage_cm +
     transfer_from_regions_cm / ratio_fracture_vol_to_total_vol;
-  lgar_global_psi_update(cum_layer_thickness_cm, layer_soil_type,
-                         soil_properties_matrix, head_matrix);
-  lgar_global_psi_update(cum_layer_thickness_cm, layer_soil_type,
-                         soil_properties_fracture, head_fracture);
-  if (std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head_matrix) -
-                target_matrix_storage_cm) > MBAL_ITERATIVE_TOLERANCE) {
-    lgar_theta_mass_balance_correction(
-      false, listLength(*head_matrix), target_matrix_storage_cm, head_matrix,
-      cum_layer_thickness_cm, layer_soil_type, soil_properties_matrix);
-  }
-  if (std::fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head_fracture) -
-                target_fracture_storage_cm) > MBAL_ITERATIVE_TOLERANCE) {
-    lgar_theta_mass_balance_correction(
-      false, listLength(*head_fracture), target_fracture_storage_cm,
-      head_fracture, cum_layer_thickness_cm, layer_soil_type,
-      soil_properties_fracture);
-  }
+  lgar_dual_permeability_reconstruct_domain_after_exchange(
+    num_layers, target_matrix_storage_cm, cum_layer_thickness_cm,
+    layer_soil_type, soil_properties_matrix, head_matrix);
+  lgar_dual_permeability_reconstruct_domain_after_exchange(
+    num_layers, target_fracture_storage_cm, cum_layer_thickness_cm,
+    layer_soil_type, soil_properties_fracture, head_fracture);
   lgar_dual_permeability_refresh_conductivity(
-    *head_matrix, layer_soil_type, soil_properties_matrix);
+    *head_matrix, layer_soil_type, soil_properties_matrix, frozen_factor);
   lgar_dual_permeability_refresh_conductivity(
-    *head_fracture, layer_soil_type, soil_properties_fracture);
+    *head_fracture, layer_soil_type, soil_properties_fracture, frozen_factor);
   lgar_assert_wetting_fronts_nonnegative_depth(*head_matrix);
   lgar_assert_wetting_fronts_nonnegative_depth(*head_fracture);
   lgar_assert_wetting_front_depth_order(*head_matrix);

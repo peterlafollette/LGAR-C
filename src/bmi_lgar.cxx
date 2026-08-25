@@ -2426,14 +2426,14 @@ static lgar_mass_balance_variables lgar_initial_domain_mass_balance(
 void BmiLGAR::InitializeDualPermeabilityRuntime()
 {
   const lgar_bmi_parameters& params = state->lgar_bmi_params;
-  if (params.is_invalid_soil_type || params.sft_coupled ||
-      params.calib_params_flag || params.PET_affects_precip ||
+  if (params.is_invalid_soil_type || params.calib_params_flag ||
+      params.PET_affects_precip ||
       params.lower_bdy_flux_to_CR || params.mobile_groundwater_level ||
       params.lateral_flow_enabled || params.frac_to_CR > 0.0 ||
       params.initial_CR_fast_storage_cm > 0.0 ||
       params.initial_CR_slow_storage_cm > 0.0) {
     throw std::runtime_error(
-      "dual_perm Update does not yet support invalid-soil bypass, calibration, SFT, "
+      "dual_perm Update does not yet support invalid-soil bypass, calibration, "
       "PET-precipitation subtraction, conceptual reservoirs, mobile groundwater, "
       "simple preferential flow, or lateral flow.");
   }
@@ -2575,7 +2575,8 @@ static void lgar_refresh_domain_conductivity(struct model_state *domain)
       front->theta, domain->soil_properties[soil].theta_e,
       domain->soil_properties[soil].theta_r)));
     front->K_cm_per_h = calc_K_from_Se(
-      Se, domain->soil_properties[soil].Ksat_cm_per_h,
+      Se, domain->soil_properties[soil].Ksat_cm_per_h *
+            domain->lgar_bmi_params.frozen_factor[front->layer_num],
       domain->soil_properties[soil].vg_m);
   }
 }
@@ -2747,6 +2748,7 @@ void BmiLGAR::UpdateDualPermeabilityLGAR()
       matrix_state->lgar_bmi_params.layer_soil_type,
       matrix_state->soil_properties, dual_fracture_state->soil_properties,
       matrix_state->mass_transfer_soil_properties,
+      matrix_state->lgar_bmi_params.frozen_factor,
       &matrix_state->head, &dual_fracture_state->head);
   dual_cumulative_exchange_cm += exchange.transfer_cm;
 
@@ -2945,8 +2947,11 @@ UpdateSingleDomain()
   }
   
   // if lasam is coupled to soil freeze-thaw, frozen fraction module is called
-  if (state->lgar_bmi_params.sft_coupled)
+  if (state->lgar_bmi_params.sft_coupled) {
     frozen_factor_hydraulic_conductivity(state->lgar_bmi_params);
+    // Temperature can change without changing theta; refresh stored K now.
+    lgar_refresh_domain_conductivity(state);
+  }
 
   double volchange_calib_cm = 0.0;
 
@@ -3310,6 +3315,9 @@ UpdateSingleDomain()
       listDelete(state->state_previous);
       state->state_previous = NULL;
     }
+    // Topology repairs can rebuild boundary K from unfrozen Ksat.  Restore the
+    // layer factor before this subcycle uses stored K for free drainage.
+    lgar_refresh_domain_conductivity(state);
     state->state_previous = listCopy(state->head);
 
     double ponded_flux_for_CR = 0.0;
@@ -3832,6 +3840,10 @@ UpdateSingleDomain()
 	          lgarto_correction_type_surf(num_layers, state->lgar_bmi_params.cum_layer_thickness_cm,
 	                                      &state->head, surface_cleanup_lower_boundary_cm);
 	      }
+
+      // Cleanup may update theta/psi through generic list routines that do not
+      // know the layer's frozen factor; synchronize K before calculating dz/dt.
+      lgar_refresh_domain_conductivity(state);
 
       /*----------------------------------------------------------------------*/
       // calculate derivative (dz/dt) for all wetting fronts

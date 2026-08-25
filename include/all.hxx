@@ -497,6 +497,7 @@ lgar_dual_permeability_exchange_profiles(
   struct soil_properties_ *soil_properties_matrix,
   struct soil_properties_ *soil_properties_fracture,
   struct mass_transfer_soil_properties_ *mass_transfer_soil_properties,
+  double *frozen_factor,
   struct wetting_front **head_matrix,
   struct wetting_front **head_fracture);
 
