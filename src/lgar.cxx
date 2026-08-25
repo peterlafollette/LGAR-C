@@ -2892,7 +2892,6 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
   double theta_e, theta_r;
   double vg_a, vg_m, vg_n,Ksat_cm_per_h;
   double h_min_cm;
-  struct wetting_front *current;
   struct wetting_front *current_free_drainage;
   struct wetting_front *current_free_drainage_next;
   int soil_num;
@@ -2901,7 +2900,6 @@ extern double lgar_insert_water(bool use_closed_form_G, int nint, double timeste
 
   double h_p = fmax(*ponded_depth_cm - precip_timestep_cm * timestep_h, 0.0); // water ponded on the surface
 
-  current = head;
   current_free_drainage      = listFindFront(wf_that_supplies_free_drainage_demand, head, NULL);
   current_free_drainage_next = listFindFront(wf_that_supplies_free_drainage_demand+1, head, NULL);
 
