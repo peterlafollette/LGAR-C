@@ -366,6 +366,8 @@ struct model_state
   double dual_fracture_infiltration_timestep_cm = 0.0;
   double dual_matrix_recharge_timestep_cm = 0.0;
   double dual_fracture_recharge_timestep_cm = 0.0;
+  double dual_matrix_lateral_flow_timestep_cm = 0.0;
+  double dual_fracture_lateral_flow_timestep_cm = 0.0;
   double dual_mass_transfer_timestep_cm = 0.0;
   double dual_mass_transfer_cm = 0.0;
   struct unit_conversion              units;
@@ -581,6 +583,15 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
 							 double *frozen_factor,
 							 struct wetting_front **head,
 							 struct soil_properties_ *soil_properties);
+extern bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
+  double groundwater_depth_cm,
+  int num_layers,
+  double *cum_layer_thickness_cm,
+  int *soil_type,
+  double *frozen_factor,
+  struct wetting_front **head,
+  struct soil_properties_ *soil_properties,
+  double preserved_vadose_psi_cm);
 extern double lgarto_move_mobile_groundwater_support_for_storage_change(double requested_storage_change_cm,
 									double current_groundwater_depth_cm,
 									int num_layers,
@@ -612,6 +623,15 @@ extern double lgarto_sync_mobile_groundwater_support_to_CR_storage(double target
 extern bool lgarto_reconcile_CR_sync_trial_boundaries(
   double target_mass_cm, double *cum_layer_thickness_cm, int *soil_type,
   struct wetting_front **head, struct soil_properties_ *soil_properties);
+extern void lgarto_reconcile_after_profile_state_mutation(
+  int num_layers, double target_storage_cm,
+  double *cum_layer_thickness_cm, int *layer_soil_type,
+  struct soil_properties_ *soil_properties, struct wetting_front **head,
+  const char *context);
+extern double lgarto_restore_mass_in_available_TO_storage(
+  double target_mass, int num_layers, double *cum_layer_thickness_cm,
+  int *soil_type, struct wetting_front **head,
+  struct soil_properties_ *soil_properties);
 extern double lgarto_rewet_receded_groundwater_zone(double previous_groundwater_depth_cm,
 						    double groundwater_depth_cm,
 						    int num_layers,
@@ -800,7 +820,8 @@ extern double lgar_wetting_front_cross_domain_boundary(double domain_depth_cm, i
 
 // subroutine to handle wet over dry wetting fronts condtions
 extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cum_layer_thickness_cm, int *soil_type,
-						 struct wetting_front** head, struct soil_properties_ *soil_properties);
+						 struct wetting_front** head, struct soil_properties_ *soil_properties,
+						 bool strict_material_inversions_only = false);
 
 // checks if dry over wet wetting front exists or not
 extern bool lgar_check_dry_over_wet_wetting_fronts(struct wetting_front* head);
@@ -935,6 +956,18 @@ extern double calc_CR_Q(
     double *CR_fast_storage_cm,
     double *CR_slow_storage_cm);
 
+// Advances the two reservoirs with independently specified fast/slow inputs.
+extern double calc_CR_Q_explicit_inputs(
+    double subtimestep_h,
+    double a_fast, double a_slow,
+    double b_fast, double b_slow,
+    double fast_discharge_threshold_cm,
+    double slow_discharge_threshold_cm,
+    double fast_input_cm_per_h,
+    double slow_input_cm_per_h,
+    double *CR_fast_storage_cm,
+    double *CR_slow_storage_cm);
+
 extern double lgar_cap_CR_input_by_available_storage(
     double raw_CR_input_cm,
     double available_storage_cm,
@@ -949,6 +982,19 @@ extern void lgar_partition_lower_boundary_flux_for_CR(
     double *CR_input_cm,
     double *CR_fast_storage_cm,
     double *CR_slow_storage_cm = NULL,
+    double *CR_storage_exchange_cm = NULL);
+
+// Partitions weighted matrix/fracture recharge without domain-order dependence.
+extern void lgar_partition_dual_lower_boundary_fluxes_for_CR(
+    bool route_positive_lower_boundary_flux_to_CR,
+    double matrix_lower_boundary_flux_cm,
+    double fracture_lower_boundary_flux_cm,
+    double frac_slow,
+    double *percolation_cm,
+    double *fast_CR_input_cm,
+    double *slow_CR_input_cm,
+    double *CR_fast_storage_cm,
+    double *CR_slow_storage_cm,
     double *CR_storage_exchange_cm = NULL);
 
 #endif  // _ALL_HXX

@@ -35,7 +35,7 @@ public:
             dual_scratch_giuh_runoff_queue(nullptr),
             dual_runtime_initialized(false),
             dual_domain_update_in_progress(false),
-            dual_cumulative_handoff_cm(0.0),
+            dual_shared_upward_TO_supply_scale(1.0),
             dual_cumulative_exchange_cm(0.0) {
     this->input_var_names[0] = "precipitation_rate";
     this->input_var_names[1] = "potential_evapotranspiration_rate";
@@ -185,7 +185,7 @@ private:
   double *dual_scratch_giuh_runoff_queue;
   bool dual_runtime_initialized;
   bool dual_domain_update_in_progress;
-  double dual_cumulative_handoff_cm;
+  double dual_shared_upward_TO_supply_scale;
   double dual_cumulative_exchange_cm;
 
   // unit conversion

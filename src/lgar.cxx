@@ -3781,11 +3781,11 @@ static bool lgarto_to_bottom_surface_front_connected_to_GW_below(
          front->psi_cm <= front->next->psi_cm + psi_tol_cm;
 }
 
-static void lgarto_convert_surface_fronts_drier_than_TO_below(struct wetting_front **head,
+static bool lgarto_convert_surface_fronts_drier_than_TO_below(struct wetting_front **head,
                                                               const char *correction_context)
 {
   if (head == NULL || *head == NULL) {
-    return;
+    return false;
   }
 
   bool converted_any = false;
@@ -3851,6 +3851,7 @@ static void lgarto_convert_surface_fronts_drier_than_TO_below(struct wetting_fro
     printf("%s converted surf wf to TO \n", correction_context);
     listPrint(*head);
   }
+  return converted_any;
 }
 
 static bool lgarto_surface_front_overtook_surface_front_above_TO_chain(const struct wetting_front *current)
@@ -7845,8 +7846,19 @@ extern bool lgarto_reconcile_CR_sync_trial_boundaries(
           upper, lower, soil_type, soil_properties)) {
       continue;
     }
-    const std::vector<struct wetting_front *> chain =
+    std::vector<struct wetting_front *> chain =
       lgarto_boundary_snap_chain(*head, upper);
+    struct wetting_front *gw_vadose = NULL;
+    if (lgarto_find_mobile_groundwater_storage_pair(
+          *head, MOBILE_GROUNDWATER_SUBMERGENCE_TOL_CM,
+          &gw_vadose, NULL) && !chain.empty() &&
+        chain.back()->next == gw_vadose &&
+        chain.back()->layer_num == gw_vadose->layer_num &&
+        gw_vadose->depth_cm > chain.back()->depth_cm + 1.0e-10) {
+      // Solve the adjacent vadose pair member with the boundary so the snap
+      // cannot leave a wetter TO front above a drier groundwater contact.
+      chain.push_back(gw_vadose);
+    }
     if (!lgarto_mass_aware_to_bottom_snap(
           target_mass_cm, cum_layer_thickness_cm, soil_type,
           soil_properties, head, chain)) {
@@ -9568,7 +9580,8 @@ extern double lgar_wetting_front_cross_domain_boundary(double domain_depth_cm, i
   drainage is enabled it can do the same thing */
 // ############################################################################################
 extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cum_layer_thickness_cm, int *soil_type,
-					 struct wetting_front** head, struct soil_properties_ *soil_properties)
+					 struct wetting_front** head, struct soil_properties_ *soil_properties,
+                                         bool strict_material_inversions_only)
 {
   // This function will delete the wetting front that is drier than the WF below it that is in the same layer, and then it will 
   // iteratively adjust the psi and theta values of the region of the soil column that should have just 1 psi value now that a WF was deleted.
@@ -9590,7 +9603,10 @@ extern void lgar_fix_dry_over_wet_wetting_fronts(double *mass_change, double* cu
       // and are within the same layer
       /***************************************************/
 
-      if ((current->theta <= next->theta) && (current->layer_num == next->layer_num)) {
+      const bool dry_over_wet = strict_material_inversions_only
+        ? next->theta - current->theta > 1.0e-12
+        : current->theta <= next->theta;
+      if (dry_over_wet && current->layer_num == next->layer_num) {
         double prior_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
         const double colocated_boundary_tol_cm =
           fmax(1.0e-8, DEPTH_AVOIDS_SAME_WF_DEPTH);
@@ -11062,8 +11078,7 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_at_depth(double groun
     for (struct wetting_front *scan = *head;
          scan != NULL && scan != new_vadose_side_front;
          scan = scan->next) {
-      if (scan->is_WF_GW &&
-          !scan->to_bottom &&
+      if (!scan->to_bottom &&
           scan->layer_num == new_vadose_side_front->layer_num) {
         has_same_layer_front_above_support = true;
       }
@@ -11122,7 +11137,7 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_at_depth(double groun
   return true;
 }
 
-static bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
+extern bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
   double groundwater_depth_cm,
   int num_layers,
   double *cum_layer_thickness_cm,
@@ -11164,7 +11179,7 @@ static bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth
     bool has_same_layer_source = false;
     for (struct wetting_front *scan = *head;
          scan != NULL && scan != vadose_side_front; scan = scan->next) {
-      if (scan->is_WF_GW && !scan->to_bottom &&
+      if (!scan->to_bottom &&
           scan->layer_num == vadose_side_front->layer_num) {
         has_same_layer_source = true;
       }
@@ -13742,7 +13757,7 @@ lgarto_save_front_hydraulic_states(struct wetting_front *head)
   return states;
 }
 
-static double lgar_restore_surface_creation_mass_in_available_TO_storage(
+extern double lgarto_restore_mass_in_available_TO_storage(
   double target_mass,
   int num_layers,
   double *cum_layer_thickness_cm,
@@ -13809,7 +13824,7 @@ static double lgar_restore_surface_creation_mass_in_available_TO_storage(
 
   if (verbosity.compare("high") == 0 &&
       fabs(residual_cm) + 1.0e-12 < initial_abs_residual_cm) {
-    printf("surface creation attempted whole-column TO storage repair; residual %.12e cm\n",
+    printf("whole-column TO storage repair left residual %.12e cm\n",
            residual_cm);
   }
 
@@ -13978,7 +13993,7 @@ static double lgar_route_surface_creation_residual_if_needed(double remaining_ma
       (creation_excess_gw_flux_cm != NULL || creation_excess_runoff_cm != NULL)) {
     const double residual_before_column_storage = remaining_mass_error_after_depth;
     remaining_mass_error_after_depth =
-      lgar_restore_surface_creation_mass_in_available_TO_storage(
+      lgarto_restore_mass_in_available_TO_storage(
         *target_mass, num_layers, cum_layer_thickness_cm, soil_type, &head, soil_properties);
     if (remaining_mass_error_after_depth <= MBAL_ITERATIVE_TOLERANCE) {
       return remaining_mass_error_after_depth;
@@ -15009,6 +15024,18 @@ extern struct dual_permeability_exchange_result lgar_dual_permeability_exchange_
       !std::isfinite(theta_matrix) || !std::isfinite(theta_fracture)) {
     throw runtime_error("Invalid input to dual-permeability exchange region.");
   }
+  const double theta_roundoff_tolerance = 64.0 * DBL_EPSILON;
+  if (theta_matrix < soil_matrix->theta_r - theta_roundoff_tolerance ||
+      theta_matrix > soil_matrix->theta_e + theta_roundoff_tolerance ||
+      theta_fracture < soil_fracture->theta_r - theta_roundoff_tolerance ||
+      theta_fracture > soil_fracture->theta_e + theta_roundoff_tolerance) {
+    throw runtime_error("Dual-permeability exchange states lie outside hydraulic capacity bounds.");
+  }
+  // Normalize roundoff at the bounds before calculating donor/receiver capacity.
+  theta_matrix = fmax(soil_matrix->theta_r, fmin(soil_matrix->theta_e, theta_matrix));
+  theta_fracture = fmax(soil_fracture->theta_r, fmin(soil_fracture->theta_e, theta_fracture));
+  result.theta_matrix = theta_matrix;
+  result.theta_fracture = theta_fracture;
   if (subtimestep_h == 0.0 || A_Gamma_per_cm_h == 0.0 ||
       psi_matrix_cm == psi_fracture_cm) {
     return result;
@@ -15078,9 +15105,31 @@ extern struct dual_permeability_exchange_result lgar_dual_permeability_exchange_
 struct lgar_dual_permeability_block
 {
   struct wetting_front *front;
+  double start_depth_cm;
+  double end_depth_cm;
   double thickness_cm;
   double transfer_cm;
 };
+
+struct lgar_dual_permeability_skipped_span
+{
+  double start_depth_cm;
+  double end_depth_cm;
+  int layer_num;
+};
+
+// Use one geometry tolerance so every exchange region maps to the same
+// finite-storage block that later receives its transfer.
+static constexpr double DUAL_PERMEABILITY_EXCHANGE_DEPTH_TOLERANCE_CM = 1.0e-12;
+
+static bool lgar_dual_permeability_depths_close(double first_cm,
+                                                double second_cm)
+{
+  const double roundoff_cm = 16.0 * DBL_EPSILON *
+    fmax(1.0, fmax(fabs(first_cm), fabs(second_cm)));
+  return fabs(first_cm - second_cm) <=
+    DUAL_PERMEABILITY_EXCHANGE_DEPTH_TOLERANCE_CM + roundoff_cm;
+}
 
 static void lgar_dual_permeability_refresh_conductivity(
   struct wetting_front *head,
@@ -15099,11 +15148,37 @@ static void lgar_dual_permeability_refresh_conductivity(
   }
 }
 
+static void lgar_assert_dual_permeability_hydraulic_bounds(
+  struct wetting_front *head,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  const char *context)
+{
+  for (struct wetting_front *front = head; front != NULL; front = front->next) {
+    const int soil = layer_soil_type[front->layer_num];
+    if (!std::isfinite(front->theta) || !std::isfinite(front->psi_cm) ||
+        front->theta < soil_properties[soil].theta_r - 1.0e-12 ||
+        front->theta > soil_properties[soil].theta_e + 1.0e-12) {
+      std::ostringstream message;
+      message << context << " left a wetting front outside hydraulic bounds: "
+              << "front=" << front->front_num
+              << " layer=" << front->layer_num
+              << " depth_cm=" << std::setprecision(17) << front->depth_cm
+              << " theta=" << front->theta
+              << " theta_r=" << soil_properties[soil].theta_r
+              << " theta_e=" << soil_properties[soil].theta_e
+              << " psi_cm=" << front->psi_cm;
+      throw runtime_error(message.str());
+    }
+  }
+}
+
 static std::vector<lgar_dual_permeability_block>
 lgar_dual_permeability_blocks(
   struct wetting_front *head,
   double *cum_layer_thickness_cm,
-  int num_layers)
+  int num_layers,
+  std::vector<lgar_dual_permeability_skipped_span>& skipped_spans)
 {
   std::vector<lgar_dual_permeability_block> blocks;
   struct wetting_front *previous = NULL;
@@ -15117,8 +15192,24 @@ lgar_dual_permeability_blocks(
       start_depth_cm = fmax(start_depth_cm, previous->depth_cm);
     }
     const double thickness_cm = front->depth_cm - start_depth_cm;
-    if (thickness_cm > 1.0e-12) {
-      blocks.push_back({front, thickness_cm, 0.0});
+    // Exchange over smaller scaffold spans is numerically meaningless and can
+    // amplify roundoff when a common region is divided by the original span.
+    if (thickness_cm > LGARTO_ZERO_DEPTH_TOLERANCE_CM) {
+      blocks.push_back(
+        {front, start_depth_cm, front->depth_cm, thickness_cm, 0.0});
+    }
+    else if (thickness_cm > 0.0) {
+      // Retain adjacent discarded blocks as one explicitly explained gap.
+      if (!skipped_spans.empty() &&
+          skipped_spans.back().layer_num == front->layer_num &&
+          lgar_dual_permeability_depths_close(
+            skipped_spans.back().end_depth_cm, start_depth_cm)) {
+        skipped_spans.back().end_depth_cm = front->depth_cm;
+      }
+      else {
+        skipped_spans.push_back(
+          {start_depth_cm, front->depth_cm, front->layer_num});
+      }
     }
     else if (thickness_cm < -1.0e-10) {
       throw runtime_error("Invalid depth order in dual-permeability profile.");
@@ -15128,19 +15219,24 @@ lgar_dual_permeability_blocks(
   return blocks;
 }
 
-static void lgar_dual_permeability_add_transfer(
-  std::vector<lgar_dual_permeability_block>& blocks,
-  struct wetting_front *front,
-  double transfer_cm)
+static bool lgar_dual_permeability_skipped_span_covers(
+  const std::vector<lgar_dual_permeability_skipped_span>& skipped_spans,
+  double start_depth_cm,
+  double end_depth_cm,
+  int layer_num)
 {
-  for (lgar_dual_permeability_block& block : blocks) {
-    if (block.front == front) {
-      block.transfer_cm += transfer_cm;
-      return;
+  for (const lgar_dual_permeability_skipped_span& span : skipped_spans) {
+    // Merged spans contain only constituent blocks that independently met the
+    // zero-depth cutoff; their combined length may be slightly larger.
+    if (span.layer_num == layer_num &&
+        (start_depth_cm >= span.start_depth_cm ||
+         lgar_dual_permeability_depths_close(start_depth_cm, span.start_depth_cm)) &&
+        (end_depth_cm <= span.end_depth_cm ||
+         lgar_dual_permeability_depths_close(end_depth_cm, span.end_depth_cm))) {
+      return true;
     }
   }
-  throw runtime_error(
-    "Dual-permeability exchange region has no finite-storage wetting front.");
+  return false;
 }
 
 static bool lgar_dual_permeability_boundary_constrained_block(
@@ -15407,8 +15503,10 @@ static double lgar_dual_permeability_project_domain_storage(
     throw runtime_error(message.str());
   }
 
+  std::vector<lgar_dual_permeability_skipped_span> skipped_spans;
   std::vector<lgar_dual_permeability_block> blocks =
-    lgar_dual_permeability_blocks(*head, cum_layer_thickness_cm, num_layers);
+    lgar_dual_permeability_blocks(
+      *head, cum_layer_thickness_cm, num_layers, skipped_spans);
   double available_storage_cm = 0.0;
   for (const lgar_dual_permeability_block& block : blocks) {
     // A to_bottom front carries the shared pressure state at a soil boundary.
@@ -15553,6 +15651,96 @@ static void lgar_dual_permeability_reconstruct_domain_after_exchange(
   }
 }
 
+extern void lgarto_reconcile_after_profile_state_mutation(
+  int num_layers,
+  double target_storage_cm,
+  double *cum_layer_thickness_cm,
+  int *layer_soil_type,
+  struct soil_properties_ *soil_properties,
+  struct wetting_front **head,
+  const char *context)
+{
+  if (head == NULL || *head == NULL || num_layers <= 0 ||
+      cum_layer_thickness_cm == NULL || layer_soil_type == NULL ||
+      soil_properties == NULL || !std::isfinite(target_storage_cm)) {
+    throw runtime_error("Invalid post-mutation profile reconciliation input.");
+  }
+
+  const double tolerance_cm =
+    1.0e-12 * fmax(1.0, fabs(target_storage_cm));
+  const char *label = context == NULL
+    ? "Post-mutation profile reconciliation" : context;
+  const int max_passes = 4 * listLength(*head) + 2 * num_layers + 8;
+  for (int pass = 0; pass < max_passes; pass++) {
+    // Recheck from the beginning after every state-only repair; no movement or
+    // external flux correction is replayed here.
+    const bool converted_surface =
+      lgarto_convert_surface_fronts_drier_than_TO_below(head, label);
+    bool material_surface_inversion = false;
+    for (struct wetting_front *front = *head;
+         front != NULL && front->next != NULL; front = front->next) {
+      if (front->is_WF_GW == FALSE && front->next->is_WF_GW == FALSE &&
+          front->layer_num == front->next->layer_num &&
+          front->next->theta - front->theta > 1.0e-12) {
+        material_surface_inversion = true;
+        break;
+      }
+    }
+    if (!material_surface_inversion) {
+      const int front_count_before_cleanup = listLength(*head);
+      (void) lgarto_cleanup_redundant_colocated_psi0_support_stacks(
+        cum_layer_thickness_cm, layer_soil_type, head, soil_properties);
+      if (listLength(*head) != front_count_before_cleanup) {
+        continue;
+      }
+
+      bool boundary_mismatch = false;
+      for (struct wetting_front *upper : lgar_collect_boundary_upper_fronts(*head)) {
+        struct wetting_front *lower = upper->next;
+        if (lower != NULL &&
+            fabs(upper->psi_cm - lower->psi_cm) >
+              lgar_boundary_roundtrip_psi_tolerance_cm(
+                upper->psi_cm, lower->psi_cm)) {
+          boundary_mismatch = true;
+          break;
+        }
+      }
+      if (boundary_mismatch ||
+          fabs(lgar_calc_mass_bal(cum_layer_thickness_cm, *head) -
+               target_storage_cm) > tolerance_cm) {
+        lgar_dual_permeability_reconstruct_domain_after_exchange(
+          num_layers, target_storage_cm, cum_layer_thickness_cm,
+          layer_soil_type, soil_properties, head);
+        continue;
+      }
+      if (converted_surface) {
+        continue;
+      }
+
+      lgar_assert_wetting_fronts_nonnegative_depth(*head);
+      lgar_assert_wetting_front_depth_order(*head);
+      lgar_assert_to_bottom_scaffold(
+        num_layers, cum_layer_thickness_cm, *head);
+      lgar_assert_boundary_psi_continuity(*head);
+      lgar_assert_dual_permeability_hydraulic_bounds(
+        *head, layer_soil_type, soil_properties, label);
+      return;
+    }
+
+    double reconstruction_mass_change_cm = 0.0;
+    lgar_fix_dry_over_wet_wetting_fronts(
+      &reconstruction_mass_change_cm, cum_layer_thickness_cm,
+      layer_soil_type, head, soil_properties, true);
+    lgar_dual_permeability_reconstruct_domain_after_exchange(
+      num_layers, target_storage_cm, cum_layer_thickness_cm,
+      layer_soil_type, soil_properties, head);
+  }
+
+  std::ostringstream message;
+  message << label << " did not converge after " << max_passes << " passes.";
+  throw runtime_error(message.str());
+}
+
 extern struct dual_permeability_profile_exchange_result
 lgar_dual_permeability_exchange_profiles(
   int num_layers,
@@ -15598,69 +15786,111 @@ lgar_dual_permeability_exchange_profiles(
     ratio_fracture_vol_to_total_vol, cum_layer_thickness_cm,
     *head_matrix, *head_fracture);
 
+  std::vector<lgar_dual_permeability_skipped_span> matrix_skipped_spans;
+  std::vector<lgar_dual_permeability_skipped_span> fracture_skipped_spans;
+  std::vector<lgar_dual_permeability_block> matrix_blocks =
+    lgar_dual_permeability_blocks(
+      *head_matrix, cum_layer_thickness_cm, num_layers, matrix_skipped_spans);
+  std::vector<lgar_dual_permeability_block> fracture_blocks =
+    lgar_dual_permeability_blocks(
+      *head_fracture, cum_layer_thickness_cm, num_layers, fracture_skipped_spans);
+  if (matrix_blocks.empty() || fracture_blocks.empty()) {
+    throw runtime_error(
+      "Dual-permeability exchange received a profile with no finite-storage blocks.");
+  }
+
   std::vector<double> depths;
   depths.push_back(0.0);
   for (int layer = 1; layer <= num_layers; layer++) {
     depths.push_back(cum_layer_thickness_cm[layer]);
   }
-  for (struct wetting_front *front = *head_matrix;
-       front != NULL; front = front->next) {
-    if (front->depth_cm > LGARTO_ZERO_DEPTH_TOLERANCE_CM) {
-      depths.push_back(front->depth_cm);
-    }
+  // Zero-storage scaffold fronts do not define exchange regions.
+  for (const lgar_dual_permeability_block& block : matrix_blocks) {
+    depths.push_back(block.start_depth_cm);
+    depths.push_back(block.end_depth_cm);
   }
-  for (struct wetting_front *front = *head_fracture;
-       front != NULL; front = front->next) {
-    if (front->depth_cm > LGARTO_ZERO_DEPTH_TOLERANCE_CM) {
-      depths.push_back(front->depth_cm);
-    }
+  for (const lgar_dual_permeability_block& block : fracture_blocks) {
+    depths.push_back(block.start_depth_cm);
+    depths.push_back(block.end_depth_cm);
   }
   std::sort(depths.begin(), depths.end());
   std::vector<double> unique_depths;
   for (double depth : depths) {
     for (int layer = 1; layer <= num_layers; layer++) {
-      if (std::fabs(depth - cum_layer_thickness_cm[layer]) <= 1.0e-10) {
+      if (lgar_dual_permeability_depths_close(
+            depth, cum_layer_thickness_cm[layer])) {
         depth = cum_layer_thickness_cm[layer];
         break;
       }
     }
     if (unique_depths.empty() ||
-        std::fabs(depth - unique_depths.back()) > 1.0e-10) {
+        !lgar_dual_permeability_depths_close(depth, unique_depths.back())) {
       unique_depths.push_back(depth);
     }
   }
 
-  struct wetting_front *matrix_front = *head_matrix;
-  struct wetting_front *fracture_front = *head_fracture;
-  std::vector<lgar_dual_permeability_block> matrix_blocks =
-    lgar_dual_permeability_blocks(
-      *head_matrix, cum_layer_thickness_cm, num_layers);
-  std::vector<lgar_dual_permeability_block> fracture_blocks =
-    lgar_dual_permeability_blocks(
-      *head_fracture, cum_layer_thickness_cm, num_layers);
+  std::size_t matrix_block_index = 0;
+  std::size_t fracture_block_index = 0;
   double transfer_from_regions_cm = 0.0;
   int layer = 1;
   for (std::size_t index = 0; index + 1 < unique_depths.size(); index++) {
     const double start_depth_cm = unique_depths[index];
     const double end_depth_cm = unique_depths[index + 1];
     const double thickness_cm = end_depth_cm - start_depth_cm;
-    if (thickness_cm <= 1.0e-12) continue;
+    if (thickness_cm <= 0.0 ||
+        lgar_dual_permeability_depths_close(start_depth_cm, end_depth_cm)) {
+      continue;
+    }
+    const double midpoint_depth_cm = start_depth_cm + 0.5 * thickness_cm;
     while (layer < num_layers &&
-           start_depth_cm >= cum_layer_thickness_cm[layer] - 1.0e-10) {
+           midpoint_depth_cm >= cum_layer_thickness_cm[layer]) {
       layer++;
     }
-    while (matrix_front != NULL &&
-           (lgarto_is_zero_depth(matrix_front->depth_cm) ||
-            matrix_front->depth_cm < end_depth_cm - 1.0e-10)) {
-      matrix_front = matrix_front->next;
+    while (matrix_block_index + 1 < matrix_blocks.size() &&
+           (matrix_blocks[matrix_block_index].front->layer_num < layer ||
+            (midpoint_depth_cm > matrix_blocks[matrix_block_index].end_depth_cm &&
+             !lgar_dual_permeability_depths_close(
+               midpoint_depth_cm, matrix_blocks[matrix_block_index].end_depth_cm)))) {
+      matrix_block_index++;
     }
-    while (fracture_front != NULL &&
-           (lgarto_is_zero_depth(fracture_front->depth_cm) ||
-            fracture_front->depth_cm < end_depth_cm - 1.0e-10)) {
-      fracture_front = fracture_front->next;
+    while (fracture_block_index + 1 < fracture_blocks.size() &&
+           (fracture_blocks[fracture_block_index].front->layer_num < layer ||
+            (midpoint_depth_cm > fracture_blocks[fracture_block_index].end_depth_cm &&
+             !lgar_dual_permeability_depths_close(
+               midpoint_depth_cm, fracture_blocks[fracture_block_index].end_depth_cm)))) {
+      fracture_block_index++;
     }
-    if (matrix_front == NULL || fracture_front == NULL ||
-        matrix_front->layer_num != layer || fracture_front->layer_num != layer) {
+    lgar_dual_permeability_block& matrix_block =
+      matrix_blocks[matrix_block_index];
+    lgar_dual_permeability_block& fracture_block =
+      fracture_blocks[fracture_block_index];
+    const bool matrix_covers_midpoint =
+      (midpoint_depth_cm >= matrix_block.start_depth_cm ||
+       lgar_dual_permeability_depths_close(
+         midpoint_depth_cm, matrix_block.start_depth_cm)) &&
+      (midpoint_depth_cm <= matrix_block.end_depth_cm ||
+       lgar_dual_permeability_depths_close(
+         midpoint_depth_cm, matrix_block.end_depth_cm));
+    const bool fracture_covers_midpoint =
+      (midpoint_depth_cm >= fracture_block.start_depth_cm ||
+       lgar_dual_permeability_depths_close(
+         midpoint_depth_cm, fracture_block.start_depth_cm)) &&
+      (midpoint_depth_cm <= fracture_block.end_depth_cm ||
+       lgar_dual_permeability_depths_close(
+         midpoint_depth_cm, fracture_block.end_depth_cm));
+    const bool matrix_block_is_valid =
+      matrix_covers_midpoint && matrix_block.front->layer_num == layer;
+    const bool fracture_block_is_valid =
+      fracture_covers_midpoint && fracture_block.front->layer_num == layer;
+    if (!matrix_block_is_valid || !fracture_block_is_valid) {
+      // Omit exchange only when discarded microscopic blocks explain the
+      // entire gap; material or otherwise unexplained gaps remain fatal.
+      if ((matrix_block_is_valid || lgar_dual_permeability_skipped_span_covers(
+             matrix_skipped_spans, start_depth_cm, end_depth_cm, layer)) &&
+          (fracture_block_is_valid || lgar_dual_permeability_skipped_span_covers(
+             fracture_skipped_spans, start_depth_cm, end_depth_cm, layer))) {
+        continue;
+      }
       throw runtime_error(
         "Dual-permeability profiles do not cover the same valid soil column.");
     }
@@ -15670,16 +15900,14 @@ lgar_dual_permeability_exchange_profiles(
       lgar_dual_permeability_exchange_region(
         ratio_fracture_vol_to_total_vol, subtimestep_h,
         mass_transfer_soil_properties[soil].A_Gamma_per_cm_h,
-        matrix_front->psi_cm, fracture_front->psi_cm,
-        matrix_front->theta, fracture_front->theta,
+        matrix_block.front->psi_cm, fracture_block.front->psi_cm,
+        matrix_block.front->theta, fracture_block.front->theta,
         &soil_properties_matrix[soil], &soil_properties_fracture[soil]);
     const double region_transfer_cm =
       region_exchange.transfer_water_content * thickness_cm;
     transfer_from_regions_cm += region_transfer_cm;
-    lgar_dual_permeability_add_transfer(
-      matrix_blocks, matrix_front, region_transfer_cm);
-    lgar_dual_permeability_add_transfer(
-      fracture_blocks, fracture_front, region_transfer_cm);
+    matrix_block.transfer_cm += region_transfer_cm;
+    fracture_block.transfer_cm += region_transfer_cm;
     result.region_count++;
   }
 
@@ -15702,6 +15930,12 @@ lgar_dual_permeability_exchange_profiles(
     block.front->psi_cm = lgar_dual_permeability_psi_from_theta(
       block.front->theta, &soil_properties_fracture[soil]);
   }
+  lgar_assert_dual_permeability_hydraulic_bounds(
+    *head_matrix, layer_soil_type, soil_properties_matrix,
+    "Matrix dual-permeability exchange");
+  lgar_assert_dual_permeability_hydraulic_bounds(
+    *head_fracture, layer_soil_type, soil_properties_fracture,
+    "Fracture dual-permeability exchange");
 
   // Keep the existing front topology and kinematics. In particular, LGAR can
   // carry two fronts at one layer boundary; rebuilding from unique depths
@@ -15716,6 +15950,16 @@ lgar_dual_permeability_exchange_profiles(
   lgar_dual_permeability_reconstruct_domain_after_exchange(
     num_layers, target_fracture_storage_cm, cum_layer_thickness_cm,
     layer_soil_type, soil_properties_fracture, head_fracture);
+  // Exchange occurs after the normal movement correction pass, so restore the
+  // same hydraulic ordering without replaying movement or external fluxes.
+  lgarto_reconcile_after_profile_state_mutation(
+    num_layers, target_matrix_storage_cm, cum_layer_thickness_cm,
+    layer_soil_type, soil_properties_matrix, head_matrix,
+    "matrix dual-permeability exchange");
+  lgarto_reconcile_after_profile_state_mutation(
+    num_layers, target_fracture_storage_cm, cum_layer_thickness_cm,
+    layer_soil_type, soil_properties_fracture, head_fracture,
+    "fracture dual-permeability exchange");
   lgar_dual_permeability_refresh_conductivity(
     *head_matrix, layer_soil_type, soil_properties_matrix, frozen_factor);
   lgar_dual_permeability_refresh_conductivity(
@@ -15730,6 +15974,12 @@ lgar_dual_permeability_exchange_profiles(
     num_layers, cum_layer_thickness_cm, *head_fracture);
   lgar_assert_boundary_psi_continuity(*head_matrix);
   lgar_assert_boundary_psi_continuity(*head_fracture);
+  lgar_assert_dual_permeability_hydraulic_bounds(
+    *head_matrix, layer_soil_type, soil_properties_matrix,
+    "Matrix dual-permeability reconstruction");
+  lgar_assert_dual_permeability_hydraulic_bounds(
+    *head_fracture, layer_soil_type, soil_properties_fracture,
+    "Fracture dual-permeability reconstruction");
 
   const double final_total_storage_cm = lgar_dual_permeability_storage_cm(
     ratio_fracture_vol_to_total_vol, cum_layer_thickness_cm,
@@ -16325,9 +16575,19 @@ extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, dou
         bottom_sum += (current->depth_cm-cum_layer_thickness_cm[layer_num-1])/K_cm_per_h;
       }
 
-      if(theta1 > theta2) {
-        printf("Calculating dzdt : theta1 > theta2 = (%lf, %lf) ... aborting \n", theta1, theta2);  // this should never happen
-        exit(0);
+      const double theta_order_error = theta1 - theta2;
+      if(theta_order_error > 1.0e-12) {
+        fprintf(stderr,
+                "Calculating dzdt found a material theta-ordering error: "
+                "theta_below=%.17g theta_above=%.17g difference=%.17g.\n",
+                theta1, theta2, theta_order_error);
+        listPrint(head);
+        abort();
+      }
+      if(theta_order_error > 0.0) {
+        // Retention-curve roundoff can make hydraulically equal states differ
+        // by a few ulps; integrate over a zero-width theta interval in that case.
+        theta1 = theta2;
       }
 
       Geff = calc_Geff(use_closed_form_G, theta1, theta2, theta_e, theta_r, vg_alpha_per_cm, vg_n, vg_m, h_min_cm, Ksat_cm_per_h, nint, lambda, bc_psib_cm); 
@@ -18188,6 +18448,19 @@ extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_t
     head, soil_type, soil_properties, cum_layer_thickness_cm);
   lgar_delete_redundant_finite_same_layer_TO_fronts(
     head, soil_type, soil_properties, cum_layer_thickness_cm);
+
+  /* Deleting duplicate TO fronts can expose a surface front immediately above
+     a wetter TO front after the normal correction loop has already finished.
+     Reclassify that front, then repeat duplicate cleanup to a fixed point. */
+  const int max_mixed_cleanup_passes = listLength(*head) + 1;
+  for (int pass = 0; pass < max_mixed_cleanup_passes; pass++) {
+    if (!lgarto_convert_surface_fronts_drier_than_TO_below(
+          head, "redundant-front cleanup")) {
+      break;
+    }
+    lgar_delete_redundant_finite_same_layer_TO_fronts(
+      head, soil_type, soil_properties, cum_layer_thickness_cm);
+  }
 
   if (*head == NULL || (*head)->next == NULL) {
     if (verbosity.compare("high") == 0) {

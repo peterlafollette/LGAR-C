@@ -157,7 +157,12 @@ extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, do
 /**************************************/
 double calc_theta_from_h(double h,double alpha, double m, double n, double theta_e, double theta_r)
 {
-  return(1.0/(pow(1.0+pow(alpha*h,n),m))*(theta_e-theta_r)+theta_r);
+  if(is_epsilon_less_than(h,1.0E-10)) return theta_e;
+  const double theta = 1.0/(pow(1.0+pow(alpha*h,n),m))*(theta_e-theta_r)+theta_r;
+  // Keep retention-curve roundoff inside its physical water-content bounds.
+  if(theta > theta_e) return theta_e;
+  if(theta < theta_r) return theta_r;
+  return theta;
 }
 
 /***********************************/
