@@ -632,6 +632,10 @@ extern double lgarto_restore_mass_in_available_TO_storage(
   double target_mass, int num_layers, double *cum_layer_thickness_cm,
   int *soil_type, struct wetting_front **head,
   struct soil_properties_ *soil_properties);
+extern double lgarto_restore_mass_cumulatively_in_available_TO_storage(
+  double target_mass, int num_layers, double *cum_layer_thickness_cm,
+  int *soil_type, struct wetting_front **head,
+  struct soil_properties_ *soil_properties);
 extern double lgarto_rewet_receded_groundwater_zone(double previous_groundwater_depth_cm,
 						    double groundwater_depth_cm,
 						    int num_layers,
@@ -693,9 +697,10 @@ extern bool lgar_TO_wetting_fronts_cross_layer_boundary(int num_layers, double *
 
 // the subroutine lets TO wetting fronts merge after one moves too deep past the TO wetting front below it
 extern double lgarto_TO_WFs_merge_via_depth(double target_mass, double column_depth, double *cum_layer_thickness_cm,
-					    struct wetting_front **head, int *soil_type,
-					    struct soil_properties_ *soil_properties,
-					    bool mobile_groundwater_level = false);
+						    struct wetting_front **head, int *soil_type,
+						    struct soil_properties_ *soil_properties,
+						    bool mobile_groundwater_level = false,
+						    double expected_mobile_groundwater_depth_cm = NAN);
 
 // the subroutine lets surface wetting fronts merge with TO wetting fronts after overtaking them
 extern bool lgar_merge_surface_and_TO_wetting_fronts(bool merged_in_non_top_layer, int num_layers,

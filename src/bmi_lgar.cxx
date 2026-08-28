@@ -4842,6 +4842,25 @@ UpdateSingleDomain()
           "substep-ledger");
       }
     }
+    if (defer_catchment_routing &&
+        state->lgar_bmi_params.mobile_groundwater_level &&
+        state->lgar_bmi_params.TO_enabled) {
+      // Repair domain geometry at the fixed shared water table; the dual
+      // wrapper applies the resulting weighted flux to the shared reservoirs.
+      volrech_subtimestep_cm +=
+        lgarto_submerge_wetting_fronts_below_groundwater(
+          lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params),
+          num_layers,
+          state->lgar_bmi_params.cum_layer_thickness_cm,
+          state->lgar_bmi_params.layer_soil_type,
+          state->lgar_bmi_params.frozen_factor,
+          &state->head,
+          state->soil_properties);
+      volend_subtimestep_cm =
+        lgar_calc_mass_bal(state->lgar_bmi_params.cum_layer_thickness_cm,
+                           state->head);
+      volend_timestep_cm = volend_subtimestep_cm;
+    }
     if (!defer_catchment_routing &&
         state->lgar_bmi_params.mobile_groundwater_level &&
         state->lgar_bmi_params.TO_enabled) {
@@ -5053,7 +5072,7 @@ UpdateSingleDomain()
         local_mb <= volin_subtimestep_cm + 1.0e-8) {
       const double storage_before_repair_cm = volend_subtimestep_cm;
       const double target_storage_cm = storage_before_repair_cm + local_mb;
-      (void) lgarto_restore_mass_in_available_TO_storage(
+      (void) lgarto_restore_mass_cumulatively_in_available_TO_storage(
         target_storage_cm, num_layers,
         state->lgar_bmi_params.cum_layer_thickness_cm,
         state->lgar_bmi_params.layer_soil_type, &state->head,
