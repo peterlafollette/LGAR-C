@@ -941,7 +941,7 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
   bool boundaries_are_atomic =
     support_sync_is_finite && lgarto_reconcile_CR_sync_trial_boundaries(
       mass_before_cm, cum_layer_thickness_cm, soil_type, &trial_head,
-      state->soil_properties);
+      state->soil_properties, frozen_factor);
   double chain_storage_after_cm =
     lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                             soil_type, trial_head,
@@ -997,7 +997,7 @@ static double lgar_sync_mobile_groundwater_chain_from_CR_storage(model_state *st
     boundaries_are_atomic =
       support_sync_is_finite && lgarto_reconcile_CR_sync_trial_boundaries(
         mass_before_cm, cum_layer_thickness_cm, soil_type, &trial_head,
-        state->soil_properties);
+        state->soil_properties, frozen_factor);
     chain_storage_after_cm =
       lgarto_mobile_groundwater_CR_storage_cm(num_layers, cum_layer_thickness_cm,
                                               soil_type, trial_head,
@@ -1246,7 +1246,8 @@ lgar_sync_dual_mobile_groundwater_from_shared_CR_storage(
       params.cum_layer_thickness_cm, trial_head);
     if (!lgarto_reconcile_CR_sync_trial_boundaries(
           mass_before_boundary_reconcile_cm, params.cum_layer_thickness_cm,
-          params.layer_soil_type, &trial_head, domain->soil_properties)) {
+          params.layer_soil_type, &trial_head, domain->soil_properties,
+          params.frozen_factor)) {
       listDelete(trial_head);
       return false;
     }
@@ -3284,6 +3285,16 @@ void BmiLGAR::UpdateDualPermeabilityLGAR()
       dual_fracture_state->lgar_mass_balance.volend_cm =
         dual_fracture_state->lgar_mass_balance.volend_timestep_cm;
       if (exchange.region_count > 0) {
+        // Exchange changes the cached hydraulic state; force the normal cache
+        // exit on the next domain update so accumulated PET is reconciled.
+        if (matrix_state->lgar_mass_balance.cache_fluxes) {
+          matrix_state->lgar_bmi_params.cache_count =
+            NUM_TIMESTEPS_BEFORE_RESET_CACHE;
+        }
+        if (dual_fracture_state->lgar_mass_balance.cache_fluxes) {
+          dual_fracture_state->lgar_bmi_params.cache_count =
+            NUM_TIMESTEPS_BEFORE_RESET_CACHE;
+        }
         lgar_refresh_domain_kinematics(matrix_state, coupling_h);
         lgar_refresh_domain_kinematics(dual_fracture_state, coupling_h);
         lgar_refresh_domain_bmi_outputs(matrix_state);
@@ -4725,7 +4736,12 @@ UpdateSingleDomain()
         lower_boundary_flux_for_mobile_groundwater_subtimestep_cm =
           lower_boundary_CR_exchange_cm;
       }
-	      state->lgar_mass_balance.accumulated_lower_boundary_flux_cm += lower_boundary_flux_for_cache_subtimestep_cm;
+	      // The deferred dual-domain ledger immediately projects this signed
+	      // flux into profile storage, so only single-domain routing defers it.
+	      if (!defer_catchment_routing) {
+	        state->lgar_mass_balance.accumulated_lower_boundary_flux_cm +=
+	          lower_boundary_flux_for_cache_subtimestep_cm;
+	      }
 
 	      const lgarto_infiltration_limit_trace_row trace_row = {
 	        state->lgar_bmi_params.timesteps,

@@ -622,7 +622,8 @@ extern double lgarto_sync_mobile_groundwater_support_to_CR_storage(double target
 								   double *explicit_mass_change_cm);
 extern bool lgarto_reconcile_CR_sync_trial_boundaries(
   double target_mass_cm, double *cum_layer_thickness_cm, int *soil_type,
-  struct wetting_front **head, struct soil_properties_ *soil_properties);
+  struct wetting_front **head, struct soil_properties_ *soil_properties,
+  double *frozen_factor = NULL);
 extern void lgarto_reconcile_after_profile_state_mutation(
   int num_layers, double target_storage_cm,
   double *cum_layer_thickness_cm, int *layer_soil_type,
