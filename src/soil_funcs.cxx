@@ -39,13 +39,13 @@ extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, do
 
   if (!use_closed_form_G){
     // local variables
-    // note: units of h in cm.  units of K in cm/s
+    // note: units of h are cm. K uses the same length/time units as Ksat.
     double h_i,h_f,Se_i,Se_f;  // variables to store initial and final values
     double Se;
-    double h2;         // the head at the right-hand side of the trapezoid being integrated [m]
-    double dh;         // the delta h over which integration is performed [m]
+    double h1,h2;      // the heads on the left- and right-hand side of the trapezoid being integrated [cm]
+    double dh;         // adaptive trial step size in capillary head [cm]
     double Se1,Se2;    // the scaled moisture content on left- and right-hand side of trapezoid
-    double K1,K2;      // the K(h) values on the left and right of the region dh integrated [m]
+    double K1,K2;      // K(h) values at the left and right endpoints of the trapezoid
 
     Se_i = calc_Se_from_theta(theta1,theta_e,theta_r);    // scaled initial water content (0-1) [-]
     Se_f = calc_Se_from_theta(theta2,theta_e,theta_r);    // scaled final water content (0-1) [-]
@@ -71,42 +71,51 @@ extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, do
 
     Geff = 0.0;
 
-    // integrate k(h) dh from h_i to h_f, using trapezoidal rule, with subscript
+    // integrate K(h) dh from h_f to h_i, using the trapezoidal rule
     // 1 denoting the left-hand side of the trapezoid, and 2 denoting the right-hand side
 
-    Se1 = Se_i;  // could just use Se_i in next statement.  Done 4 completeness.
+    Se1 = Se_f;  // start at the wet-side integration limit, h_f.
     K1  = calc_K_from_Se(Se1, Ksat, vg_m);
-    h2  = h_f + dh;
+    h1  = h_f;
+    h2  = h1 + dh;
+    const double min_dh = fmax((h_i-h_f)*1.0e-12, 1.0e-12);
+    const int max_steps = 500000; //while we have never seen an infinite loop in the adaptive integral, I'm adding this just in case
+    int steps = 0;
 
-    while(h2<h_i) {
+    while(h1<h_i && steps<max_steps) {
 
-      double prior_h2 = h2;
+      steps++;
+
+      if (h2<=h1) {
+        h2 = nextafter(h1, h_i);
+      }
+      if (h2>h_i) {
+        h2 = h_i;
+      }
+      double dh_trap = h2 - h1;
 
       Se2 = calc_Se_from_h(h2, vg_alpha, vg_m, vg_n);
       K2  = calc_K_from_Se(Se2, Ksat, vg_m);
 
-      //dh is the trapezoid width for numerical integration. dh becomes smaller if the percent difference between K1 and K2 is too large, and dh becomes bigger if K1 and K2 are sufficiently close.
-      //In the case that (K1-K2)/K2 > 0.02, K1 and K2 differ by more than 2 percent. The factor of 2 percent seemed to offer the optimal intersection of accuracy and speed. 
-      if ( (K1-K2)/K2 > 0.02 ){//if K1 disagrees with K2 by more than this fraction, then dh is made smaller
+      // dh is the adaptive trial step size. h2 may be clamped to h_i, so dh_trap
+      // is the actual width used for this trapezoid if the interval is accepted.
+      // If K changes by more than roughly 2 percent across the trial interval, retry with a
+      // smaller dh. Otherwise accept the interval and increase dh for the next trial.
+      if ( (K1-K2)/fmax(K2, 1.0e-300) > 0.02 && dh_trap>min_dh ){//if K1 disagrees with K2 by more than this fraction, then dh is made smaller and we retry 
         dh = dh*0.5;
+        h2 = h1 + dh;
+        continue;
       }
-      else {//but if K1 and K2 are within a certain fraction of each other, then dh is made larger
+      else {// accept this interval and increase the next trial step
         dh = dh*10.0;
       }
 
-      if (h2<h_i){
-        Geff += (K1+K2)*dh/2.0;                  // trapezoidal rule
-      }
-      else{
-        dh = h_i - prior_h2;
-        Se2 = calc_Se_from_h(h_i, vg_alpha, vg_m, vg_n);
-        K2  = calc_K_from_Se(Se2, Ksat, vg_m);
-        Geff += (K1+K2)*dh/2.0;  
-      }
+      Geff += (K1+K2)*dh_trap/2.0;                  // trapezoidal rule
 
       // reset for next time through loop
       K1 = K2;
-      h2 += dh;
+      h1 = h2;
+      h2 = h1 + dh;
 
     }
 
@@ -122,8 +131,8 @@ extern double calc_Geff(bool use_closed_form_G, double theta1, double theta2, do
   }
    else {
 
-     double Se_f = calc_Se_from_theta(theta1,theta_e,theta_r);    // the scaled moisture content of the wetting front
-     double Se_i = calc_Se_from_theta(theta2,theta_e,theta_r);    // the scaled moisture content below the wetting front
+     double Se_f = calc_Se_from_theta(theta1,theta_e,theta_r);    // the scaled moisture content below the wetting front
+     double Se_i = calc_Se_from_theta(theta2,theta_e,theta_r);    // the scaled moisture content of the wetting front
      double H_c = bc_psib_cm*((2+3*lambda)/(1+3*lambda));            // Green ampt capillary drive parameter, which can be used in the approximation of G with the Brooks-Corey model (See Ogden and Saghafian, 1997)
      Geff = H_c*(pow(Se_i,(3+1/lambda))-pow(Se_f,(3+1/lambda)))/(1-pow(Se_f,(3+1/lambda)));
      if (isinf(Geff)){

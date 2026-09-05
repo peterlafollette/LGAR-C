@@ -453,8 +453,8 @@ int main(int argc, char *argv[])
 
   // Benchmark values of wetting fronts depth and moisture (b is for benchmark)
   //std::vector<double> depth_wf_b = {1.873813, 44.00,175.0, 200.0}; // in cm
-  std::vector<double> depth_wf_b = {4.55355239489608365, 44.00,175.0, 200.0}; // in cm
-  std::vector<double> theta_wf_b = {0.21371581122514613, 0.17270389607163267, 0.25211383152603861, 0.17959348005962811};
+  std::vector<double> depth_wf_b = {4.36654, 44.00,175.0, 200.0}; // in cm
+  std::vector<double> theta_wf_b = {0.215457, 0.17270389607163267, 0.25211383152603861, 0.17959348005962811};
 
   int m_to_cm = 100;
   int m_to_mm = 1000;
@@ -518,7 +518,7 @@ int main(int argc, char *argv[])
 
   // check total infiltration, AET, and PET.
   double infiltration_check_mm = 1.896;  // in mm
-  double AET_check_mm          = 0.02980092620558239; // in mm
+  double AET_check_mm          = 0.03048211444838452; // in mm
   double PET_check_mm          = 0.104; // in mm
   double infiltration_computed = 0.0;
   double PET_computed          = 0.0;
