@@ -2068,6 +2068,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   state->lgar_bmi_params.frac_to_pref          = 0.0;
   state->lgar_bmi_params.ratio_fracture_vol_to_total_vol = 0.0;
   state->lgar_bmi_params.free_drainage_enabled = false;
+  state->lgar_bmi_params.fracture_free_drainage_enabled = false;
   state->lgar_bmi_params.lower_bdy_flux_to_CR  = false;
   state->lgar_bmi_params.mobile_groundwater_level = false;
   state->lgar_bmi_params.lateral_flow_enabled = false;
@@ -2106,6 +2107,7 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
   bool is_soil_params_file_set      = false;
   bool is_soil_params_file_mfi_set  = false;
   bool is_dual_surface_boundary_set = false;
+  bool is_fracture_free_drainage_set = false;
   bool is_frac_to_pref_set          = false;
   bool is_ratio_fracture_vol_to_total_vol_set = false;
   bool is_max_valid_soil_types_set  = false;
@@ -2582,6 +2584,14 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
       continue;
     }
+    else if (param_key == "fracture_free_drainage_enabled") {
+      if (param_value != "true" && param_value != "false") {
+        throw runtime_error("fracture_free_drainage_enabled must be true or false.");
+      }
+      state->lgar_bmi_params.fracture_free_drainage_enabled = param_value == "true";
+      is_fracture_free_drainage_set = true;
+      continue;
+    }
     else if (param_key == "lower_bdy_flux_to_CR" || param_key == "free_drainage_to_CR") {
       if (param_value == "false") {
         state->lgar_bmi_params.lower_bdy_flux_to_CR = false;
@@ -2901,6 +2911,18 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
     state->lgar_bmi_params.lateral_flow_enabled = true;
   }
 
+  // Resolve inheritance after parsing so configuration line order is irrelevant.
+  if (!is_fracture_free_drainage_set) {
+    state->lgar_bmi_params.fracture_free_drainage_enabled =
+      state->lgar_bmi_params.free_drainage_enabled;
+  }
+  else if (!state->lgar_bmi_params.dual_perm || state->lgar_bmi_params.TO_enabled ||
+           state->lgar_bmi_params.mobile_groundwater_level) {
+    throw runtime_error(
+      "fracture_free_drainage_enabled requires dual_perm=true, TO_enabled=false, "
+      "and mobile_groundwater_level=false.");
+  }
+
   if (state->lgar_bmi_params.dual_perm) {
     const double fracture_fraction =
       state->lgar_bmi_params.ratio_fracture_vol_to_total_vol;
@@ -3065,9 +3087,11 @@ extern void InitFromConfigFile(string config_file, struct model_state *state)
 
   if (state->lgar_bmi_params.lower_bdy_flux_to_CR &&
       !state->lgar_bmi_params.free_drainage_enabled &&
+      !(state->lgar_bmi_params.dual_perm &&
+        state->lgar_bmi_params.fracture_free_drainage_enabled) &&
       !state->lgar_bmi_params.TO_enabled){
     stringstream errMsg;
-    errMsg << "The configuration file \'" << config_file <<"\' sets lower_bdy_flux_to_CR as true but sets both free_drainage_enabled and TO_enabled as false. lower_bdy_flux_to_CR requires either LGAR free drainage or LGARTO lower-boundary exchange. \n";
+    errMsg << "The configuration file \'" << config_file <<"\' enables lower_bdy_flux_to_CR without a drainage boundary. Enable LGAR free drainage in at least one active domain or LGARTO lower-boundary exchange. \n";
     throw runtime_error(errMsg.str());
   }
 

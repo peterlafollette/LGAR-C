@@ -198,6 +198,7 @@ struct lgar_bmi_parameters
   double frac_to_pref = 0.0;             // fraction of surface input assigned to the fracture domain [0-1]
   double ratio_fracture_vol_to_total_vol = 0.0; // fracture-domain volume fraction (0-1)
   bool   free_drainage_enabled = false;  // free_drainage_enabled will specify whether the lower boundary condition is no flow (false), or free drainage (true). Defaults to false.
+  bool   fracture_free_drainage_enabled = false; // optional dual-LGAR override; inherits free_drainage_enabled when omitted
   bool   lower_bdy_flux_to_CR  = false;  // Send positive net lower-boundary drainage/exchange to the nonlinear conceptual reservoir. Defaults to false.
   bool   mobile_groundwater_level = false; // if true, update the effective depth to groundwater from lower-boundary flux and conceptual-reservoir discharge. Defaults to false.
   bool   lateral_flow_enabled = false;        // if true, wetting fronts can contribute lateral/interflow to the GIUH queue

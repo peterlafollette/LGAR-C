@@ -2777,6 +2777,9 @@ void BmiLGAR::InitializeDualPermeabilityRuntime()
   dual_fracture_state->soil_properties_frac = NULL;
   dual_fracture_state->mass_transfer_soil_properties = NULL;
   dual_fracture_state->lgar_bmi_params.dual_perm = false;
+  // Each private solver uses its own drainage switch; routing stays shared.
+  dual_fracture_state->lgar_bmi_params.free_drainage_enabled =
+    params.fracture_free_drainage_enabled;
   dual_fracture_state->lgar_bmi_input_params = new lgar_bmi_input_parameters;
   *dual_fracture_state->lgar_bmi_input_params = *state->lgar_bmi_input_params;
 
