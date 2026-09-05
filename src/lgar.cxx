@@ -4736,8 +4736,9 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
     layer_num_above = (wf == 1) ? layer_num : previous->layer_num;
     layer_num_below = (wf == last_wetting_front_index) ? layer_num + 1 : next->layer_num;
 
-    // Snapshot a canonical upper boundary before the lower front's mass solve.
-    const double shared_upper_boundary_psi_cm =
+    // Start with the shared boundary head; a mass solve replaces it with its
+    // conservative head, which a nearly saturated theta cannot uniquely recover.
+    double shared_upper_boundary_psi_cm =
       previous != NULL && previous->to_bottom && previous->layer_num != layer_num &&
       previous->psi_cm == current->psi_cm &&
       lgar_theta_is_compatible_with_shared_psi(previous, current->psi_cm,
@@ -4909,7 +4910,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       const double AET_before_mass_balance_cm = *AET_demand_cm;
       double theta_new = lgar_theta_mass_balance(layer_num, soil_num, psi_cm, new_mass, prior_mass, precip_mass_to_add, AET_demand_cm,
 						 delta_thetas, delta_thickness, soil_type, soil_properties,
-                         !use_TO_surface_AET);
+                         !use_TO_surface_AET, PSI_UPPER_LIM,
+                         &shared_upper_boundary_psi_cm);
       if (use_TO_surface_AET) {
         actual_ET_demand += (*AET_demand_cm - AET_before_mass_balance_cm);
       }
@@ -5177,7 +5179,8 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
 	double theta_new = lgar_theta_mass_balance(layer_num, soil_num, psi_cm, new_mass, prior_mass, precip_mass_to_add, AET_demand_cm,
 						   delta_thetas, delta_thickness, soil_type, soil_properties,
                            !use_TO_surface_AET,
-                           theta_mass_balance_psi_upper_limit_cm);
+                           theta_mass_balance_psi_upper_limit_cm,
+                           &shared_upper_boundary_psi_cm);
   if (use_TO_surface_AET) {
     actual_ET_demand += (*AET_demand_cm - AET_before_mass_balance_cm);
   }
@@ -5243,13 +5246,13 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
       bool switched = false;
 
       double depth_new = wf_free_drainage->depth_cm;
-      bool use_lgarto_saturated_depth_min_bound = false;
+      bool use_saturated_depth_min_bound = false;
       bool lgarto_saturated_depth_bound_hit = false;
-      double lgarto_saturated_depth_min_cm = TRUNCATION_DEPTH;
-      if (lgarto_active && !wf_free_drainage->is_WF_GW && !wf_free_drainage->to_bottom &&
+      double saturated_depth_min_cm = TRUNCATION_DEPTH;
+      if (!wf_free_drainage->is_WF_GW && !wf_free_drainage->to_bottom &&
           wf_free_drainage->layer_num >= 1 && wf_free_drainage->layer_num <= num_layers) {
         const int bounded_layer = wf_free_drainage->layer_num;
-        lgarto_saturated_depth_min_cm = bounded_layer == 1
+        saturated_depth_min_cm = bounded_layer == 1
           ? TRUNCATION_DEPTH
           : cum_layer_thickness_cm[bounded_layer - 1] + TRUNCATION_DEPTH;
 
@@ -5259,12 +5262,12 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
         }
         if (previous_free_drainage != NULL &&
             previous_free_drainage->layer_num == bounded_layer) {
-          lgarto_saturated_depth_min_cm =
-            fmax(lgarto_saturated_depth_min_cm,
+          saturated_depth_min_cm =
+            fmax(saturated_depth_min_cm,
                  previous_free_drainage->depth_cm + DEPTH_AVOIDS_SAME_WF_DEPTH);
         }
 
-        use_lgarto_saturated_depth_min_bound = true;
+        use_saturated_depth_min_bound = true;
       }
 
       // loop to adjust the depth for mass balance
@@ -5319,16 +5322,30 @@ extern double lgar_move_wetting_fronts(double timestep_h, double *free_drainage_
           depth_new = cum_layer_thickness_cm[num_layers];
         }
 
-        // LGARTO event limiting can pin a saturated surface WF to a TO/to_bottom
-        // boundary after infiltration was accepted. If the old saturated-depth
-        // mass solve then wants to pull that front above its assigned layer,
-        // keep the geometry valid and expose the remaining signed residual.
-        if (use_lgarto_saturated_depth_min_bound &&
-            depth_new < lgarto_saturated_depth_min_cm) {
-          depth_new = lgarto_saturated_depth_min_cm;
+        // Keep depth trials inside the assigned layer. LGARTO retains its
+        // existing event-bound residual handling; ordinary LGAR must bracket
+        // its fixed-pressure storage target before continuing the depth solve.
+        if (use_saturated_depth_min_bound &&
+            depth_new < saturated_depth_min_cm) {
+          depth_new = saturated_depth_min_cm;
           wf_free_drainage->depth_cm = depth_new;
           current_mass = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
           mass_balance_error = fabs(current_mass - mass_timestep);
+          if (!lgarto_active) {
+            // A trial may overshoot a valid root, but excess storage even at
+            // the layer minimum means depth alone cannot conserve the target.
+            if (!std::isfinite(current_mass) ||
+                current_mass > mass_timestep + MBAL_ITERATIVE_TOLERANCE) {
+              std::cerr << "Error: saturated surface depth solve cannot bracket storage within its layer.\n"
+                        << "  front=" << wf_free_drainage->front_num
+                        << " layer=" << wf_free_drainage->layer_num
+                        << " minimum_depth_cm=" << depth_new
+                        << " storage_excess_cm=" << current_mass - mass_timestep << '\n';
+              listPrint(*head);
+              abort();
+            }
+            continue;
+          }
           break_flag = TRUE;
           lgarto_saturated_depth_bound_hit = true;
           if (verbosity.compare("high") == 0) {
@@ -6383,7 +6400,13 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
 
       Ksat_cm_per_h  = soil_properties[soil_num].Ksat_cm_per_h * frozen_factor[current->layer_num];
 
-      current->psi_cm     = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+      // Merging leaves theta unchanged; preserve its valid pressure because
+      // a near-saturated inverse can lose the head shared with an upper layer.
+      if (!std::isfinite(current->psi_cm) || current->psi_cm < 0.0 ||
+          !lgar_theta_is_compatible_with_shared_psi(
+            current, current->psi_cm, soil_type, soil_properties)) {
+        current->psi_cm = calc_h_from_Se(Se, vg_a, vg_m, vg_n);
+      }
       current->K_cm_per_h = calc_K_from_Se(Se, Ksat_cm_per_h, vg_m);
       
       if (verbosity.compare("high") == 0) {
@@ -7243,8 +7266,12 @@ static bool lgarto_mass_aware_to_bottom_snap(
     best_mass_error_cm = fabs(mass_high_cm - target_mass_cm);
   }
 
-  for (int iter = 0; iter < 100; iter++) {
-    const double psi_mid_cm = 0.5 * (psi_low_cm + psi_high_cm);
+  // A residual-dry block can seed psi_high=1e20; 100 bisections may not
+  // resolve a valid wet boundary head to the existing storage tolerance.
+  for (int iter = 0; iter < 256; iter++) {
+    const double psi_mid_cm = psi_low_cm + 0.5 * (psi_high_cm - psi_low_cm);
+    // If no representable interior head remains, retain the best trial below.
+    if (psi_mid_cm == psi_low_cm || psi_mid_cm == psi_high_cm) break;
     if (!lgarto_apply_shared_boundary_snap_psi(snap_scaffold, psi_mid_cm,
                                                soil_type, soil_properties)) {
       lgarto_restore_theta_snap_state(simple_snap_states);
