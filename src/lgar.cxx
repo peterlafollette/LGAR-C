@@ -6399,7 +6399,10 @@ extern void lgar_merge_wetting_fronts(int *soil_type, double *frozen_factor, str
 	    // '!next->to_bottom' ensures that the next wetting front is not the deepest wetting front in the layer
 	    // Mixed surface/TO contacts must return to the correction loop for the
 	    // mass-aware surface/TO handoff instead of using this surface merge.
+	    // Match the selector for every pair in this sweep; equal/dry fronts
+	    // belong to type 4, and three equal thetas would make the merge 0/0.
 	    if ( (current->depth_cm > next->depth_cm) && (current->layer_num == next->layer_num) &&
+	         current->theta > next->theta &&
 	         !current->is_WF_GW && !next->is_WF_GW && !next->to_bottom) {
         if (lgarto_surface_front_overtook_surface_front_above_TO_chain(current)) {
           (void) lgarto_convert_overtaken_surface_front_above_TO_chain(
@@ -19063,6 +19066,11 @@ static double lgar_theta_mass_balance_correction_with_min_psi(
   }
 
   const double mass_at_original = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  // NaN comparisons must not silently select the solver's saturated default.
+  if (!std::isfinite(prior_mass) || !std::isfinite(mass_at_original)) {
+    std::cerr << "Error: theta mass-balance correction requires finite target and profile storage.\n";
+    abort();
+  }
   if (fabs(mass_at_original - prior_mass) <= MBAL_ITERATIVE_TOLERANCE) {
     return prior_mass - mass_at_original;
   }
@@ -19188,6 +19196,11 @@ static void lgar_theta_mass_balance_correction_with_max_psi(bool use_dry_over_we
   }
 
   const double mass_at_original = lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
+  // NaN comparisons must not silently select the solver's saturated default.
+  if (!std::isfinite(prior_mass) || !std::isfinite(mass_at_original)) {
+    std::cerr << "Error: theta mass-balance correction requires finite target and profile storage.\n";
+    abort();
+  }
   if (fabs(mass_at_original - prior_mass) <= MBAL_ITERATIVE_TOLERANCE) {
     return;
   }
