@@ -1218,12 +1218,13 @@ lgar_sync_dual_mobile_groundwater_from_shared_CR_storage(
     if (!lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
           selected_depth_cm, params.num_layers,
           params.cum_layer_thickness_cm, params.layer_soil_type,
-          params.frozen_factor, &trial_head, domain->soil_properties, NAN)) {
-      // Initialization has no canonical pair to preserve yet.
+          params.frozen_factor, &trial_head, domain->soil_properties, NAN,
+          params.groundwater_depth_cm)) {
+      // Initialization or exchange may leave no pair at the known old table.
       (void) lgarto_maintain_mobile_groundwater_support(
         selected_depth_cm, params.num_layers, params.cum_layer_thickness_cm,
         params.layer_soil_type, params.frozen_factor, &trial_head,
-        domain->soil_properties);
+        domain->soil_properties, params.groundwater_depth_cm);
       (void) lgarto_submerge_wetting_fronts_below_groundwater(
         selected_depth_cm, params.num_layers, params.cum_layer_thickness_cm,
         params.layer_soil_type, params.frozen_factor, &trial_head,
@@ -1231,7 +1232,7 @@ lgar_sync_dual_mobile_groundwater_from_shared_CR_storage(
       (void) lgarto_maintain_mobile_groundwater_support(
         selected_depth_cm, params.num_layers, params.cum_layer_thickness_cm,
         params.layer_soil_type, params.frozen_factor, &trial_head,
-        domain->soil_properties);
+        domain->soil_properties, selected_depth_cm);
     }
 
     // Do not carry redundant dry-over-wet surface fronts into the next dz/dt solve.
@@ -5142,7 +5143,20 @@ UpdateSingleDomain()
         false, listLength(state->head), target_storage_cm, &state->head,
         state->lgar_bmi_params.cum_layer_thickness_cm,
         state->lgar_bmi_params.layer_soil_type, state->soil_properties);
+      // This late correction can dry the finite TO chain after cleanup. Update
+      // its zero-depth metadata without changing finite fronts or storage.
+      const bool supports_changed = lgar_dry_zero_depth_groundwater_fronts_to_surface_TO_chain(
+        &state->head, state->lgar_bmi_params.layer_soil_type, state->soil_properties,
+        state->lgar_bmi_params.cum_layer_thickness_cm);
       lgar_refresh_domain_conductivity(state);
+      if (supports_changed) {
+        lgar_dzdt_calc(use_closed_form_G, nint, num_layers, ponded_depth_subtimestep_cm,
+          subtimestep_h, state->lgar_bmi_params.layer_soil_type,
+          state->lgar_bmi_params.cum_layer_thickness_cm, state->lgar_bmi_params.frozen_factor,
+          state->head, state->soil_properties, false, 1, -1,
+          lgar_effective_groundwater_depth_cm(&state->lgar_bmi_params), true);
+        lgar_apply_upward_TO_supply_scale(state, dual_shared_upward_TO_supply_scale);
+      }
       const double corrected_storage_cm = lgar_calc_mass_bal(
         state->lgar_bmi_params.cum_layer_thickness_cm, state->head);
       local_mb -= corrected_storage_cm - volend_subtimestep_cm;

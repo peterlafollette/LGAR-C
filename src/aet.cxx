@@ -1406,7 +1406,7 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
   }
 
   wetting_front *current = find_deepest_surface_front(*head);
-  if (current == NULL) {
+  if (current == NULL || current->psi_cm >= TO_AET_MAX_PSI_CM) {
     return 0.0;
   }
 
@@ -1484,6 +1484,11 @@ static double lgarto_extract_missing_to_aet_from_surface_WFs(double missing_to_a
     free(delta_thickness);
   }
 
+  // This is still a trial: cap its head before measuring/reporting actual extraction.
+  if (current->psi_cm > TO_AET_MAX_PSI_CM) {
+    current->psi_cm = TO_AET_MAX_PSI_CM;
+    refresh_front_state_from_psi(current, soil_type, frozen_factor, soil_properties);
+  }
   propagate_surface_chain_psi_from_below(soil_type, frozen_factor, soil_properties, head);
   const double extracted_cm = mass_before - lgar_calc_mass_bal(cum_layer_thickness_cm, *head);
   if (extracted_cm <= ROOT_ZONE_TO_POPULATION_MASS_TOLERANCE_CM ||
@@ -1531,7 +1536,9 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
   const double original_psi_cm = target_front->psi_cm;
   double psi_lo_cm = fmax(0.0, original_psi_cm);
   double mass_lo = mass_before;
-  const double max_psi_cm = max_to_aet_chain_psi_cm(*head, target_front);
+  // Bound every trial, including the first; leave already-drier states unchanged.
+  const double max_psi_cm = fmin(TO_AET_MAX_PSI_CM,
+                                max_to_aet_chain_psi_cm(*head, target_front));
   if (max_psi_cm <= psi_lo_cm) {
     return 0.0;
   }
@@ -1546,7 +1553,7 @@ static double lgarto_extract_missing_to_aet_from_to_chain(wetting_front *target_
   double psi_hi_cm = fmin(max_psi_cm, fmax(psi_lo_cm + 1.0, psi_lo_cm * 2.0));
   double mass_hi = apply_trial_psi(psi_hi_cm);
   int expand_iter = 0;
-  while (mass_hi > target_mass && psi_hi_cm < fmin(TO_AET_MAX_PSI_CM, max_psi_cm) && expand_iter < 80) {
+  while (mass_hi > target_mass && psi_hi_cm < max_psi_cm && expand_iter < 80) {
     psi_hi_cm = fmin(max_psi_cm, fmax(psi_hi_cm + 1.0, psi_hi_cm * 2.0));
     mass_hi = apply_trial_psi(psi_hi_cm);
     expand_iter++;

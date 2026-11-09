@@ -455,6 +455,9 @@ extern void lgar_clean_redundant_fronts(struct wetting_front** head, int *soil_t
                                         bool apply_zero_depth_groundwater_cap = true,
                                         double *cum_layer_thickness_cm = NULL,
                                         double domain_depth_cm = 0.0);
+extern bool lgar_dry_zero_depth_groundwater_fronts_to_surface_TO_chain(
+  struct wetting_front **head, int *soil_type,
+  struct soil_properties_ *soil_properties, double *cum_layer_thickness_cm);
 
 // computes derivatives; called derivs() in Python code
 extern void lgar_dzdt_calc(bool use_closed_form_G, int nint, int num_layers, double h_p, double subtimestep_h, int *soil_type, double *cum_layer_thickness,
@@ -583,7 +586,8 @@ extern double lgarto_maintain_mobile_groundwater_support(double groundwater_dept
 							 int *soil_type,
 							 double *frozen_factor,
 							 struct wetting_front **head,
-							 struct soil_properties_ *soil_properties);
+							 struct soil_properties_ *soil_properties,
+                                                         double expected_old_depth_cm = NAN);
 extern bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth(
   double groundwater_depth_cm,
   int num_layers,
@@ -592,7 +596,8 @@ extern bool lgarto_rebuild_mobile_groundwater_storage_pair_and_submerge_at_depth
   double *frozen_factor,
   struct wetting_front **head,
   struct soil_properties_ *soil_properties,
-  double preserved_vadose_psi_cm);
+  double preserved_vadose_psi_cm,
+  double expected_old_depth_cm = NAN);
 extern double lgarto_move_mobile_groundwater_support_for_storage_change(double requested_storage_change_cm,
 									double current_groundwater_depth_cm,
 									int num_layers,
